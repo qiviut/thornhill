@@ -1,0 +1,11 @@
+[Unit]
+Description=Deploy Thornhill revision proven by successful main CI
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@ROOT@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
+ExecStart=@ROOT@/scripts/deploy-passed-main.sh
+TimeoutStartSec=20min

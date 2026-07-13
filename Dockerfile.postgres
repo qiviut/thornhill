@@ -1,0 +1,3 @@
+# Keep PostgreSQL as a Dockerfile dependency so Dependabot can propose
+# deliberate major/minor upgrades instead of leaving Compose image tags unseen.
+FROM postgres:18.3-alpine

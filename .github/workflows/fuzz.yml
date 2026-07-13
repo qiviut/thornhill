@@ -1,0 +1,42 @@
+name: Scheduled fuzzing
+
+on:
+  schedule:
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-fuzzing
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Authority and protocol fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v5.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Fuzz authority and protocol boundaries
+        env:
+          FUZZTIME: 2m
+        run: scripts/test-fuzz.sh
+
+      - name: Preserve minimized failure corpora
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fuzz-failures-${{ github.run_id }}
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
+          retention-days: 14

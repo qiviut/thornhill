@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Go, web, and image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Scan Git history for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Verify branch-protection readiness
+        run: scripts/check-ci-policy.sh
+
+      - name: Resolve container toolchains
+        id: toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          go_image=$(awk '$1 == "FROM" && $2 ~ /^golang:/ { print $2; exit }' Dockerfile)
+          node_image=$(awk '$1 == "FROM" && $2 ~ /^node:/ { print $2; exit }' Dockerfile)
+          go_version=${go_image#golang:}
+          go_version=${go_version%-alpine}
+          node_version=${node_image#node:}
+          node_version=${node_version%-alpine}
+          test -n "${go_version}" && test -n "${node_version}"
+          printf 'go=%s\nnode=%s\n' "${go_version}" "${node_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version: ${{ steps.toolchains.outputs.go }}
+          # Avoid mutable cache restores in the untrusted-code qualification lane.
+          cache: false
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet and test Go
+        run: |
+          go vet ./...
+          go test -race ./...
+
+      - name: Fuzz authority and protocol boundaries
+        env:
+          FUZZTIME: 5s
+        run: scripts/test-fuzz.sh
+
+      - name: Test ephemeral dummy model provider
+        run: go test -tags=integration -count=1 -run '^TestProviderProcessConformance$' ./internal/dummyopenai
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ steps.toolchains.outputs.node }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Verify web client
+        working-directory: web
+        run: |
+          npm ci
+          npm run check
+          npm run build
+
+      - name: Build application image
+        run: |
+          docker build --pull \
+            --build-arg "THORNHILL_REVISION=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --tag thornhill:ci .
+          revision_label=$(docker image inspect thornhill:ci --format='{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          test "${revision_label}" = "${GITHUB_SHA}"
+          test "$(docker run --rm thornhill:ci --version)" = "thornhill ${GITHUB_SHA}"
+
+      - name: Build PostgreSQL image
+        run: docker build --pull --file Dockerfile.postgres --tag thornhill-postgres:ci .
+
+      - name: Test randomized PostgreSQL migrations and approval claims
+        run: scripts/test-postgres-integration.sh
+
+      - name: Validate Compose model
+        run: |
+          cp .env.example .env
+          docker compose config --quiet

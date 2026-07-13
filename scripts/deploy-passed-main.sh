@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+REPOSITORY=${REPOSITORY:-qiviut/thornhill}
+PROJECT_NAME=${PROJECT_NAME:-thornhill}
+LOCAL_APP_URL=${LOCAL_APP_URL:-http://127.0.0.1:8787/}
+LOCAL_STATUS_URL=${LOCAL_STATUS_URL:-http://127.0.0.1:8787/api/status}
+PUBLIC_APP_URL=${PUBLIC_APP_URL:?set the externally reachable Thornhill URL}
+PUBLIC_STATUS_URL=${PUBLIC_STATUS_URL:?set its /api/status URL}
+STATE_DIR=${STATE_DIR:-${HOME}/.local/state/thornhill-ci-deploy}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-30}
+export GH_HTTP_TIMEOUT=${GH_HTTP_TIMEOUT:-20}
+
+install -d -m 0700 "${STATE_DIR}"
+exec 9>"${STATE_DIR}/deploy.lock"
+if ! flock -n 9; then
+  echo "A Thornhill deployment is already running"
+  exit 0
+fi
+
+revision=""
+run_id=""
+run_url=""
+image=""
+previous_revision=""
+previous_image=""
+tmp=""
+source_dir=""
+previous_source_dir=""
+deployed=false
+draining=false
+stage=select
+compose=()
+previous_compose=()
+
+write_receipt() {
+  local deployed_revision=$1 deployed_image=$2 deployed_run_id=$3 deployed_run_url=$4 temporary
+  temporary=$(mktemp "${STATE_DIR}/deployed.json.XXXXXX")
+  jq -n --arg source_commit "${deployed_revision}" --arg image "${deployed_image}" \
+    --argjson ci_run_id "${deployed_run_id}" --arg ci_url "${deployed_run_url}" \
+    '{source_commit:$source_commit,image:$image,ci_run_id:$ci_run_id,ci_url:$ci_url}' >"${temporary}"
+  mv "${temporary}" "${STATE_DIR}/deployed.json"
+}
+
+mark_failed() {
+  local reason=$1 temporary
+  [[ -n "${revision}" ]] || return 0
+  temporary=$(mktemp "${STATE_DIR}/failed.json.XXXXXX")
+  jq -n --arg source_commit "${revision}" --arg reason "${reason}" \
+    --argjson ci_run_id "${run_id:-0}" --arg ci_url "${run_url}" \
+    '{source_commit:$source_commit,ci_run_id:$ci_run_id,ci_url:$ci_url,reason:$reason,failed_at:(now|todate)}' >"${temporary}"
+  mv "${temporary}" "${STATE_DIR}/failed.json"
+}
+
+# The PostgreSQL variables intentionally expand inside the container shell.
+# shellcheck disable=SC2016
+db_sql() {
+  timeout 15s docker exec -i "${PROJECT_NAME}-db-1" sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atq'
+}
+
+set_dispatch_paused() {
+  local value=$1 result
+  printf '%s\n' "BEGIN; SELECT pg_advisory_xact_lock(72623859790382856); UPDATE deployment_control SET dispatch_paused=${value}, updated_at=now() WHERE singleton=TRUE; COMMIT;" | db_sql >/dev/null
+  result=$(printf '%s\n' "SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE;" | db_sql)
+  if [[ "${value}" == TRUE ]]; then
+    [[ "${result}" == t ]]
+    draining=true
+  else
+    [[ "${result}" == f ]]
+    draining=false
+  fi
+}
+
+ensure_deployment_control() {
+  db_sql >/dev/null <<'SQL'
+CREATE TABLE IF NOT EXISTS deployment_control (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  dispatch_paused BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO deployment_control (singleton, dispatch_paused)
+VALUES (TRUE, FALSE) ON CONFLICT (singleton) DO NOTHING;
+CREATE OR REPLACE FUNCTION thornhill_guard_job_insert() RETURNS trigger
+LANGUAGE plpgsql AS $guard$
+BEGIN
+  PERFORM pg_advisory_xact_lock(72623859790382856);
+  IF (SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE) THEN
+    RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='job dispatch is temporarily paused for deployment';
+  END IF;
+  RETURN NEW;
+END
+$guard$;
+DO $trigger$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='thornhill_guard_job_insert_trigger') THEN
+    CREATE TRIGGER thornhill_guard_job_insert_trigger
+    BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION thornhill_guard_job_insert();
+  END IF;
+END
+$trigger$;
+SQL
+}
+
+active_jobs() {
+  printf "%s\n" "SELECT count(*) FROM jobs WHERE status IN ('queued','running','needs_input','needs_approval');" | db_sql
+}
+
+status_revision() {
+  local url=$1
+  curl --fail --silent --show-error --max-time 15 "${url}" |
+    jq -er 'select(.status == "ok" and .versioned == true) | .source_commit'
+}
+
+verify_running_revision() {
+  local expected=$1 image_id label binary
+  image_id=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Image}}')
+  label=$(docker image inspect "${image_id}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+  binary=$(timeout 10s docker exec "${PROJECT_NAME}-app-1" /app/thornhill --version)
+  [[ "${label}" == "${expected}" && "${binary}" == "thornhill ${expected}" ]]
+}
+
+verify_live_revision() {
+  local expected=$1 local_revision public_revision
+  curl --fail --silent --show-error --output /dev/null --max-time 15 "${LOCAL_APP_URL}"
+  curl --fail --silent --show-error --output /dev/null --max-time 15 "${PUBLIC_APP_URL}"
+  local_revision=$(status_revision "${LOCAL_STATUS_URL}")
+  public_revision=$(status_revision "${PUBLIC_STATUS_URL}")
+  [[ "${local_revision}" == "${expected}" && "${public_revision}" == "${expected}" ]]
+  verify_running_revision "${expected}"
+}
+
+cleanup_worktrees() {
+  local directory
+  for directory in "${source_dir}" "${previous_source_dir}"; do
+    [[ -n "${directory}" ]] || continue
+    if git worktree list --porcelain | grep -Fqx "worktree ${directory}"; then
+      git worktree remove --force "${directory}" >/dev/null 2>&1 || true
+    fi
+  done
+  [[ -z "${tmp}" ]] || rm -rf "${tmp}"
+}
+
+rollback() {
+  local rollback_ok=false deadline
+  if [[ "${deployed}" == true && -n "${previous_image}" && ${#previous_compose[@]} -gt 0 ]]; then
+    echo "${stage} failed; rolling back to ${previous_revision} (${previous_image})" >&2
+    if THORNHILL_APP_IMAGE="${previous_image}" "${previous_compose[@]}" up -d --no-build --force-recreate app >/dev/null; then
+      deadline=$((SECONDS + TIMEOUT_SECONDS))
+      while (( SECONDS < deadline )); do
+        if verify_live_revision "${previous_revision}" >/dev/null 2>&1; then
+          rollback_ok=true
+          break
+        fi
+        sleep 1
+      done
+    fi
+    mark_failed "${stage} failed; rollback_ok=${rollback_ok}"
+  fi
+  if [[ "${draining}" == true ]]; then
+    if ! set_dispatch_paused FALSE; then
+      echo "CRITICAL: failed to leave deployment drain mode" >&2
+      return 1
+    fi
+  fi
+  [[ "${rollback_ok}" == true || "${deployed}" == false ]]
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if (( rc != 0 )); then
+    rollback || rc=1
+  elif [[ "${draining}" == true ]]; then
+    set_dispatch_paused FALSE || rc=1
+  fi
+  cleanup_worktrees
+  exit "${rc}"
+}
+trap on_exit EXIT INT TERM
+
+cd "${ROOT}"
+timeout 60s git fetch --quiet --prune origin main
+remote_main=$(git rev-parse origin/main)
+runs=$(gh run list --repo "${REPOSITORY}" --workflow CI --branch main --event push --limit 50 \
+  --json databaseId,headSha,status,conclusion,url,createdAt)
+passed=$(jq -c '[.[] | select(.status == "completed" and .conclusion == "success")][0] // empty' <<<"${runs}")
+if [[ -z "${passed}" ]]; then
+  echo "No successful main push CI run found" >&2
+  exit 1
+fi
+revision=$(jq -r .headSha <<<"${passed}")
+run_id=$(jq -r .databaseId <<<"${passed}")
+run_url=$(jq -r .url <<<"${passed}")
+if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Refusing invalid CI revision ${revision@Q}" >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor "${revision}" "${remote_main}"; then
+  echo "Latest passing CI revision ${revision} is not an ancestor of origin/main ${remote_main}" >&2
+  exit 1
+fi
+controller=scripts/deploy-passed-main.sh
+if ! git diff --quiet -- "${controller}" || ! git diff --cached --quiet -- "${controller}"; then
+  echo "Refusing deployment with a modified controller: ${controller}" >&2
+  exit 1
+fi
+if [[ $(git hash-object "${controller}") != $(git rev-parse "${revision}:${controller}") ]]; then
+  echo "Deployment controller does not match passing revision ${revision}; update the local checkout first" >&2
+  exit 1
+fi
+
+previous_revision=$(status_revision "${LOCAL_STATUS_URL}" 2>/dev/null || true)
+if [[ "${previous_revision}" == "${revision}" ]]; then
+  if ! verify_live_revision "${revision}"; then
+    echo "Revision ${revision} is local but failed full local/Tailnet/image/binary verification" >&2
+    exit 1
+  fi
+  current_image=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Config.Image}}')
+  write_receipt "${revision}" "${current_image}" "${run_id}" "${run_url}"
+  rm -f "${STATE_DIR}/failed.json"
+  set_dispatch_paused FALSE
+  echo "Already running latest passing CI revision ${revision} (run ${run_id})"
+  exit 0
+fi
+if [[ "${CHECK_ONLY:-0}" == 1 ]]; then
+  echo "Revision mismatch: live=${previous_revision:-unversioned} latest_passing_ci=${revision} run=${run_id}" >&2
+  exit 1
+fi
+if [[ -f "${STATE_DIR}/failed.json" && "${RETRY_FAILED:-0}" != 1 ]]; then
+  failed_revision=$(jq -r '.source_commit // empty' "${STATE_DIR}/failed.json")
+  if [[ "${failed_revision}" == "${revision}" ]]; then
+    echo "Revision ${revision} is quarantined after a failed deployment; set RETRY_FAILED=1 to retry" >&2
+    exit 0
+  fi
+fi
+if [[ ! "${previous_revision}" =~ ^[0-9a-f]{40}$ ]] || ! verify_live_revision "${previous_revision}"; then
+  echo "Refusing deployment without a healthy, versioned rollback target" >&2
+  exit 1
+fi
+previous_image=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Config.Image}}')
+if [[ -z "${previous_image}" ]]; then
+  echo "Refusing deployment without an existing app image for rollback" >&2
+  exit 1
+fi
+
+tmp=$(mktemp -d)
+source_dir="${tmp}/source"
+previous_source_dir="${tmp}/previous"
+git worktree add --quiet --detach "${source_dir}" "${revision}"
+git worktree add --quiet --detach "${previous_source_dir}" "${previous_revision}"
+image="thornhill-app:${revision}"
+stage=build
+docker build --pull \
+  --build-arg "THORNHILL_REVISION=${revision}" \
+  --label "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
+  --tag "${image}" "${source_dir}"
+label=$(docker image inspect "${image}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+if [[ "${label}" != "${revision}" || $(docker run --rm "${image}" --version) != "thornhill ${revision}" ]]; then
+  echo "Built image or binary does not report ${revision}" >&2
+  exit 1
+fi
+
+# Link the host environment only after the untrusted build context has been consumed.
+ln -s "${ROOT}/.env" "${source_dir}/.env"
+ln -s "${ROOT}/.env" "${previous_source_dir}/.env"
+compose=(docker compose --project-name "${PROJECT_NAME}" -f "${source_dir}/docker-compose.yml" -f "${source_dir}/docker-compose.host.yml")
+previous_compose=(docker compose --project-name "${PROJECT_NAME}" -f "${previous_source_dir}/docker-compose.yml" -f "${previous_source_dir}/docker-compose.host.yml")
+
+stage=drain
+ensure_deployment_control
+set_dispatch_paused TRUE
+active=$(active_jobs)
+if [[ "${active}" != 0 ]]; then
+  echo "Deferring ${revision}: ${active} active job(s) after entering drain mode"
+  set_dispatch_paused FALSE
+  exit 0
+fi
+
+stage=deploy
+deployed=true
+THORNHILL_APP_IMAGE="${image}" "${compose[@]}" up -d --no-build --force-recreate app
+stage=verify
+deadline=$((SECONDS + TIMEOUT_SECONDS))
+while (( SECONDS < deadline )); do
+  if verify_live_revision "${revision}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+if ! verify_live_revision "${revision}"; then
+  echo "Local/Tailnet/readiness/image/binary verification failed for ${revision}" >&2
+  exit 1
+fi
+set_dispatch_paused FALSE
+deployed=false
+rm -f "${STATE_DIR}/failed.json"
+write_receipt "${revision}" "${image}" "${run_id}" "${run_url}"
+echo "Deployed ${revision} from successful CI run ${run_id}: ${run_url}"

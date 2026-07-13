@@ -1,0 +1,11 @@
+.git/
+.github/
+.beads/
+.env
+.env.*
+!.env.example
+thornhill
+prebaked/
+web/node_modules/
+web/dist/
+coverage.out

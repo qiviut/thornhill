@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Dependabot proposes all supported update classes by default, including majors.
+  # Daily checks minimize time spent behind the latest release.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: daily }
+    open-pull-requests-limit: 20
+  - package-ecosystem: gomod
+    directory: /
+    schedule: { interval: daily }
+    open-pull-requests-limit: 20
+  - package-ecosystem: npm
+    directory: /web
+    schedule: { interval: daily }
+    open-pull-requests-limit: 20
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: daily }
+    open-pull-requests-limit: 20

@@ -1,0 +1,12 @@
+/thornhill
+/web/node_modules/
+/web/dist/
+/prebaked/
+coverage.out
+.env
+.env.*
+!.env.example
+/.beads/beads.db*
+/.beads/*.lock
+# br doctor per-run artifacts
+.doctor/

@@ -1,0 +1,14 @@
+# Linux host integration: let Thornhill reach a Hermes API server that remains
+# bound to 127.0.0.1. Postgres stays containerized and is published only on a
+# high loopback port; the app itself joins the host network and binds loopback.
+services:
+  db:
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  app:
+    network_mode: host
+    ports: !reset []
+    environment:
+      DATABASE_URL: postgres://thornhill:thornhill@127.0.0.1:55432/thornhill?sslmode=disable
+      LISTEN_ADDR: 127.0.0.1:8787

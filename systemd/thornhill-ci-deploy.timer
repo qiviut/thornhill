@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll GitHub for the latest CI-proven Thornhill main revision
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=thornhill-ci-deploy.service
+
+[Install]
+WantedBy=timers.target
