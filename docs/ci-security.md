@@ -28,7 +28,7 @@ Increase `required_approving_review_count` when a reliable second reviewer exist
 
 ### 1. Pull-request qualification: untrusted and secretless
 
-`CI` executes contributor code and dependency build scripts with only `contents: read`. It must never reference repository, environment, Dependabot, cloud, tailnet, model-provider, signing, or deployment secrets. It establishes whether one immutable source revision is eligible for promotion; it does not deploy or sign.
+`CI` executes contributor code and dependency build scripts with only `contents: read` and `pull-requests: read`. Pull-request metadata access lets Gitleaks resolve and scan the exact PR commit range; the workflow has no pull-request write permission. It must never reference repository, environment, Dependabot, cloud, tailnet, model-provider, signing, or deployment secrets. It establishes whether one immutable source revision is eligible for promotion; it does not deploy or sign.
 
 The required check exercises:
 

@@ -66,6 +66,20 @@ func TestCheckRejectsPrivilegedJobAndUnsafeTrigger(t *testing.T) {
 			},
 			contain: "triggers",
 		},
+		{
+			name: "pull request metadata write",
+			mutate: func(in string) string {
+				return strings.Replace(in, "  pull-requests: read\n", "  pull-requests: write\n", 1)
+			},
+			contain: "documented read-only permissions",
+		},
+		{
+			name: "unexpected permission",
+			mutate: func(in string) string {
+				return strings.Replace(in, "  pull-requests: read\n", "  pull-requests: read\n  issues: read\n", 1)
+			},
+			contain: "documented read-only permissions",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

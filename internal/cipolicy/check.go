@@ -81,8 +81,16 @@ func Check(root string) error {
 		if err := yaml.Unmarshal(data, &wf); err != nil {
 			return fmt.Errorf("decode %s: %w", relative, err)
 		}
-		if len(wf.Permissions) != 1 || wf.Permissions["contents"] != "read" {
-			return fmt.Errorf("%s must have exactly contents: read permissions", relative)
+		wantPermissions := map[string]string{"contents": "read"}
+		if relative == ".github/workflows/ci.yml" {
+			wantPermissions["pull-requests"] = "read"
+		}
+		permissionsMatch := len(wf.Permissions) == len(wantPermissions)
+		for name, access := range wantPermissions {
+			permissionsMatch = permissionsMatch && wf.Permissions[name] == access
+		}
+		if !permissionsMatch {
+			return fmt.Errorf("%s must have exactly the documented read-only permissions", relative)
 		}
 		for id, job := range wf.Jobs {
 			if len(job.Permissions) != 0 {
