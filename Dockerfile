@@ -2,7 +2,17 @@
 FROM node:26.5.0-alpine AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
-RUN npm ci --ignore-scripts --no-audit --no-fund
+RUN set -eu; \
+    for attempt in 1 2 3; do \
+      rm -rf node_modules; \
+      if npm ci --include=optional --ignore-scripts --no-audit --no-fund \
+        && ./node_modules/.bin/tsc --version >/dev/null \
+        && node --input-type=module -e "await import('rolldown')"; then \
+        exit 0; \
+      fi; \
+      [ "$attempt" -eq 3 ] || sleep "$attempt"; \
+    done; \
+    exit 1
 COPY web/ ./
 RUN npm run check && npm run build
 

@@ -35,7 +35,7 @@ The required check exercises:
 - a Gitleaks scan over the fetched Git history before builds execute;
 - Go formatting, vetting, race tests, and short invariant-driven fuzz campaigns;
 - an ephemeral deterministic OpenAI-compatible provider process;
-- web dependency installation, checks, and production build;
+- web dependency installation, explicit platform-package loading, checks, and production build; transient registry omissions of optional native packages are retried and still fail closed after three attempts;
 - application and PostgreSQL image builds;
 - migrations and concurrent approval claims against an ephemeral PostgreSQL container whose username, database, password, container name, host port, and test data are freshly generated from cryptographic randomness;
 - the Compose delivery model and this policy itself.
