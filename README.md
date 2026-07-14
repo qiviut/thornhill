@@ -282,3 +282,10 @@ docs/vendor/         the exact API docs this code was written against
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the required local checks and
 secretless contribution rules. Report vulnerabilities privately as described in
 [`SECURITY.md`](SECURITY.md).
+
+## License
+
+Thornhill is licensed under the [GNU Affero General Public License v3.0
+only](LICENSE) (`AGPL-3.0-only`). The browser interface links to this public
+source so network users can obtain the corresponding source. Modified network
+deployments must keep that offer pointed at the source for the version they run.

@@ -386,6 +386,13 @@ export default function App() {
         <button onClick={sendText}>Send</button>
       </div>
 
+      <footer className="legal">
+        <a href="https://github.com/qiviut/thornhill" target="_blank" rel="noreferrer">
+          Source
+        </a>
+        <span>© 2026 Thornhill contributors · AGPL-3.0-only · no warranty</span>
+      </footer>
+
       <audio ref={audioRef} autoPlay />
     </div>
   );

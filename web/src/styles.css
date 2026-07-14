@@ -227,3 +227,16 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 }
 .textbar input:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
 .textbar input::placeholder { color: var(--dim); }
+
+.legal {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.4;
+}
+.legal a { color: var(--dim); }
+.legal a:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }

@@ -30,7 +30,8 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # --- runtime ---
 FROM debian:stable-slim
 ARG THORNHILL_REVISION=unknown
-LABEL org.opencontainers.image.revision="${THORNHILL_REVISION}"
+LABEL org.opencontainers.image.revision="${THORNHILL_REVISION}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
@@ -40,6 +41,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --chown=thornhill:thornhill --from=build /out/thornhill /app/thornhill
 COPY --chown=thornhill:thornhill --from=web /src/web/dist /app/web/dist
+COPY --chown=thornhill:thornhill LICENSE /usr/share/licenses/thornhill/LICENSE
 ENV STATIC_DIR=/app/web/dist \
     PREBAKE_DIR=/data/prebaked
 VOLUME /data
