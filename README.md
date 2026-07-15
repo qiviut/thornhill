@@ -99,31 +99,40 @@ GitHub Actions run URL.
 gofmt -w .
 go vet ./...
 go test -race ./...
+go tool staticcheck ./...
+go tool govulncheck ./...
+go tool actionlint .github/workflows/*.yml
 FUZZTIME=5s scripts/test-fuzz.sh
 go test -tags=integration -run '^TestProviderProcessConformance$' ./internal/dummyopenai
-(cd web && npm ci && npm run check && npm run build)
-docker build --pull --tag thornhill:local .
-docker build --pull --file Dockerfile.postgres --tag thornhill-postgres:ci .
+(cd web && npm ci --ignore-scripts && npm run check && npm run lint && npm run build && npm audit --audit-level=high)
+docker buildx build --check .
+docker buildx build --pull --load --build-arg THORNHILL_REVISION=0123456789abcdef0123456789abcdef01234567 --tag thornhill:local .
+docker buildx build --pull --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
+scripts/test-container-hardening.sh thornhill:local thornhill-postgres:ci
 scripts/test-postgres-integration.sh
-actionlint .github/workflows/*.yml
+scripts/run-security-scans.sh thornhill:local thornhill-postgres:ci
 scripts/check-ci-policy.sh
 ```
 
-GitHub Actions runs formatting, race-enabled Go tests, short authority/protocol
-fuzz campaigns, an ephemeral deterministic model-provider process, frontend
-checks, both container builds, randomized PostgreSQL migration/concurrency tests,
-and Compose validation on every push and pull request. Its Go and Node setup
-versions are derived from the Dockerfile, so Docker updates are tested with the
-same toolchains they change. A weekly workflow gives every fuzz target a longer
-campaign and preserves minimized failures. Dependabot checks Go, npm, Docker,
-and GitHub Actions daily; PostgreSQL lives in `Dockerfile.postgres` so Compose's
-database base image is covered too. A privileged `workflow_run` lane may approve
-only an open, same-repository `dependabot[bot]` PR to `main` at the exact SHA that
-read-only CI passed; it neither checks out PR code nor merges it.
+GitHub Actions runs formatting, Go and web static analysis, known-vulnerability
+and secret scans, race-enabled tests, short authority/protocol fuzz campaigns,
+an ephemeral deterministic model-provider process, both final container builds,
+runtime-hardening checks, randomized PostgreSQL migration/concurrency tests,
+Compose validation, image scans, and CycloneDX SBOM generation on every push and
+pull request. Its Go and Node setup versions are derived from the Dockerfile, so
+Docker updates are tested with the same toolchains they change. A weekly workflow
+gives every fuzz target a longer campaign and preserves minimized failures.
+Dependabot checks Go tools/modules, npm packages and Biome rules, Dockerfiles,
+production and scanner Compose images/rule engines, and GitHub Actions daily. A
+privileged `workflow_run` lane may approve only an open, same-repository
+`dependabot[bot]` PR to `main` at the exact SHA that read-only CI passed; it
+neither checks out PR code nor merges it.
 
 PR CI is intentionally secretless. The checked-in branch-protection policy,
 publication procedure, future trusted-promotion rules, randomized-test policy,
 and dummy-provider scope are documented in [docs/ci-security.md](docs/ci-security.md).
+Container design, scanner scope, update coverage, and the primary-source review
+are documented in [docs/container-security.md](docs/container-security.md).
 
 ## Session lifecycle
 

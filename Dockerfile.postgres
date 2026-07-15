@@ -1,3 +1,8 @@
-# Keep PostgreSQL as a Dockerfile dependency so Dependabot can propose
-# deliberate major/minor upgrades instead of leaving Compose image tags unseen.
-FROM postgres:18.4-alpine
+# Keep PostgreSQL as a Dockerfile dependency so Dependabot can update both the
+# human-readable tag and the immutable manifest digest.
+FROM postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+
+# The upstream point-release image is not rebuilt for every Alpine advisory.
+# Apply current repository security fixes, then gate the resulting image with
+# Trivy. The pinned base digest still makes the upstream starting point clear.
+RUN apk upgrade --no-cache

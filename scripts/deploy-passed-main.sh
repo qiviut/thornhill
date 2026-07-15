@@ -251,7 +251,11 @@ git worktree add --quiet --detach "${source_dir}" "${revision}"
 git worktree add --quiet --detach "${previous_source_dir}" "${previous_revision}"
 image="thornhill-app:${revision}"
 stage=build
-docker build --pull \
+docker buildx version >/dev/null || {
+  echo "Docker Buildx is required for reproducible BuildKit builds; install the Docker buildx CLI plugin" >&2
+  exit 1
+}
+docker buildx build --pull --load \
   --build-arg "THORNHILL_REVISION=${revision}" \
   --label "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
   --tag "${image}" "${source_dir}"

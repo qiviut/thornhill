@@ -32,6 +32,7 @@ interface Job {
 }
 
 interface TranscriptLine {
+  id: string;
   who: "you" | "desk";
   text: string;
 }
@@ -66,7 +67,9 @@ export default function App() {
   const teardownCall = useCallback(() => {
     pcRef.current?.close();
     pcRef.current = null;
-    micRef.current?.getTracks().forEach((t) => t.stop());
+    micRef.current?.getTracks().forEach((track) => {
+      track.stop();
+    });
     micRef.current = null;
     if (audioRef.current) audioRef.current.srcObject = null;
   }, []);
@@ -168,7 +171,9 @@ export default function App() {
           if (st === "PARKING") {
             // Server-originated park requests (including the voice tool) must
             // stop new input just like the Park button while remote audio drains.
-            micRef.current?.getAudioTracks().forEach((track) => (track.enabled = false));
+            micRef.current?.getAudioTracks().forEach((track) => {
+              track.enabled = false;
+            });
           }
           break;
         }
@@ -188,13 +193,14 @@ export default function App() {
         case "job.failed":
         case "job.cancelled": {
           const job = p as unknown as Job;
-          if (!e.job_id) break;
+          const jobID = e.job_id;
+          if (!jobID) break;
           setJobs((m) => {
             const next = new Map(m);
             // Job lifecycle events carry complete snapshots. Replace rather
             // than merge so omitted cleared fields (approvals/progress/error)
             // cannot survive from an earlier state.
-            next.set(e.job_id!, { ...job, id: e.job_id! });
+            next.set(jobID, { ...job, id: jobID });
             return next;
           });
           if (e.kind === "job.done") earcons.jobDone();
@@ -207,12 +213,13 @@ export default function App() {
           break;
         }
         case "job.renamed": {
-          if (!e.job_id) break;
+          const jobID = e.job_id;
+          if (!jobID) break;
           const to = String(p.to ?? "");
           setJobs((m) => {
             const next = new Map(m);
-            const prev = next.get(e.job_id!);
-            if (prev) next.set(e.job_id!, { ...prev, display_name: to });
+            const prev = next.get(jobID);
+            if (prev) next.set(jobID, { ...prev, display_name: to });
             return next;
           });
           break;
@@ -248,13 +255,14 @@ export default function App() {
       document.removeEventListener("visibilitychange", vis);
       link.stop();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [handleEvent, pushState]);
 
   const toggleMute = useCallback(() => {
     setMuted((m) => {
       const next = !m;
-      micRef.current?.getAudioTracks().forEach((t) => (t.enabled = !next));
+      micRef.current?.getAudioTracks().forEach((track) => {
+        track.enabled = !next;
+      });
       mutedRef.current = next;
       linkRef.current?.sendState(next, document.hidden);
       return next;
@@ -273,7 +281,9 @@ export default function App() {
     }
     // Stop sending new microphone audio while keeping the peer connection and
     // remote audio alive until the server confirms the current output drained.
-    micRef.current?.getAudioTracks().forEach((track) => (track.enabled = false));
+    micRef.current?.getAudioTracks().forEach((track) => {
+      track.enabled = false;
+    });
     sessionRef.current = "PARKING";
     setSession("PARKING");
     setParkReason("finishing current audio");
@@ -313,6 +323,7 @@ export default function App() {
       </header>
 
       <button
+        type="button"
         className={`ring ${session.toLowerCase()} ${muted ? "muted" : ""} ${connecting ? "connecting" : ""}`}
         onClick={ringTap}
         aria-label={session === "PARKED" ? "Resume voice session" : session === "PARKING" ? "Voice session is draining before park" : "Toggle mute"}
@@ -322,19 +333,19 @@ export default function App() {
       </button>
 
       <div className="controls">
-        <button onClick={toggleMute} disabled={session === "PARKED" || session === "PARKING"}>
+        <button type="button" onClick={toggleMute} disabled={session === "PARKED" || session === "PARKING"}>
           {muted ? "Unmute" : "Mute"}
         </button>
-        <button onClick={park} disabled={session === "PARKED" || session === "PARKING"}>
+        <button type="button" onClick={park} disabled={session === "PARKED" || session === "PARKING"}>
           {session === "PARKING" ? "Parking…" : "Park"}
         </button>
       </div>
 
       <section className="ticker" aria-live="polite">
         {ticker.length === 0 && <div className="tick dim">transcript will appear here</div>}
-        {ticker.map((l, i) => (
-          <div key={i} className={`tick ${l.who}`}>
-            <span className="who">{l.who === "you" ? "YOU" : "DESK"}</span> {l.text}
+        {ticker.map((line) => (
+          <div key={line.id} className={`tick ${line.who}`}>
+            <span className="who">{line.who === "you" ? "YOU" : "DESK"}</span> {line.text}
           </div>
         ))}
       </section>
@@ -383,7 +394,7 @@ export default function App() {
           placeholder="Type when voice is not an option"
           aria-label="Text message to the desk"
         />
-        <button onClick={sendText}>Send</button>
+        <button type="button" onClick={sendText}>Send</button>
       </div>
 
       <footer className="legal">
@@ -393,13 +404,14 @@ export default function App() {
         <span>© 2026 Thornhill contributors · AGPL-3.0-only · no warranty</span>
       </footer>
 
+      {/* biome-ignore lint/a11y/useMediaCaption: live WebRTC speech has no static caption track. */}
       <audio ref={audioRef} autoPlay />
     </div>
   );
 }
 
-function clip(arr: TranscriptLine[], line: TranscriptLine): TranscriptLine[] {
-  return [...arr.slice(-7), line];
+function clip(arr: TranscriptLine[], line: Omit<TranscriptLine, "id">): TranscriptLine[] {
+  return [...arr.slice(-7), { ...line, id: crypto.randomUUID() }];
 }
 
 function waitForIce(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {

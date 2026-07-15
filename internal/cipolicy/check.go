@@ -22,6 +22,28 @@ type workflow struct {
 type workflowJob struct {
 	Name        string            `yaml:"name"`
 	Permissions map[string]string `yaml:"permissions"`
+	Steps       []workflowStep    `yaml:"steps"`
+}
+
+type workflowStep struct {
+	Uses string `yaml:"uses"`
+	Run  string `yaml:"run"`
+}
+
+type dependabotConfig struct {
+	Updates []dependabotUpdate `yaml:"updates"`
+}
+
+type dependabotUpdate struct {
+	PackageEcosystem string         `yaml:"package-ecosystem"`
+	Directory        string         `yaml:"directory"`
+	Groups           map[string]any `yaml:"groups"`
+}
+
+type scannerCompose struct {
+	Services map[string]struct {
+		Image string `yaml:"image"`
+	} `yaml:"services"`
 }
 
 type protection struct {
@@ -111,6 +133,97 @@ func Check(root string) error {
 			if !ok || verify.Name != requiredCheck {
 				return fmt.Errorf("CI verify job must retain required check name %q", requiredCheck)
 			}
+			var lane strings.Builder
+			for _, step := range verify.Steps {
+				lane.WriteString(step.Uses)
+				lane.WriteByte('\n')
+				lane.WriteString(step.Run)
+				lane.WriteByte('\n')
+			}
+			for _, required := range []string{
+				"go tool actionlint",
+				"go tool staticcheck",
+				"go tool govulncheck",
+				"npm run lint",
+				"docker buildx build --check",
+				"scripts/test-container-hardening.sh",
+				"scripts/run-security-scans.sh",
+				"actions/upload-artifact@",
+			} {
+				if !strings.Contains(lane.String(), required) {
+					return fmt.Errorf("CI qualification lane must include %q", required)
+				}
+			}
+		}
+	}
+	if err := checkDependabot(root); err != nil {
+		return err
+	}
+	if err := checkPinnedImages(root); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkDependabot(root string) error {
+	data, err := os.ReadFile(filepath.Join(root, ".github/dependabot.yml"))
+	if err != nil {
+		return err
+	}
+	var config dependabotConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("decode Dependabot config: %w", err)
+	}
+	want := map[string]bool{
+		"github-actions|/":                 false,
+		"gomod|/":                          false,
+		"npm|/web":                         false,
+		"docker|/":                         false,
+		"docker-compose|/":                 false,
+		"docker-compose|/.github/scanners": false,
+	}
+	for _, update := range config.Updates {
+		key := update.PackageEcosystem + "|" + update.Directory
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+		if key == "docker-compose|/.github/scanners" && len(update.Groups) == 0 {
+			return fmt.Errorf("dependabot scanner-image entry must group scanner and embedded-rule updates")
+		}
+	}
+	for key, found := range want {
+		if !found {
+			return fmt.Errorf("dependabot must cover %s", key)
+		}
+	}
+	return nil
+}
+
+func checkPinnedImages(root string) error {
+	for _, relative := range []string{"Dockerfile", "Dockerfile.postgres"} {
+		data, err := os.ReadFile(filepath.Join(root, relative))
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "FROM ") && !strings.Contains(strings.Fields(line)[1], "@sha256:") {
+				return fmt.Errorf("%s contains an unpinned base image: %s", relative, line)
+			}
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".github/scanners/compose.yml"))
+	if err != nil {
+		return err
+	}
+	var config scannerCompose
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("decode scanner Compose model: %w", err)
+	}
+	for _, name := range []string{"hadolint", "shellcheck", "trivy"} {
+		service, ok := config.Services[name]
+		if !ok || !strings.Contains(service.Image, "@sha256:") {
+			return fmt.Errorf("scanner %s must use a tag plus immutable manifest digest", name)
 		}
 	}
 	return nil
