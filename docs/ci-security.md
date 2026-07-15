@@ -44,7 +44,7 @@ The required check exercises:
 
 ### 2. Promotion: branch protection decides trust
 
-Only the exact revision that passed the required check may merge to `main`. Dependabot pull requests use the same secretless qualification lane and are merged only after that required check passes. The repository deliberately has no write-capable auto-approval workflow: in a solo-maintainer repository, a bot approval is not an independent review and should not be presented as one.
+Only the exact revision that passed the required check may merge to `main`. Dependabot pull requests use the same secretless qualification lane. After CI succeeds, a separate `workflow_run` job may approve only an open same-repository PR whose actor and author are `dependabot[bot]`, base is `main`, branch is `dependabot/*`, and head SHA exactly matches the successful CI run. It never checks out or executes PR code, does not merge, and has only read access plus `pull-requests: write`. Repository-wide workflow permissions remain read-only; only the narrowly required ability for Actions to submit PR reviews is enabled. This bot approval is an automation signal, not independent human review.
 
 ### 3. Secret-bearing canaries or deployment: trusted revision only
 

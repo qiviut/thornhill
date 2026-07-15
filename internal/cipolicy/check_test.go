@@ -30,6 +30,7 @@ func policyFixture(t *testing.T) string {
 		".github/branch-protection.json",
 		".github/dependabot.yml",
 		".github/scanners/compose.yml",
+		".github/workflows/dependabot-auto-approve.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
 		"Dockerfile",
@@ -48,6 +49,49 @@ func policyFixture(t *testing.T) string {
 		}
 	}
 	return target
+}
+
+func TestCheckRejectsUnsafeDependabotApproval(t *testing.T) {
+	tests := []struct {
+		name    string
+		old     string
+		new     string
+		contain string
+	}{
+		{
+			name:    "missing actor guard",
+			old:     `                "${actor}" != 'dependabot[bot]' ||`,
+			new:     `                "${actor}" != 'anyone' ||`,
+			contain: "approval lane must include",
+		},
+		{
+			name:    "checkout",
+			old:     "    steps:\n",
+			new:     "    steps:\n      - uses: actions/checkout@0000000000000000000000000000000000000000\n",
+			contain: "must not access secrets",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/dependabot-auto-approve.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
+	}
 }
 
 func TestCheckRejectsPrivilegedJobAndUnsafeTrigger(t *testing.T) {

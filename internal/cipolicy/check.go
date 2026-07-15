@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 type workflow struct {
@@ -21,6 +21,7 @@ type workflow struct {
 
 type workflowJob struct {
 	Name        string            `yaml:"name"`
+	If          string            `yaml:"if"`
 	Permissions map[string]string `yaml:"permissions"`
 	Steps       []workflowStep    `yaml:"steps"`
 }
@@ -159,8 +160,73 @@ func Check(root string) error {
 	if err := checkDependabot(root); err != nil {
 		return err
 	}
+	if err := checkDependabotApproval(root); err != nil {
+		return err
+	}
 	if err := checkPinnedImages(root); err != nil {
 		return err
+	}
+	return nil
+}
+
+func checkDependabotApproval(root string) error {
+	relative := ".github/workflows/dependabot-auto-approve.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if strings.Contains(text, "secrets.") || strings.Contains(text, "actions/checkout@") || strings.Contains(text, "pull_request_target") {
+		return fmt.Errorf("%s must not access secrets, check out code, or use pull_request_target", relative)
+	}
+
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	if len(wf.On) != 1 || wf.On["workflow_run"] == nil {
+		return fmt.Errorf("%s must trigger only from workflow_run", relative)
+	}
+	wantPermissions := map[string]string{"actions": "read", "contents": "read", "pull-requests": "write"}
+	if len(wf.Permissions) != len(wantPermissions) {
+		return fmt.Errorf("%s must have exactly the documented approval permissions", relative)
+	}
+	for name, access := range wantPermissions {
+		if wf.Permissions[name] != access {
+			return fmt.Errorf("%s permission %s must be %s", relative, name, access)
+		}
+	}
+	approve, ok := wf.Jobs["approve"]
+	if len(wf.Jobs) != 1 || !ok || approve.If != "github.event.workflow_run.conclusion == 'success'" || len(approve.Permissions) != 0 {
+		return fmt.Errorf("%s must contain only the success-gated approval job without permission overrides", relative)
+	}
+
+	var lane strings.Builder
+	for _, step := range approve.Steps {
+		if step.Uses != "" {
+			return fmt.Errorf("%s approval job must not run external actions", relative)
+		}
+		lane.WriteString(step.Run)
+		lane.WriteByte('\n')
+	}
+	for _, required := range []string{
+		".actor.login",
+		".head_repository.full_name",
+		".head_branch",
+		".head_sha",
+		`"${actor}" != 'dependabot[bot]'`,
+		`"${source_repository}" != "${REPOSITORY}"`,
+		`"${head_branch}" != dependabot/*`,
+		`.user.login == "dependabot[bot]"`,
+		`.head.repo.full_name == .base.repo.full_name`,
+		`.base.ref == "main"`,
+		`.head.sha == $sha`,
+		`repos/${REPOSITORY}/pulls/${pull_request}/reviews`,
+		"-f event=APPROVE",
+	} {
+		if !strings.Contains(lane.String(), required) {
+			return fmt.Errorf("%s approval lane must include %q", relative, required)
+		}
 	}
 	return nil
 }
