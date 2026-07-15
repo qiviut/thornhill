@@ -67,7 +67,7 @@ Production images embed the full Git commit and expose it at `GET /api/status`.
 A normal local build deliberately reports `unversioned`; it must not be confused
 with a CI-corresponding deployment.
 
-On the Thornhill host, install the user timer once:
+On the Thornhill host, install the user deployment service and optional timer:
 
 ```sh
 PUBLIC_APP_URL=https://your-host.your-tailnet.ts.net:8787/ \
@@ -75,13 +75,18 @@ PUBLIC_STATUS_URL=https://your-host.your-tailnet.ts.net:8787/api/status \
   ./scripts/install-ci-autodeploy.sh
 ```
 
-The timer polls GitHub for the newest successful **push-to-main** CI run and builds
+The timer polls GitHub every 15 minutes for the newest successful
+**push-to-main** CI run and builds
 that exact commit from a detached temporary worktree. Immediately before
 replacement it atomically pauses new dispatches in PostgreSQL and rechecks that
 no work is active. It then recreates only the app service and verifies the local
 and Tailnet UI, status endpoint, OCI label, and binary revision. Failed
 verification restores the prior revision's image **and Compose model**; the bad
-SHA is quarantined instead of being retried every two minutes. The current
+SHA is quarantined instead of being retried. During active development the timer
+may be stopped. Polls against a modified or revision-mismatched deployment
+controller defer safely, write `deferred.json` under the deployment state
+directory, and do not generate failed systemd units. Direct script execution
+continues to fail closed. The current
 correspondence is independently checked with:
 
 ```sh

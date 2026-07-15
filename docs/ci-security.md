@@ -44,7 +44,7 @@ The required check exercises:
 
 ### 2. Promotion: branch protection decides trust
 
-Only the exact revision that passed the required check may merge to `main`. Dependabot approval automation validates the source repository, actor, base branch, head branch, and exact CI-tested SHA and never executes PR code in its write-capable workflow.
+Only the exact revision that passed the required check may merge to `main`. Dependabot pull requests use the same secretless qualification lane and are merged only after that required check passes. The repository deliberately has no write-capable auto-approval workflow: in a solo-maintainer repository, a bot approval is not an independent review and should not be presented as one.
 
 ### 3. Secret-bearing canaries or deployment: trusted revision only
 
@@ -89,6 +89,14 @@ The timer deliberately polls from the host rather than giving GitHub a Tailnet
 or Docker credential. The externally reachable UI and status URLs are required
 host-local service environment values (`PUBLIC_APP_URL` and
 `PUBLIC_STATUS_URL`); they are never committed as deployment defaults.
+Polling is a convergence mechanism, not a release-time requirement: the timer
+runs every 15 minutes and may remain disabled during active development. If the
+shared checkout has a modified deployment controller, or that controller does
+not match the selected passing revision, poll mode records the reason in
+`~/.local/state/thornhill-ci-deploy/deferred.json`, exits successfully without
+deploying, and stays quiet. Direct script execution remains fail-closed for the
+same conditions. After a merge, update the checkout, run the service once, and
+enable the timer only after the deployed receipt and live revision agree.
 `CHECK_ONLY=1 scripts/deploy-passed-main.sh` fails whenever the live revision
 differs from the latest passing CI revision.
 
