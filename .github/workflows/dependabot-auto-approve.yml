@@ -1,0 +1,75 @@
+name: Approve green Dependabot pull requests
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+# This workflow never checks out or executes pull-request code. Its write token is
+# used only after the exact same-repository Dependabot SHA has passed CI.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  approve:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Approve the exact Dependabot revision CI tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          source_run=$(gh api "repos/${REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}")
+          event=$(jq -r '.event' <<<"${source_run}")
+          actor=$(jq -r '.actor.login // empty' <<<"${source_run}")
+          source_repository=$(jq -r '.head_repository.full_name // empty' <<<"${source_run}")
+          head_branch=$(jq -r '.head_branch' <<<"${source_run}")
+          head_sha=$(jq -r '.head_sha' <<<"${source_run}")
+
+          if [[ "${event}" != 'pull_request' ||
+                "${actor}" != 'dependabot[bot]' ||
+                "${source_repository}" != "${REPOSITORY}" ||
+                "${head_branch}" != dependabot/* ]]; then
+            echo 'Successful CI run is not a same-repository Dependabot PR; no review is created.'
+            exit 0
+          fi
+
+          repository_owner=${REPOSITORY%%/*}
+          pull_request=$(gh api --method GET "repos/${REPOSITORY}/pulls" \
+            -f state=open \
+            -f "head=${repository_owner}:${head_branch}" \
+            | jq -er --arg sha "${head_sha}" '
+                [ .[]
+                  | select(.user.login == "dependabot[bot]")
+                  | select(.head.repo.full_name == .base.repo.full_name)
+                  | select(.base.ref == "main")
+                  | select(.head.sha == $sha)
+                ]
+                | if length == 1 then .[0].number
+                  else error("expected one open Dependabot pull request at the CI-tested SHA")
+                  end
+              ')
+
+          if gh api --method GET "repos/${REPOSITORY}/pulls/${pull_request}/reviews" \
+            -f per_page=100 \
+            | jq -e --arg sha "${head_sha}" '
+                any(.[];
+                  .user.login == "github-actions[bot]" and
+                  .state == "APPROVED" and
+                  .commit_id == $sha
+                )
+              ' >/dev/null; then
+            echo "The CI-tested revision already has a GitHub Actions approval."
+            exit 0
+          fi
+
+          gh api --method POST "repos/${REPOSITORY}/pulls/${pull_request}/reviews" \
+            -f event=APPROVE \
+            -f "body=Approved automatically after CI succeeded for ${head_sha}."
