@@ -2,9 +2,9 @@
 Description=Poll GitHub for the latest CI-proven Thornhill main revision
 
 [Timer]
-OnBootSec=2min
-OnUnitInactiveSec=2min
-RandomizedDelaySec=20s
+OnBootSec=5min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=1min
 Persistent=true
 Unit=thornhill-ci-deploy.service
 

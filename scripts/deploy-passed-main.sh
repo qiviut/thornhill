@@ -37,6 +37,25 @@ stage=select
 compose=()
 previous_compose=()
 
+defer_or_fail_checkout() {
+  local reason=$1 temporary current_head
+  if [[ "${DEPLOY_POLL_MODE:-0}" != 1 ]]; then
+    printf 'Refusing deployment: %s\n' "${reason}" >&2
+    exit 1
+  fi
+
+  current_head=$(git rev-parse HEAD 2>/dev/null || true)
+  temporary=$(mktemp "${STATE_DIR}/deferred.json.XXXXXX")
+  jq -n --arg reason "${reason}" --arg source_commit "${revision}" \
+    --arg checkout_commit "${current_head}" \
+    '{reason:$reason,source_commit:$source_commit,checkout_commit:$checkout_commit,deferred_at:(now|todate)}' >"${temporary}"
+  mv "${temporary}" "${STATE_DIR}/deferred.json"
+  if [[ "${QUIET_DEPLOY_DEFERRALS:-0}" != 1 ]]; then
+    printf 'Deployment deferred: %s\n' "${reason}"
+  fi
+  exit 0
+}
+
 write_receipt() {
   local deployed_revision=$1 deployed_image=$2 deployed_db_image=$3 deployed_run_id=$4 deployed_run_url=$5 temporary
   temporary=$(mktemp "${STATE_DIR}/deployed.json.XXXXXX")
@@ -222,12 +241,10 @@ if ! git merge-base --is-ancestor "${revision}" "${remote_main}"; then
 fi
 controller=scripts/deploy-passed-main.sh
 if ! git diff --quiet -- "${controller}" || ! git diff --cached --quiet -- "${controller}"; then
-  echo "Refusing deployment with a modified controller: ${controller}" >&2
-  exit 1
+  defer_or_fail_checkout "modified controller ${controller}"
 fi
 if [[ $(git hash-object "${controller}") != $(git rev-parse "${revision}:${controller}") ]]; then
-  echo "Deployment controller does not match passing revision ${revision}; update the local checkout first" >&2
-  exit 1
+  defer_or_fail_checkout "controller does not match passing revision ${revision}; update the local checkout"
 fi
 
 previous_revision=$(status_revision "${LOCAL_STATUS_URL}" 2>/dev/null || true)
@@ -239,9 +256,11 @@ if [[ "${previous_revision}" == "${revision}" ]]; then
   fi
   current_image=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Config.Image}}')
   write_receipt "${revision}" "${current_image}" "${current_db_image}" "${run_id}" "${run_url}"
-  rm -f "${STATE_DIR}/failed.json"
+  rm -f "${STATE_DIR}/failed.json" "${STATE_DIR}/deferred.json"
   set_dispatch_paused FALSE
-  echo "Already running latest passing CI revision ${revision} (run ${run_id})"
+  if [[ "${QUIET_ALREADY_CURRENT:-0}" != 1 ]]; then
+    echo "Already running latest passing CI revision ${revision} (run ${run_id})"
+  fi
   exit 0
 fi
 if [[ "${CHECK_ONLY:-0}" == 1 ]]; then
@@ -330,6 +349,6 @@ if ! verify_live_revision "${revision}" || ! verify_running_db "${db_image}"; th
 fi
 set_dispatch_paused FALSE
 deployed=false
-rm -f "${STATE_DIR}/failed.json"
+rm -f "${STATE_DIR}/failed.json" "${STATE_DIR}/deferred.json"
 write_receipt "${revision}" "${image}" "${db_image}" "${run_id}" "${run_url}"
 echo "Deployed ${revision} from successful CI run ${run_id}: ${run_url}"
