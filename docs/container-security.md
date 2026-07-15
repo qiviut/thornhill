@@ -11,10 +11,11 @@ Thornhill treats the container image as a tested release artifact, not merely a 
 - pin every base and scanner image with a readable tag plus immutable manifest digest;
 - run the application as numeric UID/GID `65532:65532` on Chainguard's minimal `static` image;
 - keep the root filesystem read-only, provide only explicit `/tmp` and `/data` writable mounts, drop every Linux capability, retain Docker's default seccomp profile, set `no-new-privileges`, and impose a PID limit;
+- run PostgreSQL with a read-only root filesystem, writable storage only at the named database volume plus bounded `/run/postgresql` and `/tmp` tmpfs mounts, all capabilities dropped except the five required by the official first-start ownership/drop-privilege path, `no-new-privileges`, a PID limit, and no published host port;
 - expose an image-native health check that verifies the status endpoint is ready and, for release builds, versioned and serving the image's linked Git revision; unversioned development images can be healthy but remain ineligible for deployment;
 - build and test the actual final application and PostgreSQL images on every pull request without repository or deployment secrets.
 
-PostgreSQL remains a separate container and the application persists no state in its root filesystem. Node and Go toolchains never enter the application runtime layer.
+PostgreSQL remains a separate container and the application persists no state in its root filesystem. PostgreSQL's root entrypoint is an initialization boundary rather than the database runtime identity: after preparing the persistent volume, the database process directly beneath Docker's init is verified to run as upstream UID `70`. Node and Go toolchains never enter the application runtime layer.
 
 ## Build and dependency discipline
 
@@ -22,7 +23,7 @@ PostgreSQL remains a separate container and the application persists no state in
 
 BuildKit is mandatory. CI runs Dockerfile build checks before building, and the host deployer uses `docker buildx build --pull --load`. The pinned digest fixes the starting filesystem while the readable tag keeps Dependabot updates reviewable. `--pull` ensures the pinned reference is resolved rather than accidentally using an unrelated local tag.
 
-The PostgreSQL wrapper starts from a pinned official image and applies current Alpine repository security fixes. This is an explicit trade-off: the base is reproducible, while the final OS package set tracks security fixes available at build time. The resulting image, rather than only its source manifest, is scanned and recorded in an SBOM.
+The PostgreSQL wrapper starts from a pinned official image and applies current Alpine repository security fixes. This is an explicit trade-off: the base is reproducible, while the final OS package set tracks security fixes available at build time. PostgreSQL builds use `--no-cache` so a previously cached `apk upgrade` layer cannot hide newly published fixes. The resulting image, rather than only its source manifest, is scanned and recorded in an SBOM.
 
 ## Qualification pipeline
 
@@ -37,7 +38,7 @@ The required `Go, web, and image build` job is one secretless, read-only qualifi
 - ShellCheck over every tracked shell script;
 - Trivy repository dependency and Dockerfile-misconfiguration scans;
 - Trivy scans of the built application and PostgreSQL images;
-- a runtime harness that verifies numeric non-root execution, image health, exact source-revision reporting, read-only root, all capabilities dropped, `no-new-privileges`, and graceful `SIGTERM` shutdown;
+- a runtime harness that verifies application and PostgreSQL runtime identities, image health, exact source-revision reporting, read-only roots, least capabilities, `no-new-privileges`, PID limits, and graceful application `SIGTERM` shutdown;
 - real PostgreSQL migration/concurrency integration tests and Compose-model validation;
 - CycloneDX SBOM generation and 30-day artifact retention for both images.
 
@@ -45,7 +46,7 @@ The vulnerability gate rejects fixable `HIGH` or `CRITICAL` findings. Unfixed fi
 
 ### PostgreSQL scanner scope
 
-Trivy's Dockerfile non-root rule is skipped only for `Dockerfile.postgres`: the official entrypoint must initially have enough authority to initialize and fix ownership on a fresh named volume before dropping to the `postgres` user. The database is not published to a host port in the production Compose model.
+Trivy's Dockerfile non-root rule is skipped only for `Dockerfile.postgres`: the official entrypoint must initially have enough authority to initialize and fix ownership on a fresh named volume before dropping to the `postgres` user. Compose drops every ambient capability, adds back only `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID`, and `SETUID` for that transition, and the runtime harness verifies the resulting database process is UID `70`. The database is not published to a host port in the production Compose model.
 
 The third-party `gosu` launcher is excluded from language-package gating because signature-only scanning reports every Go standard-library advisory compiled into that helper without reachability analysis. The PostgreSQL image is still gated on all OS packages, including current Alpine fixes, and receives a complete CycloneDX inventory. Thornhill's own Go binary receives full OS and language-aware image scanning plus call-aware `govulncheck`.
 

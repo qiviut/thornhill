@@ -29,11 +29,11 @@ fail_with_logs() {
 
 postgres_ready() {
   # The official image briefly starts a temporary PostgreSQL server during
-  # initialization, then stops it before exec'ing the final server as PID 1.
-  # Requiring PID 1 to be postgres prevents a transient pg_isready success from
-  # racing that intentional shutdown.
+  # initialization, then stops it before exec'ing the final server as the sole
+  # direct child of Docker's init. Requiring that process shape prevents a
+  # transient pg_isready success from racing the intentional shutdown.
   docker exec "$db" sh -c \
-    'test "$(cat /proc/1/comm)" = postgres && pg_isready --username thornhill --dbname thornhill' \
+    'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1 && test "$(cat "/proc/$1/comm")" = postgres && pg_isready --username thornhill --dbname thornhill' \
     >/dev/null 2>&1
 }
 
@@ -56,6 +56,19 @@ docker run --detach --name "$db" --network "$network" \
   --env POSTGRES_USER=thornhill \
   --env POSTGRES_PASSWORD=thornhill-test-only \
   --env POSTGRES_DB=thornhill \
+  --init \
+  --read-only \
+  --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \
+  --tmpfs /run/postgresql:rw,noexec,nosuid,size=16m,uid=70,gid=70,mode=2775 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE \
+  --cap-add FOWNER \
+  --cap-add SETGID \
+  --cap-add SETUID \
+  --security-opt no-new-privileges:true \
+  --pids-limit 256 \
   "$db_image" >/dev/null
 
 for _ in {1..60}; do
@@ -65,6 +78,21 @@ for _ in {1..60}; do
   sleep 1
 done
 postgres_ready || fail_with_logs 'PostgreSQL did not become ready'
+
+db_uid=$(docker exec "$db" sh -c 'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1; stat -c %u "/proc/$1"')
+db_readonly=$(docker inspect "$db" --format '{{.HostConfig.ReadonlyRootfs}}')
+db_cap_drop=$(docker inspect "$db" --format '{{json .HostConfig.CapDrop}}')
+db_cap_add=$(docker inspect "$db" --format '{{json .HostConfig.CapAdd}}')
+db_security_opt=$(docker inspect "$db" --format '{{json .HostConfig.SecurityOpt}}')
+db_pids_limit=$(docker inspect "$db" --format '{{.HostConfig.PidsLimit}}')
+[[ "$db_uid" == 70 ]]
+[[ "$db_readonly" == true ]]
+[[ "$db_cap_drop" == *'ALL'* ]]
+for capability in CHOWN DAC_OVERRIDE FOWNER SETGID SETUID; do
+  [[ "$db_cap_add" == *"$capability"* ]]
+done
+[[ "$db_security_opt" == *'no-new-privileges'* ]]
+[[ "$db_pids_limit" == 256 ]]
 
 docker run --detach --name "$app" --network "$network" \
   --publish 127.0.0.1::8787 \
@@ -106,4 +134,5 @@ versioned=$(jq -r '.versioned // false' <<<"$status")
 docker stop --time 10 "$app" >/dev/null
 [[ "$(docker inspect "$app" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'Application did not stop cleanly on SIGTERM'
 
-printf 'Container hardening passed: revision=%s user=%s health=healthy read_only=true cap_drop=ALL\n' "$revision" "$runtime_user"
+printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL db_user=%s db_read_only=true db_cap_drop=ALL\n' \
+  "$revision" "$runtime_user" "$db_uid"

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.postgres
-    image: thornhill-postgres
+    image: ${THORNHILL_POSTGRES_IMAGE:-thornhill-postgres}
     restart: unless-stopped
     environment:
       POSTGRES_USER: thornhill
@@ -13,6 +13,25 @@ services:
       # PostgreSQL 18+ stores versioned clusters below /var/lib/postgresql.
       # Mount the parent so pg_upgrade --link can cross major versions safely.
       - dbdata:/var/lib/postgresql
+    # The official entrypoint starts with only the capabilities needed to
+    # initialize/chown a fresh volume, then drops to UID/GID 70 for postgres.
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 256
+    tmpfs:
+      - /run/postgresql:rw,noexec,nosuid,size=16m,uid=70,gid=70,mode=2775
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U thornhill"]
       interval: 5s

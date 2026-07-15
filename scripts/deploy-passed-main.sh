@@ -23,11 +23,14 @@ revision=""
 run_id=""
 run_url=""
 image=""
+db_image=""
 previous_revision=""
 previous_image=""
+previous_db_image=""
 tmp=""
 source_dir=""
 previous_source_dir=""
+db_image_override=""
 deployed=false
 draining=false
 stage=select
@@ -35,11 +38,12 @@ compose=()
 previous_compose=()
 
 write_receipt() {
-  local deployed_revision=$1 deployed_image=$2 deployed_run_id=$3 deployed_run_url=$4 temporary
+  local deployed_revision=$1 deployed_image=$2 deployed_db_image=$3 deployed_run_id=$4 deployed_run_url=$5 temporary
   temporary=$(mktemp "${STATE_DIR}/deployed.json.XXXXXX")
   jq -n --arg source_commit "${deployed_revision}" --arg image "${deployed_image}" \
-    --argjson ci_run_id "${deployed_run_id}" --arg ci_url "${deployed_run_url}" \
-    '{source_commit:$source_commit,image:$image,ci_run_id:$ci_run_id,ci_url:$ci_url}' >"${temporary}"
+    --arg db_image "${deployed_db_image}" --argjson ci_run_id "${deployed_run_id}" \
+    --arg ci_url "${deployed_run_url}" \
+    '{source_commit:$source_commit,image:$image,db_image:$db_image,ci_run_id:$ci_run_id,ci_url:$ci_url}' >"${temporary}"
   mv "${temporary}" "${STATE_DIR}/deployed.json"
 }
 
@@ -120,6 +124,21 @@ verify_running_revision() {
   [[ "${label}" == "${expected}" && "${binary}" == "thornhill ${expected}" ]]
 }
 
+verify_running_db() {
+  local expected_image=$1 actual_image health read_only cap_drop security_opt pids_limit runtime_uid
+  actual_image=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.Config.Image}}')
+  health=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.State.Health.Status}}')
+  read_only=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.ReadonlyRootfs}}')
+  cap_drop=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.CapDrop}}')
+  security_opt=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.SecurityOpt}}')
+  pids_limit=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.PidsLimit}}')
+  runtime_uid=$(docker exec "${PROJECT_NAME}-db-1" sh -c \
+    'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1; stat -c %u "/proc/$1"')
+  [[ "${actual_image}" == "${expected_image}" && "${health}" == healthy && "${read_only}" == true && \
+    "${cap_drop}" == *ALL* && "${security_opt}" == *no-new-privileges* && \
+    "${pids_limit}" == 256 && "${runtime_uid}" == 70 ]]
+}
+
 verify_live_revision() {
   local expected=$1 local_revision public_revision
   curl --fail --silent --show-error --output /dev/null --max-time 15 "${LOCAL_APP_URL}"
@@ -143,9 +162,10 @@ cleanup_worktrees() {
 
 rollback() {
   local rollback_ok=false deadline
-  if [[ "${deployed}" == true && -n "${previous_image}" && ${#previous_compose[@]} -gt 0 ]]; then
-    echo "${stage} failed; rolling back to ${previous_revision} (${previous_image})" >&2
-    if THORNHILL_APP_IMAGE="${previous_image}" "${previous_compose[@]}" up -d --no-build --force-recreate app >/dev/null; then
+  if [[ "${deployed}" == true && -n "${previous_image}" && -n "${previous_db_image}" && ${#previous_compose[@]} -gt 0 ]]; then
+    echo "${stage} failed; rolling back to ${previous_revision} (${previous_image}, ${previous_db_image})" >&2
+    if THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
+      "${previous_compose[@]}" up -d --no-build --force-recreate db app >/dev/null; then
       deadline=$((SECONDS + TIMEOUT_SECONDS))
       while (( SECONDS < deadline )); do
         if verify_live_revision "${previous_revision}" >/dev/null 2>&1; then
@@ -212,12 +232,13 @@ fi
 
 previous_revision=$(status_revision "${LOCAL_STATUS_URL}" 2>/dev/null || true)
 if [[ "${previous_revision}" == "${revision}" ]]; then
-  if ! verify_live_revision "${revision}"; then
-    echo "Revision ${revision} is local but failed full local/Tailnet/image/binary verification" >&2
+  current_db_image=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.Config.Image}}')
+  if ! verify_live_revision "${revision}" || ! verify_running_db "${current_db_image}"; then
+    echo "Revision ${revision} is local but failed full app/PostgreSQL runtime verification" >&2
     exit 1
   fi
   current_image=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Config.Image}}')
-  write_receipt "${revision}" "${current_image}" "${run_id}" "${run_url}"
+  write_receipt "${revision}" "${current_image}" "${current_db_image}" "${run_id}" "${run_url}"
   rm -f "${STATE_DIR}/failed.json"
   set_dispatch_paused FALSE
   echo "Already running latest passing CI revision ${revision} (run ${run_id})"
@@ -239,8 +260,10 @@ if [[ ! "${previous_revision}" =~ ^[0-9a-f]{40}$ ]] || ! verify_live_revision "$
   exit 1
 fi
 previous_image=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Config.Image}}')
-if [[ -z "${previous_image}" ]]; then
-  echo "Refusing deployment without an existing app image for rollback" >&2
+previous_db_image=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.Config.Image}}')
+if [[ -z "${previous_image}" || -z "${previous_db_image}" ]] || \
+  ! docker image inspect "${previous_image}" "${previous_db_image}" >/dev/null 2>&1; then
+  echo "Refusing deployment without existing app and PostgreSQL images for rollback" >&2
   exit 1
 fi
 
@@ -250,6 +273,7 @@ previous_source_dir="${tmp}/previous"
 git worktree add --quiet --detach "${source_dir}" "${revision}"
 git worktree add --quiet --detach "${previous_source_dir}" "${previous_revision}"
 image="thornhill-app:${revision}"
+db_image="thornhill-postgres:${revision}"
 stage=build
 docker buildx version >/dev/null || {
   echo "Docker Buildx is required for reproducible BuildKit builds; install the Docker buildx CLI plugin" >&2
@@ -259,6 +283,9 @@ docker buildx build --pull --load \
   --build-arg "THORNHILL_REVISION=${revision}" \
   --label "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
   --tag "${image}" "${source_dir}"
+docker buildx build --pull --no-cache --load \
+  --file "${source_dir}/Dockerfile.postgres" \
+  --tag "${db_image}" "${source_dir}"
 label=$(docker image inspect "${image}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
 if [[ "${label}" != "${revision}" || $(docker run --rm "${image}" --version) != "thornhill ${revision}" ]]; then
   echo "Built image or binary does not report ${revision}" >&2
@@ -268,8 +295,11 @@ fi
 # Link the host environment only after the untrusted build context has been consumed.
 ln -s "${ROOT}/.env" "${source_dir}/.env"
 ln -s "${ROOT}/.env" "${previous_source_dir}/.env"
-compose=(docker compose --project-name "${PROJECT_NAME}" -f "${source_dir}/docker-compose.yml" -f "${source_dir}/docker-compose.host.yml")
-previous_compose=(docker compose --project-name "${PROJECT_NAME}" -f "${previous_source_dir}/docker-compose.yml" -f "${previous_source_dir}/docker-compose.host.yml")
+db_image_override="${tmp}/db-image.override.yml"
+printf 'services:\n  db:\n    image: %s\n' \
+  "\${THORNHILL_POSTGRES_IMAGE:?set THORNHILL_POSTGRES_IMAGE}" >"${db_image_override}"
+compose=(docker compose --project-name "${PROJECT_NAME}" -f "${source_dir}/docker-compose.yml" -f "${source_dir}/docker-compose.host.yml" -f "${db_image_override}")
+previous_compose=(docker compose --project-name "${PROJECT_NAME}" -f "${previous_source_dir}/docker-compose.yml" -f "${previous_source_dir}/docker-compose.host.yml" -f "${db_image_override}")
 
 stage=drain
 ensure_deployment_control
@@ -283,21 +313,23 @@ fi
 
 stage=deploy
 deployed=true
-THORNHILL_APP_IMAGE="${image}" "${compose[@]}" up -d --no-build --force-recreate app
+THORNHILL_APP_IMAGE="${image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+  "${compose[@]}" up -d --no-build --force-recreate db app
 stage=verify
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 while (( SECONDS < deadline )); do
-  if verify_live_revision "${revision}" >/dev/null 2>&1; then
+  if verify_live_revision "${revision}" >/dev/null 2>&1 && \
+    verify_running_db "${db_image}" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-if ! verify_live_revision "${revision}"; then
-  echo "Local/Tailnet/readiness/image/binary verification failed for ${revision}" >&2
+if ! verify_live_revision "${revision}" || ! verify_running_db "${db_image}"; then
+  echo "Local/Tailnet/app/PostgreSQL runtime verification failed for ${revision}" >&2
   exit 1
 fi
 set_dispatch_paused FALSE
 deployed=false
 rm -f "${STATE_DIR}/failed.json"
-write_receipt "${revision}" "${image}" "${run_id}" "${run_url}"
+write_receipt "${revision}" "${image}" "${db_image}" "${run_id}" "${run_url}"
 echo "Deployed ${revision} from successful CI run ${run_id}: ${run_url}"

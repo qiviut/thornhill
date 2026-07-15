@@ -90,8 +90,9 @@ curl -fsS https://your-host.your-tailnet.ts.net:8787/api/status | jq .
 ```
 
 The durable receipt is stored at
-`~/.local/state/thornhill-ci-deploy/deployed.json`; it includes the source SHA and
-GitHub Actions run URL.
+`~/.local/state/thornhill-ci-deploy/deployed.json`; it includes the source SHA,
+the revision-tagged application and PostgreSQL images, and the GitHub Actions
+run URL.
 
 ## Verification and maintenance
 

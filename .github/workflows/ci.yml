@@ -113,7 +113,10 @@ jobs:
           test "$(docker run --rm thornhill:ci --version)" = "thornhill ${GITHUB_SHA}"
 
       - name: Build PostgreSQL image
-        run: docker buildx build --pull --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
+        # Dockerfile.postgres deliberately refreshes Alpine security packages;
+        # bypass a stale cached `apk upgrade` layer so the scan covers today's
+        # repository fixes rather than only the pinned upstream base.
+        run: docker buildx build --pull --no-cache --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
 
       - name: Test container health and runtime hardening
         run: scripts/test-container-hardening.sh thornhill:ci thornhill-postgres:ci
