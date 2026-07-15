@@ -68,7 +68,7 @@ for image in "$@"; do
     --scanners vuln
     --ignore-unfixed
     --exit-code 1
-    --severity HIGH,CRITICAL
+    --severity "HIGH,CRITICAL"
     --timeout 10m
   )
   if [[ "$image" == *postgres* ]]; then
