@@ -20,8 +20,15 @@ Run before every commit:
 gofmt -w .
 go vet ./...
 go test -race ./...
-(cd web && npm ci && npm run check && npm run build)
-docker build --pull --tag thornhill:local .
+go tool staticcheck ./...
+go tool govulncheck ./...
+go tool actionlint .github/workflows/*.yml
+(cd web && npm ci --ignore-scripts && npm run check && npm run lint && npm run build && npm audit --audit-level=high)
+docker buildx build --check .
+docker buildx build --pull --load --build-arg THORNHILL_REVISION=0123456789abcdef0123456789abcdef01234567 --tag thornhill:local .
+docker buildx build --pull --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
+scripts/test-container-hardening.sh thornhill:local thornhill-postgres:ci
+scripts/run-security-scans.sh thornhill:local thornhill-postgres:ci
 ```
 
-GitHub Actions repeats these checks on pushes and pull requests. Dependabot maintains Go, npm, Docker, and Actions dependencies.
+GitHub Actions repeats these checks on pushes and pull requests. Dependabot maintains Go modules and tool rules, npm/Biome rules, Dockerfile and Compose images, scanner rule engines, and Actions dependencies. See `docs/container-security.md` for scope and exceptions.

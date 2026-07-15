@@ -1,0 +1,30 @@
+name: thornhill-security-tools
+
+# These images contain the scanner rule engines. Their tags and immutable
+# manifest digests are updated by Dependabot's docker-compose ecosystem.
+services:
+  hadolint:
+    image: hadolint/hadolint:v2.14.0-debian@sha256:158cd0184dcaa18bd8ec20b61f4c1cabdf8b32a592d062f57bdcb8e4c1d312e2
+    entrypoint: ["/bin/hadolint"]
+    user: "${SCANNER_UID:-1000}:${SCANNER_GID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:ro
+
+  shellcheck:
+    image: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+    user: "${SCANNER_UID:-1000}:${SCANNER_GID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:ro
+
+  trivy:
+    image: aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f
+    user: "${SCANNER_UID:-1000}:${SCANNER_GID:-1000}"
+    working_dir: /workspace
+    environment:
+      TRIVY_CACHE_DIR: /trivy-cache
+    volumes:
+      - .:/workspace:ro
+      - ${TRIVY_CACHE_DIR:-/tmp/thornhill-trivy-cache}:/trivy-cache
+      - ${SCAN_OUTPUT_DIR:-/tmp/thornhill-scan-output}:/output

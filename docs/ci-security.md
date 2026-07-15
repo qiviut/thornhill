@@ -33,10 +33,12 @@ Increase `required_approving_review_count` when a reliable second reviewer exist
 The required check exercises:
 
 - a Gitleaks scan over the fetched Git history before builds execute;
-- Go formatting, vetting, race tests, and short invariant-driven fuzz campaigns;
+- Go formatting, vetting, Staticcheck, `govulncheck`, race tests, and short invariant-driven fuzz campaigns;
 - an ephemeral deterministic OpenAI-compatible provider process;
-- web dependency installation, explicit platform-package loading, checks, and production build; transient registry omissions of optional native packages are retried and still fail closed after three attempts;
-- application and PostgreSQL image builds;
+- web dependency installation, TypeScript and Biome analysis, checks, and production build;
+- version-or-digest-pinned Actionlint, Hadolint, ShellCheck, Gitleaks, and Trivy tooling with Dependabot-covered engines and embedded rule sets;
+- BuildKit validation plus application and PostgreSQL image builds from tag-and-digest-pinned bases;
+- built-image vulnerability gates, CycloneDX SBOMs, and runtime checks for health, non-root execution, read-only root, dropped capabilities, `no-new-privileges`, and graceful shutdown;
 - migrations and concurrent approval claims against an ephemeral PostgreSQL container whose username, database, password, container name, host port, and test data are freshly generated from cryptographic randomness;
 - the Compose delivery model and this policy itself.
 
@@ -90,10 +92,14 @@ host-local service environment values (`PUBLIC_APP_URL` and
 differs from the latest passing CI revision.
 
 This is **source-revision correspondence**, not binary artifact promotion: CI and
-the host independently rebuild the same commit. OCI labels, linker metadata, and
-runtime checks prevent source-SHA ambiguity, but mutable upstream base-image tags
-can still produce different image digests. Digest-pinned bases plus a signed CI
-artifact/provenance lane would be required for byte-identical artifact assurance.
+the host independently rebuild the same commit. OCI labels, linker metadata,
+runtime checks, and digest-pinned bases eliminate source and base-image ambiguity,
+but the PostgreSQL wrapper deliberately applies the current Alpine security
+repository at build time. A signed CI artifact/provenance lane would still be
+required for byte-identical artifact assurance.
+
+The detailed container design, scanner policy, exceptions, maintenance cadence,
+and primary-source research are in [container-security.md](container-security.md).
 
 ## Deterministic dummy provider
 

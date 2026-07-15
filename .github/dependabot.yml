@@ -1,20 +1,52 @@
 version: 2
 updates:
-  # Dependabot proposes all supported update classes by default, including majors.
-  # Daily checks minimize time spent behind the latest release.
+  # Workflow action revisions, including Gitleaks and SBOM publication.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: daily }
     open-pull-requests-limit: 20
+
+  # Runtime modules plus Go tool/rule engines declared by `tool` in go.mod.
   - package-ecosystem: gomod
     directory: /
     schedule: { interval: daily }
     open-pull-requests-limit: 20
+    groups:
+      go-static-analysis:
+        patterns:
+          - github.com/rhysd/actionlint
+          - golang.org/x/vuln
+          - honnef.co/go/tools
+
+  # Web runtime dependencies and Biome's versioned built-in ruleset.
   - package-ecosystem: npm
     directory: /web
     schedule: { interval: daily }
     open-pull-requests-limit: 20
+    groups:
+      web-static-analysis:
+        patterns:
+          - "@biomejs/biome"
+
+  # Dockerfile base tags and immutable manifest digests.
   - package-ecosystem: docker
     directory: /
     schedule: { interval: daily }
     open-pull-requests-limit: 20
+
+  # Production Compose image references (and future additions).
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule: { interval: daily }
+    open-pull-requests-limit: 20
+
+  # Hadolint, ShellCheck, and Trivy embed their maintained rules/checks in
+  # pinned images; this entry updates both image tags and manifest digests.
+  - package-ecosystem: docker-compose
+    directory: /.github/scanners
+    schedule: { interval: daily }
+    open-pull-requests-limit: 20
+    groups:
+      container-scanners-and-rules:
+        patterns:
+          - "*"

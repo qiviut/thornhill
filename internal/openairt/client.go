@@ -85,16 +85,16 @@ func DialURL(ctx context.Context, apiKey, callID, baseURL string, log *slog.Logg
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || u.Host == "" || (u.Scheme != "wss" && u.Scheme != "ws") {
-		return nil, errors.New("Realtime sideband endpoint must be an absolute ws or wss URL")
+		return nil, errors.New("realtime sideband endpoint must be an absolute ws or wss URL")
 	}
 	if u.User != nil || u.Fragment != "" {
-		return nil, errors.New("Realtime sideband endpoint must not contain userinfo or a fragment")
+		return nil, errors.New("realtime sideband endpoint must not contain userinfo or a fragment")
 	}
 	if u.Scheme == "ws" {
 		host := u.Hostname()
 		ip := net.ParseIP(host)
 		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			return nil, errors.New("Realtime sideband endpoint must use wss except on loopback")
+			return nil, errors.New("realtime sideband endpoint must use wss except on loopback")
 		}
 	}
 	query := u.Query()

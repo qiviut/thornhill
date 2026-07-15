@@ -23,7 +23,7 @@ jobs:
   verify:
     name: Go, web, and image build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v5.0.0
@@ -45,6 +45,8 @@ jobs:
           set -euo pipefail
           go_image=$(awk '$1 == "FROM" && $2 ~ /^golang:/ { print $2; exit }' Dockerfile)
           node_image=$(awk '$1 == "FROM" && $2 ~ /^node:/ { print $2; exit }' Dockerfile)
+          go_image=${go_image%@sha256:*}
+          node_image=${node_image%@sha256:*}
           go_version=${go_image#golang:}
           go_version=${go_version%-alpine}
           node_version=${node_image#node:}
@@ -56,15 +58,19 @@ jobs:
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
         with:
           go-version: ${{ steps.toolchains.outputs.go }}
-          # Avoid mutable cache restores in the untrusted-code qualification lane.
+          # Do not restore mutable caches into the untrusted qualification lane.
           cache: false
 
-      - name: Check Go formatting
-        run: test -z "$(gofmt -l .)"
+      - name: Check Go formatting and workflows
+        run: |
+          test -z "$(gofmt -l .)"
+          go tool actionlint .github/workflows/*.yml
 
-      - name: Vet and test Go
+      - name: Analyze and test Go
         run: |
           go vet ./...
+          go tool staticcheck ./...
+          go tool govulncheck ./...
           go test -race ./...
 
       - name: Fuzz authority and protocol boundaries
@@ -78,20 +84,27 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
+          # Deliberately omit `cache` in the public-PR qualification lane.
           node-version: ${{ steps.toolchains.outputs.node }}
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
       - name: Verify web client
         working-directory: web
         run: |
-          npm ci
+          npm ci --ignore-scripts
           npm run check
+          npm run lint
           npm run build
+          npm audit --audit-level=high
+
+      - name: Validate Dockerfiles with BuildKit
+        run: |
+          docker buildx version
+          docker buildx build --check .
+          docker buildx build --check --file Dockerfile.postgres .
 
       - name: Build application image
         run: |
-          docker build --pull \
+          docker buildx build --pull --load \
             --build-arg "THORNHILL_REVISION=${GITHUB_SHA}" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --tag thornhill:ci .
@@ -100,7 +113,10 @@ jobs:
           test "$(docker run --rm thornhill:ci --version)" = "thornhill ${GITHUB_SHA}"
 
       - name: Build PostgreSQL image
-        run: docker build --pull --file Dockerfile.postgres --tag thornhill-postgres:ci .
+        run: docker buildx build --pull --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
+
+      - name: Test container health and runtime hardening
+        run: scripts/test-container-hardening.sh thornhill:ci thornhill-postgres:ci
 
       - name: Test randomized PostgreSQL migrations and approval claims
         run: scripts/test-postgres-integration.sh
@@ -109,3 +125,20 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config --quiet
+          SCANNER_UID=$(id -u) SCANNER_GID=$(id -g) \
+            docker compose --file .github/scanners/compose.yml --project-directory . config --quiet
+
+      - name: Scan source, configuration, and final images
+        env:
+          SCAN_OUTPUT_DIR: ${{ runner.temp }}/thornhill-scan
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: scripts/run-security-scans.sh thornhill:ci thornhill-postgres:ci
+
+      - name: Preserve CycloneDX SBOMs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thornhill-sboms-${{ github.sha }}
+          path: ${{ runner.temp }}/thornhill-scan/*.cdx.json
+          if-no-files-found: warn
+          retention-days: 30

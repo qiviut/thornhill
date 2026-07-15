@@ -28,8 +28,12 @@ func policyFixture(t *testing.T) string {
 	target := t.TempDir()
 	for _, relative := range []string{
 		".github/branch-protection.json",
+		".github/dependabot.yml",
+		".github/scanners/compose.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
+		"Dockerfile",
+		"Dockerfile.postgres",
 	} {
 		data, err := os.ReadFile(filepath.Join(source, relative))
 		if err != nil {
@@ -97,5 +101,22 @@ func TestCheckRejectsPrivilegedJobAndUnsafeTrigger(t *testing.T) {
 				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
 			}
 		})
+	}
+}
+
+func TestCheckRejectsMissingScannerUpdateCoverage(t *testing.T) {
+	root := policyFixture(t)
+	path := filepath.Join(root, ".github/dependabot.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = []byte(strings.Replace(string(data), "    directory: /.github/scanners\n", "    directory: /.github/scanners-disabled\n", 1))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Check(root)
+	if err == nil || !strings.Contains(err.Error(), "docker-compose|/.github/scanners") {
+		t.Fatalf("Check() error = %v, want scanner Dependabot coverage error", err)
 	}
 }

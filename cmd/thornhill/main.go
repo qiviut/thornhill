@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,9 +25,18 @@ import (
 	"thornhill/internal/summarize"
 )
 
+const defaultHealthcheckURL = "http://127.0.0.1:8787/api/status"
+
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Printf("thornhill %s\n", buildinfo.Commit)
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		if err := runHealthcheck(os.Getenv("HEALTHCHECK_URL")); err != nil {
+			fmt.Fprintln(os.Stderr, "healthcheck:", err)
+			os.Exit(1)
+		}
 		return
 	}
 	lvl := slog.LevelInfo
@@ -135,4 +145,45 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("bye")
+}
+
+func runHealthcheck(rawURL string) error {
+	if rawURL == "" {
+		rawURL = defaultHealthcheckURL
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected HTTP status %s", resp.Status)
+	}
+	var status struct {
+		Status       string `json:"status"`
+		SourceCommit string `json:"source_commit"`
+		Versioned    bool   `json:"versioned"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return fmt.Errorf("decode status: %w", err)
+	}
+	if buildinfo.Valid() {
+		if status.Status != "ok" || !status.Versioned || status.SourceCommit != buildinfo.Commit {
+			return fmt.Errorf("unhealthy status=%q versioned=%t source_commit=%q", status.Status, status.Versioned, status.SourceCommit)
+		}
+		return nil
+	}
+	// Development images are intentionally allowed to run without fabricated
+	// provenance. CI and the deployer reject them for promotion, while the
+	// Docker health check still provides a useful liveness/readiness signal.
+	if status.Status != "unversioned" || status.Versioned || status.SourceCommit != buildinfo.Commit {
+		return fmt.Errorf("unhealthy unversioned status=%q versioned=%t source_commit=%q", status.Status, status.Versioned, status.SourceCommit)
+	}
+	return nil
 }
