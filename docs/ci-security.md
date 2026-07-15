@@ -80,8 +80,9 @@ an operator explicitly sets `RETRY_FAILED=1`.
 This preserves a directly inspectable chain:
 
 ```text
-GitHub push CI run → head SHA → detached source worktree → OCI revision label
-  → linked binary commit → live /api/status → deployed.json receipt
+GitHub push CI run → head SHA → detached source worktree → revision-tagged app
+  and PostgreSQL images → OCI app revision label → linked binary commit
+  → live /api/status and PostgreSQL hardening checks → deployed.json receipt
 ```
 
 The timer deliberately polls from the host rather than giving GitHub a Tailnet
