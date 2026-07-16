@@ -9,7 +9,8 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "noEmit": true,
-    "noUnusedLocals": true
+    "noUnusedLocals": true,
+    "types": ["node"]
   },
   "include": ["src"]
 }

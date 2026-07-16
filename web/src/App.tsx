@@ -1,37 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ControlLink, type BusEvent } from "./ws";
 import { earcons, playPrebaked, prefetchPrebaked, unlockAudio } from "./earcons";
-
-type SessionState = "PARKED" | "PARKING" | "QUIET" | "LIVE";
-
-interface Approval {
-  id: string;
-  state: "pending" | "sending" | "parked" | "indeterminate";
-  description?: string;
-  command?: string;
-  pattern_keys?: string[];
-  allow_permanent: boolean;
-  parked_at?: string;
-  park_reason?: string;
-}
-
-interface Progress {
-  tool?: string;
-  label?: string;
-  state: string;
-  updated_at: string;
-}
-
-interface Job {
-  id: string;
-  display_name: string;
-  status: string;
-  question?: string;
-  approvals?: Approval[];
-  progress?: Progress;
-  result_digest?: string;
-  error?: string;
-}
+import {
+  type Job,
+  parseJobSnapshot,
+  type SessionState,
+  upsertJobHistory,
+} from "./protocol";
 
 interface TranscriptLine {
   id: string;
@@ -56,6 +31,10 @@ export default function App() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const micRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const connectAbortRef = useRef<AbortController | null>(null);
+  const drainAbortRef = useRef<AbortController | null>(null);
+  const rolloverTimerRef = useRef<number | null>(null);
+  const callGenerationRef = useRef(0);
   const linkRef = useRef<ControlLink | null>(null);
   const mutedRef = useRef(false);
   const sessionRef = useRef<SessionState>("PARKED");
@@ -66,7 +45,22 @@ export default function App() {
     linkRef.current?.sendState(mutedRef.current, document.hidden);
   }, []);
 
+  const cancelParkWork = useCallback(() => {
+    drainAbortRef.current?.abort();
+    drainAbortRef.current = null;
+    if (rolloverTimerRef.current !== null) {
+      window.clearTimeout(rolloverTimerRef.current);
+      rolloverTimerRef.current = null;
+    }
+  }, []);
+
   const teardownCall = useCallback(() => {
+    cancelParkWork();
+    callGenerationRef.current += 1;
+    connectAbortRef.current?.abort();
+    connectAbortRef.current = null;
+    connectingRef.current = false;
+    setConnecting(false);
     pcRef.current?.close();
     pcRef.current = null;
     micRef.current?.getTracks().forEach((track) => {
@@ -74,10 +68,16 @@ export default function App() {
     });
     micRef.current = null;
     if (audioRef.current) audioRef.current.srcObject = null;
-  }, []);
+  }, [cancelParkWork]);
 
   const connect = useCallback(async () => {
     if (pcRef.current || connectingRef.current) return;
+		cancelParkWork();
+    const generation = callGenerationRef.current + 1;
+    callGenerationRef.current = generation;
+    const controller = new AbortController();
+    connectAbortRef.current = controller;
+    const ownsCall = () => callGenerationRef.current === generation && !controller.signal.aborted;
     connectingRef.current = true;
     setConnecting(true);
     setNotice("");
@@ -85,6 +85,12 @@ export default function App() {
     prefetchPrebaked(PREBAKE_KEYS);
     try {
       const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!ownsCall()) {
+        mic.getTracks().forEach((track) => {
+          track.stop();
+        });
+        return;
+      }
       micRef.current = mic;
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
@@ -93,9 +99,10 @@ export default function App() {
         pc.addTrack(track, mic);
       }
       pc.ontrack = (ev) => {
-        if (audioRef.current) audioRef.current.srcObject = ev.streams[0];
+				if (ownsCall() && pcRef.current === pc && audioRef.current) audioRef.current.srcObject = ev.streams[0];
       };
       pc.onconnectionstatechange = () => {
+				if (!ownsCall() || pcRef.current !== pc) return;
         console.debug("rtc state", pc.connectionState);
         if (pc.connectionState === "failed") {
           earcons.linkLost();
@@ -104,59 +111,82 @@ export default function App() {
       };
 
       const offer = await pc.createOffer();
+      if (!ownsCall()) return;
       await pc.setLocalDescription(offer);
-      await waitForIce(pc, 1500);
+			if (!ownsCall()) return;
+      await waitForIce(pc, 1500, controller.signal);
+      if (!ownsCall()) return;
 
       const resp = await fetch("/offer", {
         method: "POST",
         headers: { "Content-Type": "application/sdp" },
         body: pc.localDescription?.sdp ?? offer.sdp ?? "",
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
       });
       if (!resp.ok) {
         throw new Error(`offer relay: http ${resp.status}`);
       }
       const answer = await resp.text();
+      if (!ownsCall()) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
+			if (!ownsCall() || pcRef.current !== pc) return;
       pushState();
       console.debug("call up");
     } catch (err) {
+      if (callGenerationRef.current !== generation) return;
       console.warn("connect failed", err);
       setNotice(String(err));
       teardownCall();
       void playPrebaked("voice_down");
     } finally {
-      connectingRef.current = false;
-      setConnecting(false);
+      if (callGenerationRef.current === generation) {
+        connectAbortRef.current = null;
+        connectingRef.current = false;
+        setConnecting(false);
+      }
     }
-  }, [pushState, teardownCall]);
+  }, [cancelParkWork, pushState, teardownCall]);
 
   const finishPark = useCallback(async (reason: string) => {
+    cancelParkWork();
     const parkedPC = pcRef.current;
+    const generation = callGenerationRef.current;
+    const drainController = new AbortController();
+    drainAbortRef.current = drainController;
     if (parkedPC) {
-      await waitForRemoteAudioDrain(parkedPC, 2500, 300);
+      await waitForRemoteAudioDrain(parkedPC, 2500, 300, drainController.signal);
       // A replacement call or newer server state must never be torn down by a
       // stale park completion.
-      if (pcRef.current !== parkedPC || sessionRef.current !== "PARKING") return;
+      if (
+        drainController.signal.aborted ||
+        callGenerationRef.current !== generation ||
+        pcRef.current !== parkedPC ||
+        sessionRef.current !== "PARKING"
+      ) {
+        return;
+      }
     }
-    if (sessionRef.current !== "PARKING") return;
+    if (drainController.signal.aborted || callGenerationRef.current !== generation || sessionRef.current !== "PARKING") return;
+    drainAbortRef.current = null;
     sessionRef.current = "PARKED";
     setSession("PARKED");
     setParkReason(reason);
     teardownCall();
     if (reason === "rollover") {
       // Invisible re-materialization: same browser permission, new call.
-      window.setTimeout(() => void connect(), 250);
+      const rolloverGeneration = callGenerationRef.current;
+      rolloverTimerRef.current = window.setTimeout(() => {
+        rolloverTimerRef.current = null;
+        if (callGenerationRef.current === rolloverGeneration && sessionRef.current === "PARKED") void connect();
+      }, 250);
     }
-  }, [connect, teardownCall]);
+  }, [cancelParkWork, connect, teardownCall]);
 
   const handleEvent = useCallback(
     (e: BusEvent) => {
-      const p = (e.payload ?? {}) as Record<string, unknown>;
       switch (e.kind) {
         case "session.state": {
-          const st = (p.state as SessionState) ?? "PARKED";
-          const reason = (p.reason as string) ?? "";
+          const { state: st, reason } = e.payload;
           if (st === "PARKED") {
             // The server has stopped producing audio, but RTP already in flight
             // can still be audible in the browser. Keep the visible drain state
@@ -167,6 +197,7 @@ export default function App() {
             void finishPark(reason);
             break;
           }
+					cancelParkWork();
           sessionRef.current = st;
           setSession(st);
           setParkReason(reason);
@@ -180,10 +211,10 @@ export default function App() {
           break;
         }
         case "transcript.user":
-          setTicker((t) => clip(t, { who: "you", text: String(p.text ?? "") }));
+          setTicker((t) => clip(t, { who: "you", text: e.payload.text }));
           break;
         case "transcript.assistant":
-          setTicker((t) => clip(t, { who: "desk", text: String(p.text ?? "") }));
+          setTicker((t) => clip(t, { who: "desk", text: e.payload.text }));
           break;
         case "job.queued":
         case "job.running":
@@ -195,17 +226,14 @@ export default function App() {
         case "job.done":
         case "job.failed":
         case "job.cancelled": {
-          const job = p as unknown as Job;
-          const jobID = e.job_id;
-          if (!jobID) break;
-          setJobs((m) => {
-            const next = new Map(m);
-            // Job lifecycle events carry complete snapshots. Replace rather
-            // than merge so omitted cleared fields (approvals/progress/error)
-            // cannot survive from an earlier state.
-            next.set(jobID, { ...job, id: jobID });
-            return next;
-          });
+          const job = parseJobSnapshot(e);
+          if (!job) {
+            setNotice(`Ignored a malformed ${e.kind} event.`);
+            break;
+          }
+          // Job lifecycle events carry complete snapshots. Replace rather
+          // than merge so omitted cleared fields cannot survive earlier state.
+          setJobs((m) => upsertJobHistory(m, job));
           if (e.kind === "job.done") earcons.jobDone();
           if (e.kind === "job.failed") earcons.jobFail();
           if (e.kind === "job.needs_input") earcons.needsInput();
@@ -217,8 +245,7 @@ export default function App() {
         }
         case "job.renamed": {
           const jobID = e.job_id;
-          if (!jobID) break;
-          const to = String(p.to ?? "");
+          const { to } = e.payload;
           setJobs((m) => {
             const next = new Map(m);
             const prev = next.get(jobID);
@@ -228,17 +255,22 @@ export default function App() {
           break;
         }
         case "error.voice": {
-          const msg = String(p.message ?? "voice error");
+          const msg = e.payload.message;
           setNotice(msg);
-          const key = p.play as string | undefined;
+          const key = e.payload.play;
           if (key) void playPrebaked(key);
           break;
         }
+				case "job.approval_auto_denied":
+				case "job.approval_auto_allowed":
+				case "hermes.hook":
+				case "usage":
+					break;
         default:
-          break;
+					assertNever(e);
       }
     },
-    [finishPark],
+    [cancelParkWork, finishPark],
   );
 
   useEffect(() => {
@@ -249,6 +281,7 @@ export default function App() {
         if (up) earcons.linkOk();
         else earcons.linkLost();
       },
+      onProtocolError: setNotice,
     });
     linkRef.current = link;
     link.start();
@@ -257,8 +290,9 @@ export default function App() {
     return () => {
       document.removeEventListener("visibilitychange", vis);
       link.stop();
+      teardownCall();
     };
-  }, [handleEvent, pushState]);
+  }, [handleEvent, pushState, teardownCall]);
 
   const toggleMute = useCallback(() => {
     setMuted((m) => {
@@ -322,9 +356,16 @@ export default function App() {
     <div className="app">
       <header>
         <span className="brand">THORNHILL</span>
-        <span className={`linkdot ${linkUp ? "up" : "down"}`} title={linkUp ? "backend link up" : "backend link down"} />
+        <span
+          className={`linkdot ${linkUp ? "up" : "down"}`}
+          role="status"
+          aria-live="polite"
+          aria-label={linkUp ? "Backend link up" : "Backend link down"}
+          title={linkUp ? "backend link up" : "backend link down"}
+        />
       </header>
 
+      <main>
       <button
         type="button"
         className={`ring ${session.toLowerCase()} ${muted ? "muted" : ""} ${connecting ? "connecting" : ""}`}
@@ -344,7 +385,7 @@ export default function App() {
         </button>
       </div>
 
-      <section className="ticker" aria-live="polite">
+      <section className="ticker" aria-label="Conversation transcript" aria-live="polite">
         {ticker.length === 0 && <div className="tick dim">transcript will appear here</div>}
         {ticker.map((line) => (
           <div key={line.id} className={`tick ${line.who}`}>
@@ -353,14 +394,16 @@ export default function App() {
         ))}
       </section>
 
-      <section className="board">
-        <h2>Board</h2>
+      <section className="board" aria-labelledby="board-title">
+        <h2 id="board-title">Board</h2>
         {jobList.length === 0 && <div className="dim">No jobs yet. Say what you need.</div>}
         {jobList.map((j) => (
           <article key={j.id} className={`job ${j.status}`}>
             <div className="job-head">
               <span className="job-name">{j.display_name}</span>
-              <span className="job-status">{j.status.replace("_", " ")}</span>
+              <span className="job-status" role="status" aria-live="polite" aria-atomic="true">
+                {j.status.replace("_", " ")}
+              </span>
             </div>
             {j.status === "needs_input" && j.question && <p className="job-q">{j.question}</p>}
             {j.status === "needs_approval" && j.approvals?.[0] && (
@@ -391,12 +434,12 @@ export default function App() {
               <p className="job-progress">{j.progress.state === "running" ? "Working: " : "Last: "}{j.progress.label || j.progress.tool}</p>
             )}
             {j.status === "done" && j.result_digest && <p className="job-r">{j.result_digest}</p>}
-            {j.status === "failed" && j.error && <p className="job-e">{j.error}</p>}
+            {j.status === "failed" && j.error && <p className="job-e" role="alert">{j.error}</p>}
           </article>
         ))}
       </section>
 
-      {notice && <div className="notice">{notice}</div>}
+      {notice && <div className="notice" role="alert">{notice}</div>}
 
       <div className="textbar">
         <input
@@ -408,6 +451,7 @@ export default function App() {
         />
         <button type="button" onClick={sendText}>Send</button>
       </div>
+      </main>
 
       <footer className="legal">
         <a href="https://github.com/qiviut/thornhill" target="_blank" rel="noreferrer">
@@ -426,16 +470,28 @@ function clip(arr: TranscriptLine[], line: Omit<TranscriptLine, "id">): Transcri
   return [...arr.slice(-7), { ...line, id: crypto.randomUUID() }];
 }
 
-function waitForIce(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+function assertNever(value: never): never {
+	throw new Error(`unhandled control event: ${JSON.stringify(value)}`);
+}
+
+function waitForIce(pc: RTCPeerConnection, timeoutMs: number, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return Promise.resolve();
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = window.setTimeout(resolve, timeoutMs);
-    pc.addEventListener("icegatheringstatechange", () => {
+    const finish = () => {
+      window.clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", onChange);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const onChange = () => {
       if (pc.iceGatheringState === "complete") {
-        window.clearTimeout(timer);
-        resolve();
+        finish();
       }
-    });
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    pc.addEventListener("icegatheringstatechange", onChange);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 
@@ -443,10 +499,11 @@ async function waitForRemoteAudioDrain(
   pc: RTCPeerConnection,
   maxWaitMs: number,
   quietWindowMs: number,
+  signal: AbortSignal,
 ): Promise<void> {
   const started = performance.now();
   let quietSince = started;
-  while (performance.now() - started < maxWaitMs) {
+  while (!signal.aborted && performance.now() - started < maxWaitMs) {
     if (pc.connectionState === "closed" || pc.connectionState === "failed") return;
     const now = performance.now();
     let level = 0;
@@ -463,6 +520,19 @@ async function waitForRemoteAudioDrain(
     } else {
       quietSince = now;
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
+    await abortableDelay(50, signal);
   }
+}
+
+function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      window.clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, delayMs);
+    signal.addEventListener("abort", finish, { once: true });
+  });
 }

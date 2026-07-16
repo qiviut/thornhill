@@ -3,86 +3,138 @@
 // backend (the one failure nobody server-side can announce) and lets the
 // app sound the L2 earcon.
 
-export interface BusEvent {
-  seq: number;
-  ts: string;
-  kind: string;
-  job_id?: string;
-  payload?: unknown;
-}
+import { parseServerMessage, type BusEvent } from "./protocol";
 
-type ServerMsg =
-  | { type: "hb" }
-  | { type: "event"; event: BusEvent };
+export type { BusEvent } from "./protocol";
 
 export interface LinkCallbacks {
   onEvent: (e: BusEvent) => void;
   onLink: (up: boolean) => void;
+  onProtocolError?: (message: string) => void;
+}
+
+export interface ControlLinkRuntime {
+  createSocket: (url: string) => WebSocket;
+  now: () => number;
+  protocol: string;
+  host: string;
+  setInterval: (fn: () => void, delay: number) => number;
+  clearInterval: (id: number) => void;
+  setTimeout: (fn: () => void, delay: number) => number;
+  clearTimeout: (id: number) => void;
+}
+
+function createBrowserRuntime(): ControlLinkRuntime {
+  return {
+    createSocket: (url) => new WebSocket(url),
+    now: () => Date.now(),
+    protocol: location.protocol,
+    host: location.host,
+    setInterval: (fn, delay) => window.setInterval(fn, delay),
+    clearInterval: (id) => window.clearInterval(id),
+    setTimeout: (fn, delay) => window.setTimeout(fn, delay),
+    clearTimeout: (id) => window.clearTimeout(id),
+  };
 }
 
 export class ControlLink {
   private ws: WebSocket | null = null;
-  private cb: LinkCallbacks;
+  private readonly cb: LinkCallbacks;
+  private readonly runtime: ControlLinkRuntime;
   private lastBeat = 0;
   private up = false;
   private backoff = 1000;
-  private closed = false;
+  private closed = true;
   private watchdog: number | undefined;
+  private reconnect: number | undefined;
 
-  constructor(cb: LinkCallbacks) {
+  constructor(cb: LinkCallbacks, runtime?: ControlLinkRuntime) {
     this.cb = cb;
+    this.runtime = runtime ?? createBrowserRuntime();
   }
 
   start(): void {
+    if (!this.closed) return;
     this.closed = false;
     this.connect();
-    this.watchdog = window.setInterval(() => this.checkPulse(), 3000);
+    this.watchdog = this.runtime.setInterval(() => this.checkPulse(), 3000);
   }
 
   stop(): void {
     this.closed = true;
-    if (this.watchdog) window.clearInterval(this.watchdog);
-    this.ws?.close();
+    if (this.watchdog !== undefined) {
+      this.runtime.clearInterval(this.watchdog);
+      this.watchdog = undefined;
+    }
+    if (this.reconnect !== undefined) {
+      this.runtime.clearTimeout(this.reconnect);
+      this.reconnect = undefined;
+    }
+    const ws = this.ws;
+    this.ws = null;
+    ws?.close();
+    this.setUp(false);
   }
 
   private wsURL(): string {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    return `${proto}://${location.host}/ws`;
+    const proto = this.runtime.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${this.runtime.host}/ws`;
   }
 
   private connect(): void {
     if (this.closed) return;
-    const ws = new WebSocket(this.wsURL());
+    this.reconnect = undefined;
+    const ws = this.runtime.createSocket(this.wsURL());
     this.ws = ws;
     ws.onopen = () => {
+      if (this.closed || this.ws !== ws) return;
       console.debug("control ws open");
       this.backoff = 1000;
-      this.lastBeat = Date.now();
+      this.lastBeat = this.runtime.now();
       this.setUp(true);
     };
     ws.onmessage = (ev: MessageEvent<string>) => {
-      this.lastBeat = Date.now();
-      let msg: ServerMsg;
-      try {
-        msg = JSON.parse(ev.data) as ServerMsg;
-      } catch {
+      if (this.closed || this.ws !== ws) return;
+      const msg = parseServerMessage(ev.data);
+      if (!msg) {
+        this.cb.onProtocolError?.("Ignored a malformed control-link message.");
         return;
       }
+      this.lastBeat = this.runtime.now();
       if (msg.type === "event") this.cb.onEvent(msg.event);
     };
     ws.onclose = () => {
+      if (this.ws !== ws) return;
+      this.ws = null;
       this.setUp(false);
-      if (!this.closed) {
-        window.setTimeout(() => this.connect(), this.backoff);
-        this.backoff = Math.min(this.backoff * 2, 8000);
-      }
+      this.scheduleReconnect();
     };
     ws.onerror = () => ws.close();
   }
 
+  private scheduleReconnect(): void {
+    if (this.closed || this.reconnect !== undefined) return;
+    const delay = this.backoff;
+    this.backoff = Math.min(this.backoff * 2, 8000);
+    this.reconnect = this.runtime.setTimeout(() => this.connect(), delay);
+  }
+
   private checkPulse(): void {
-    // Server heartbeats every 5s; three misses = link down.
-    if (this.up && Date.now() - this.lastBeat > 16000) this.setUp(false);
+    // Server heartbeats every 5s; three misses means the socket is half-open.
+    // Browser close events are not reliable in this state, so explicitly
+    // transfer ownership to one replacement before closing the stale socket.
+    if (!this.up || this.runtime.now() - this.lastBeat <= 16000) return;
+    const stale = this.ws;
+    this.ws = null;
+    this.setUp(false);
+    if (stale) {
+      stale.onopen = null;
+      stale.onmessage = null;
+      stale.onerror = null;
+      stale.onclose = null;
+      stale.close();
+    }
+    this.connect();
   }
 
   private setUp(up: boolean): void {
@@ -92,7 +144,7 @@ export class ControlLink {
   }
 
   send(obj: Record<string, unknown>): boolean {
-    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    if (this.ws?.readyState !== 1) return false;
     this.ws.send(JSON.stringify(obj));
     return true;
   }
