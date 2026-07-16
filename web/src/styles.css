@@ -37,6 +37,13 @@ body {
   padding: max(12px, env(safe-area-inset-top)) 16px max(12px, env(safe-area-inset-bottom));
 }
 
+main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
 header {
   display: flex;
   align-items: center;
