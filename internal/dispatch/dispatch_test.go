@@ -35,6 +35,28 @@ func TestPrepareForResumePreservesFailureEvidence(t *testing.T) {
 	}
 }
 
+func TestPrepareForResumePreservesParkedApprovalUntilRunSnapshotsIt(t *testing.T) {
+	parkedAt := time.Unix(1_700_000_001, 0).UTC()
+	approval := store.Approval{
+		ID: "parked-approval", DecisionNonce: "stale-nonce", State: store.ApprovalStateParked,
+		Description: "restart service", PatternKeys: []string{"service restart"}, ParkedAt: &parkedAt,
+	}
+	j := store.Job{
+		Status: store.StatusParkedApproval, HermesSessionID: "durable-session", HermesRunID: "stopped-run",
+		Approvals: []store.Approval{approval}, Progress: &store.Progress{State: store.ApprovalStateParked},
+	}
+	if !prepareForResume(&j) {
+		t.Fatal("parked approval job was not claimed for resume")
+	}
+	if j.Status != store.StatusQueued || j.HermesRunID != "" || len(j.Approvals) != 1 {
+		t.Fatalf("parked resume reset lost evidence: %+v", j)
+	}
+	if j.Approvals[0].ID != approval.ID || j.Approvals[0].DecisionNonce != approval.DecisionNonce ||
+		j.Approvals[0].State != store.ApprovalStateParked {
+		t.Fatalf("parked authority evidence mutated: %+v", j.Approvals)
+	}
+}
+
 func TestPrepareForResumeRejectsDuplicateClaim(t *testing.T) {
 	j := store.Job{Status: store.StatusQueued, Error: "preserve"}
 	if prepareForResume(&j) {

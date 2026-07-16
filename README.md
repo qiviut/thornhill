@@ -203,37 +203,56 @@ The operator may ask questions before deciding. The desk model translates
 natural speech into one typed choice at the authority boundary. Its primary
 prompt is **allow once**, **deny once**, **details**, or **use a safer
 alternative**; broader job/permanent allow or deny scopes are offered only when
-the operator asks for them. Questions, silence, ambiguous scope, and transport
-errors never grant or deny authority. A healthy pending request has no decision
-deadline; only an explicit typed decision, explicit cancellation/session
-interruption, or process failure ends the wait. Session choices apply to the
-exact approval pattern set for the current Thornhill job. Reusable allows and
-denies are exact-pattern-set policies owned by Thornhill and scoped to the
-configured Hermes endpoint; Hermes receives only a one-time grant for each
-concrete request. Permanent allow still requires explicit confirmation of its
-pattern-wide scope.
+the operator asks for them. Questions, silence, ambiguous scope, restart, and
+resource reclamation never grant or deny authority.
 
-The broker accepts a decision only for the sole pending request and validates a
-one-use approval ID/nonce. A second concurrent request triggers deny-all and a
-fail-closed stop. An allow POST is sent exactly once; an indeterminate response
-is never retried and stops the run. Approval heartbeats keep healthy Hermes and
-gateway activity leases alive without turning elapsed time into a decision.
-The River worker likewise has no elapsed runtime deadline; explicit cancel,
-shutdown, and execution failure still stop work.
+`APPROVAL_PARK_AFTER` (default `15m`) bounds how long a silent approval may hold
+a Hermes run, SSE transport, River worker, and in-memory control slots. At that
+threshold Thornhill atomically persists `parked_approval`, keeps the redacted
+request evidence, requests that the old run stop, and releases the worker/SSE
+resources without sending an allow or deny. A failed upstream stop retains its
+run ID for bounded detached and startup/resume cleanup; it does not retain a
+River worker or open event stream. A decision claim and parking claim race on
+the exact one-use ID/nonce under a PostgreSQL row lock; after parking, that
+authority token is stale.
+
+Session choices apply to the exact approval pattern set for the current
+Thornhill job. Reusable allows and denies are exact-pattern-set policies owned by
+Thornhill and scoped to the configured Hermes endpoint; Hermes receives only a
+one-time grant for each concrete request. Permanent allow still requires
+explicit confirmation of its pattern-wide scope.
+
+The broker accepts a decision only for the sole active pending request and
+validates a one-use approval ID/nonce. A second concurrent request triggers
+deny-all and a fail-closed stop. An allow POST is sent exactly once; an
+indeterminate response is never retried and stops the run. Approval heartbeats
+keep a healthy Hermes wait active before its resource threshold without turning
+elapsed time into a decision. The River worker has no whole-run elapsed runtime
+deadline; explicit cancel, shutdown, execution failure, and durable approval
+parking still stop or reclaim work.
 
 ## Job recovery and script lifecycle
 
 Browser parking never cancels durable Hermes jobs. After a Thornhill restart,
-known upstream runs are stopped fail-closed and their jobs are marked failed.
-`resume_job` reuses the durable job identity and Hermes session history, while
-preserving the prior error and last tool-progress checkpoint in a verification
-brief. Resume is an atomic failed-to-queued claim, so duplicate or concurrent
-resume attempts cannot enqueue the same job twice. The resumed agent must
-inspect current state before repeating any potentially side-effecting operation;
-stale approval requests are not replayed. Recovery retains the newest bounded
-session history rather than the oldest messages that happen to fit, and the
-prior error remains durable even after a successful resumed completion (job
-status remains the authoritative current outcome).
+known upstream runs are stopped fail-closed. Running/input work becomes failed
+with its uncertainty recorded; a sole pending approval becomes
+`parked_approval` without any authority decision. Stale River delivery cannot
+restart parked work.
+
+`resume_job` atomically claims either a failed or parked-approval job, reuses the
+durable job identity and Hermes session history, and builds a
+verification-first recovery brief. For parked approval, the brief includes
+quoted untrusted request evidence but excludes the old ID/nonce and explicitly
+requires fresh authority if the action is still needed. The old approval is
+cleared before a new Hermes run begins. Concurrent resume attempts cannot
+enqueue the same job twice, and a queue-submission failure restores the parked
+state with its evidence intact.
+
+The resumed agent must inspect current state before repeating any potentially
+side-effecting operation. Recovery retains the newest bounded session history
+rather than the oldest messages that happen to fit, and a failed job's prior
+error remains durable even after a successful resumed completion (job status
+remains the authoritative current outcome).
 
 Dispatched agents prefer native Hermes tools over opaque shell pipelines. If a
 script is necessary, creation and debugging should be delegated when practical.
@@ -288,9 +307,10 @@ docs/vendor/         the exact API docs this code was written against
   zero cost; wire rates from docs/vendor/openai/pricing.md when it
   matters).
 - A process restart fail-closes in-flight Hermes work: Thornhill stops known
-  run IDs, marks running/input/approval jobs failed, and cancels their River
-  redelivery. Queued jobs remain eligible to start normally; failed jobs can be
-  resumed through the verification-first recovery path described above.
+  run IDs, marks running/input jobs failed, parks a sole pending approval
+  unresolved, and reclaims stale River delivery. Queued jobs remain eligible to
+  start normally; failed and parked-approval jobs can be resumed through the
+  verification-first recovery path described above.
 
 ## Contributing and security
 

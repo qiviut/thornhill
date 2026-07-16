@@ -4,13 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"thornhill/internal/dummyopenai"
+	"thornhill/internal/events"
+	"thornhill/internal/store"
 )
 
 type summaryTestStore struct {
@@ -47,5 +51,17 @@ func TestCompleteUsesConfiguredProviderAndRecordsUsage(t *testing.T) {
 	}
 	if st.usageSource != "summary" || st.input != 1 || st.output != 1 {
 		t.Fatalf("usage source=%q input=%d output=%d", st.usageSource, st.input, st.output)
+	}
+}
+
+func TestLineForParkedApprovalStatesNoDecisionAndFreshAuthority(t *testing.T) {
+	payload, err := json.Marshal(store.Job{DisplayName: "System audit", Status: store.StatusParkedApproval})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, keep := lineFor(events.Event{TS: time.Unix(1_700_000_000, 0), Kind: events.KindJobApprovalParked, Payload: payload})
+	if !keep || !strings.Contains(line, "parked an unresolved approval") ||
+		!strings.Contains(line, "released its run") || !strings.Contains(line, "fresh authority") {
+		t.Fatalf("parked approval line = %q, keep=%v", line, keep)
 	}
 }

@@ -106,6 +106,8 @@ func lineFor(e events.Event) (string, bool) {
 			return fmt.Sprintf("%s job %q needs approval: %s", ts, p.Name, p.Approvals[0].Description), true
 		}
 		return fmt.Sprintf("%s job %q needs approval", ts, p.Name), true
+	case events.KindJobApprovalParked:
+		return fmt.Sprintf("%s job %q parked an unresolved approval and released its run; resume requires fresh authority", ts, p.Name), true
 	case events.KindJobQueued:
 		return fmt.Sprintf("%s job %q dispatched", ts, p.Name), true
 	case events.KindHermesHook:

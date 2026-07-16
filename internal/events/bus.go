@@ -19,6 +19,7 @@ const (
 	KindJobRunning             = "job.running"
 	KindJobNeedsInput          = "job.needs_input"
 	KindJobNeedsApproval       = "job.needs_approval"
+	KindJobApprovalParked      = "job.approval_parked"
 	KindJobApprovalResolved    = "job.approval_resolved"
 	KindJobApprovalAutoDenied  = "job.approval_auto_denied"
 	KindJobApprovalAutoAllowed = "job.approval_auto_allowed"

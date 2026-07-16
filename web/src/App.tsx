@@ -6,11 +6,13 @@ type SessionState = "PARKED" | "PARKING" | "QUIET" | "LIVE";
 
 interface Approval {
   id: string;
-  state: "pending" | "sending" | "indeterminate";
+  state: "pending" | "sending" | "parked" | "indeterminate";
   description?: string;
   command?: string;
   pattern_keys?: string[];
   allow_permanent: boolean;
+  parked_at?: string;
+  park_reason?: string;
 }
 
 interface Progress {
@@ -187,6 +189,7 @@ export default function App() {
         case "job.running":
         case "job.needs_input":
         case "job.needs_approval":
+        case "job.approval_parked":
         case "job.approval_resolved":
         case "job.progress":
         case "job.done":
@@ -299,7 +302,7 @@ export default function App() {
 
   const jobList = useMemo(() => {
     const arr = [...jobs.values()];
-    const rank: Record<string, number> = { needs_approval: 0, needs_input: 1, running: 2, queued: 3, failed: 4, done: 5, cancelled: 6 };
+    const rank: Record<string, number> = { needs_approval: 0, parked_approval: 1, needs_input: 2, running: 3, queued: 4, failed: 5, done: 6, cancelled: 7 };
     arr.sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
     return arr;
   }, [jobs]);
@@ -367,6 +370,15 @@ export default function App() {
                 {j.approvals[0].command && <code>{j.approvals[0].command}</code>}
                 {j.approvals[0].pattern_keys?.length ? <p className="dim">Scope: {j.approvals[0].pattern_keys.join(", ")}</p> : null}
                 <p className="dim">Reply by voice: allow or deny once, ask for a safer alternative, or choose job/always scope. You can ask questions first.</p>
+              </div>
+            )}
+            {j.status === "parked_approval" && j.approvals?.[0] && (
+              <div className="job-approval" role="status">
+                <strong>Approval parked unresolved</strong>
+                {j.approvals[0].description && <p>{j.approvals[0].description}</p>}
+                {j.approvals[0].command && <code>{j.approvals[0].command}</code>}
+                {j.approvals[0].pattern_keys?.length ? <p className="dim">Scope: {j.approvals[0].pattern_keys.join(", ")}</p> : null}
+                <p className="dim">No decision was made. The old run released its resources. Ask the desk to resume this job; any authority still needed must be requested again.</p>
               </div>
             )}
             {j.status === "failed" && j.approvals?.[0]?.state === "indeterminate" && (

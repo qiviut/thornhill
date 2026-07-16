@@ -76,6 +76,7 @@ func main() {
 		log.Info("hermes bridge active", "base", cfg.HermesBaseURL, "model", cfg.HermesModel)
 		hermes := bridge.NewHermes(cfg.HermesBaseURL, cfg.HermesAPIKey, cfg.HermesModel,
 			st, bus, log.With("comp", "hermes"))
+		hermes.ApprovalParkAfter = cfg.ApprovalParkAfter
 		if err := hermes.ReconcileOrphans(ctx); err != nil {
 			log.Error("reconcile orphaned Hermes runs", "err", err)
 			os.Exit(1)

@@ -131,9 +131,10 @@ func (d *Dispatcher) Resume(ctx context.Context, ref string) (store.Job, error) 
 	if err != nil {
 		return store.Job{}, err
 	}
-	if j.Status != store.StatusFailed {
-		return j, fmt.Errorf("job %q is %s; only failed jobs can be resumed", j.DisplayName, j.Status)
+	if j.Status != store.StatusFailed && j.Status != store.StatusParkedApproval {
+		return j, fmt.Errorf("job %q is %s; only failed or parked-approval jobs can be resumed", j.DisplayName, j.Status)
 	}
+	wasParked := j.Status == store.StatusParkedApproval
 	// Stop any persisted upstream run before clearing its identity. Hermes.Cancel
 	// falls back to the durable run ID after a Thornhill restart.
 	d.runner.Cancel(ctx, j.ID)
@@ -149,29 +150,36 @@ func (d *Dispatcher) Resume(ctx context.Context, ref string) (store.Job, error) 
 	}
 	if err := d.queue.EnqueueRun(ctx, j.ID); err != nil {
 		failed, _ := d.store.UpdateJob(ctx, j.ID, func(x *store.Job) {
-			x.Status = store.StatusFailed
+			if wasParked {
+				x.Status = store.StatusParkedApproval
+			} else {
+				x.Status = store.StatusFailed
+			}
 			x.Error = "resume enqueue failed after: " + x.Error + "; " + err.Error()
 		})
 		return failed, fmt.Errorf("resume enqueue: %w", err)
 	}
 	d.bus.Publish(events.KindJobQueued, j.ID, j)
-	d.log.Info("failed job queued for safe resume", "id", j.ID, "name", j.DisplayName)
+	d.log.Info("job queued for safe resume", "id", j.ID, "name", j.DisplayName, "from_parked_approval", wasParked)
 	return j, nil
 }
 
 func prepareForResume(x *store.Job) bool {
-	if x.Status != store.StatusFailed {
+	previous := x.Status
+	if previous != store.StatusFailed && previous != store.StatusParkedApproval {
 		return false
 	}
 	x.Status = store.StatusQueued
 	x.Question = ""
 	x.ResultDigest = ""
 	x.HermesRunID = ""
-	x.Approvals = nil
+	if previous == store.StatusFailed {
+		x.Approvals = nil
+	}
 	x.FinishedAt = nil
 	// Preserve Error and Progress until Hermes snapshots them into the resume
-	// verification brief. They are evidence about interrupted side effects, not
-	// ephemeral UI state.
+	// verification brief. A parked approval also remains attached until Run
+	// snapshots its untrusted evidence, then it is cleared before a new run starts.
 	return true
 }
 
@@ -214,7 +222,8 @@ func (w *Worker) Work(ctx context.Context, job *river.Job[RunArgs]) error {
 }
 
 func (w *Worker) Timeout(*river.Job[RunArgs]) time.Duration {
-	// A pending approval or long autonomous run has no elapsed decision/runtime
-	// deadline. Explicit cancel, shutdown, and worker failure still cancel ctx.
+	// River itself has no elapsed decision/runtime deadline. Approval parking
+	// reclaims the worker after its separately configured threshold without
+	// granting or denying authority; explicit cancel and shutdown still cancel ctx.
 	return -1
 }

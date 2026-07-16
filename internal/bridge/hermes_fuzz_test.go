@@ -97,3 +97,77 @@ func FuzzApprovalDecisionIsSingleUse(f *testing.F) {
 		}
 	})
 }
+
+type fuzzParkTransport struct {
+	approvalCalls atomic.Int32
+	stopCalls     atomic.Int32
+}
+
+func (r *fuzzParkTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, "/approval") {
+		r.approvalCalls.Add(1)
+	}
+	if strings.HasSuffix(req.URL.Path, "/stop") {
+		r.stopCalls.Add(1)
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+	}, nil
+}
+
+func FuzzParkedApprovalNeverInvokesAuthority(f *testing.F) {
+	f.Add(true, true, []byte("operator silent"))
+	f.Add(false, true, []byte("restart"))
+	f.Add(true, false, []byte("resource reclamation"))
+	f.Fuzz(func(t *testing.T, matchID, matchNonce bool, reasonBytes []byte) {
+		if len(reasonBytes) > 1024 {
+			reasonBytes = reasonBytes[:1024]
+		}
+		const jobID, runID, approvalID, nonce = "park-fuzz-job", "park-fuzz-run", "park-fuzz-approval", "park-fuzz-nonce"
+		candidateID, candidateNonce := approvalID, nonce
+		if !matchID {
+			candidateID += "-stale"
+		}
+		if !matchNonce {
+			candidateNonce += "-stale"
+		}
+		fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+			ID: jobID, Status: store.StatusNeedsApproval, HermesRunID: runID,
+			Approvals: []store.Approval{{ID: approvalID, DecisionNonce: nonce, State: store.ApprovalStatePending}},
+		}}}
+		h := NewHermes("http://fuzz.invalid", "", "dummy", fs, events.NewBus(nil, testLog()), testLog())
+		transport := &fuzzParkTransport{}
+		h.HTTP = &http.Client{Transport: transport}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		_, err := h.parkApproval(ctx, jobID, runID, candidateID, candidateNonce, string(reasonBytes))
+		valid := matchID && matchNonce
+		if valid && err != nil {
+			t.Fatalf("valid parking failed: %v", err)
+		}
+		if !valid && err == nil {
+			t.Fatal("mismatched parking token succeeded")
+		}
+		if transport.approvalCalls.Load() != 0 {
+			t.Fatalf("parking reached authority endpoint %d times", transport.approvalCalls.Load())
+		}
+		wantStops := int32(0)
+		if valid {
+			wantStops = 1
+			parked, resolveErr := fs.ResolveJob(ctx, jobID)
+			if resolveErr != nil || parked.Status != store.StatusParkedApproval ||
+				len(parked.Approvals) != 1 || parked.Approvals[0].State != store.ApprovalStateParked {
+				t.Fatalf("parked state = %+v, err=%v", parked, resolveErr)
+			}
+			if _, replayErr := h.DecideApproval(ctx, jobID, approvalID, nonce, DecisionAllowOnce); replayErr == nil {
+				t.Fatal("parked authority token was replayable")
+			}
+		}
+		if transport.stopCalls.Load() != wantStops {
+			t.Fatalf("stop calls = %d, want %d", transport.stopCalls.Load(), wantStops)
+		}
+	})
+}
