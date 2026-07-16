@@ -47,3 +47,4 @@ export THORNHILL_TEST_SCHEMA="${schema}"
 export THORNHILL_TEST_DATABASE_URL="postgres://${user}:${password}@127.0.0.1:${port}/${database}?sslmode=disable&search_path=${schema}"
 
 go test -tags=integration -count=1 -run '^TestPostgresMigrationAndAtomicApprovalClaim$' ./internal/store
+go test -tags=integration -count=1 -run '^Test(DispatchAndResumeCommitWithQueueDelivery|CancelledDeliveryAndSynchronousAnswerCannotResurrectTerminalState)$' ./internal/dispatch

@@ -29,6 +29,11 @@ func (p *blockingPersister) AppendEvent(context.Context, events.Event) error {
 func TestDeskStatePublicationFencesSupersededDeskAtomically(t *testing.T) {
 	persist := &blockingPersister{entered: make(chan struct{}), release: make(chan struct{})}
 	bus := events.NewBus(persist, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = bus.Close(ctx)
+	})
 	oldDesk, newDesk := &desk.Desk{}, &desk.Desk{}
 	g := &Gateway{Bus: bus, current: oldDesk}
 

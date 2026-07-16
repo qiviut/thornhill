@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,11 +18,274 @@ import (
 	"thornhill/internal/store"
 )
 
+func TestApprovalLocksSerializePerRunWithoutBlockingOtherRuns(t *testing.T) {
+	h := &Hermes{approvalLocks: map[string]*approvalLock{}}
+	unlockFirst := h.lockApproval("job-1", "run-1")
+
+	sameRun := make(chan func(), 1)
+	go func() { sameRun <- h.lockApproval("job-1", "run-1") }()
+	select {
+	case unlock := <-sameRun:
+		unlock()
+		t.Fatal("same-run authority call did not serialize")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	otherRun := make(chan func(), 1)
+	go func() { otherRun <- h.lockApproval("job-2", "run-2") }()
+	select {
+	case unlock := <-otherRun:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("unrelated run was blocked by another run's authority lock")
+	}
+
+	unlockFirst()
+	select {
+	case unlock := <-sameRun:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("same-run waiter did not acquire after release")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.approvalLocks) != 0 {
+		t.Fatalf("approval lock map retained %d idle entries", len(h.approvalLocks))
+	}
+}
+
 type fakeStore struct {
 	mu        sync.Mutex
 	jobs      map[string]store.Job
 	permanent map[string]bool
 	allows    map[string]bool
+}
+
+type initialResolveBarrierStore struct {
+	*fakeStore
+	mu      sync.Mutex
+	count   int
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *initialResolveBarrierStore) ResolveJob(ctx context.Context, ref string) (store.Job, error) {
+	j, err := s.fakeStore.ResolveJob(ctx, ref)
+	if err != nil {
+		return j, err
+	}
+	s.mu.Lock()
+	s.count++
+	count := s.count
+	if count == 2 {
+		close(s.ready)
+	}
+	s.mu.Unlock()
+	if count <= 2 {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return store.Job{}, ctx.Err()
+		}
+	}
+	return j, nil
+}
+
+func TestRunRejectsCancelledOrTerminalDeliveryBeforeHermes(t *testing.T) {
+	for _, status := range []string{store.StatusCancelled, store.StatusDone, store.StatusFailed} {
+		t.Run(status, func(t *testing.T) {
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				requests.Add(1)
+			}))
+			defer srv.Close()
+			jobID := "terminal-" + status
+			fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+				ID: jobID, DisplayName: status, Task: "must not execute", Status: status,
+			}}}
+			h := NewHermes(srv.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+			if err := h.Run(context.Background(), jobID); err != nil {
+				t.Fatalf("Run(%s): %v", status, err)
+			}
+			if got := requests.Load(); got != 0 {
+				t.Fatalf("terminal delivery made %d Hermes request(s)", got)
+			}
+			got, err := fs.ResolveJob(context.Background(), jobID)
+			if err != nil || got.Status != status {
+				t.Fatalf("terminal state changed to %q: %v", got.Status, err)
+			}
+		})
+	}
+}
+
+func TestDuplicateDeliveriesCannotDeleteWinningExecutionOwnership(t *testing.T) {
+	const jobID = "duplicate-delivery"
+	streamRelease := make(chan struct{})
+	started := make(chan struct{})
+	var startOnce sync.Once
+	var starts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			starts.Add(1)
+			_, _ = io.WriteString(w, `{"run_id":"run-winner","status":"started"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-winner/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			startOnce.Do(func() { close(started) })
+			select {
+			case <-streamRelease:
+				_, _ = io.WriteString(w, "data: {\"event\":\"run.completed\",\"output\":\"done\"}\n\n")
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Duplicate", Task: "run once", Status: store.StatusQueued,
+	}}}
+	barrier := &initialResolveBarrierStore{
+		fakeStore: fs, ready: make(chan struct{}), release: make(chan struct{}),
+	}
+	h := NewHermes(srv.URL, "", "hermes-agent", barrier, events.NewBus(nil, testLog()), testLog())
+	results := make(chan error, 2)
+	go func() { results <- h.Run(context.Background(), jobID) }()
+	go func() { results <- h.Run(context.Background(), jobID) }()
+	<-barrier.ready
+	close(barrier.release)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("winning delivery did not start Hermes")
+	}
+	select {
+	case err := <-results:
+		if err != nil {
+			t.Fatalf("losing delivery returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("losing delivery did not return")
+	}
+	h.mu.Lock()
+	_, hasCancel := h.cancels[jobID]
+	gotRunID := h.runIDs[jobID]
+	h.mu.Unlock()
+	if !hasCancel || gotRunID != "run-winner" {
+		t.Fatalf("loser removed winning ownership: cancel=%t run=%q", hasCancel, gotRunID)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("Hermes starts=%d, want exactly 1", got)
+	}
+
+	close(streamRelease)
+	select {
+	case err := <-results:
+		if err != nil {
+			t.Fatalf("winning delivery returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("winning delivery did not finish")
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusDone {
+		t.Fatalf("winning delivery finished as %s", got.Status)
+	}
+}
+
+func TestCompletedEventCannotOverwriteCommittedCancellation(t *testing.T) {
+	const jobID = "cancel-before-complete"
+	streamRelease := make(chan struct{})
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			_, _ = io.WriteString(w, `{"run_id":"run-cancelled","status":"started"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-cancelled/events":
+			close(started)
+			<-streamRelease
+			_, _ = io.WriteString(w, "data: {\"event\":\"run.completed\",\"output\":\"stale completion\"}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Cancellation fence", Task: "must stay cancelled", Status: store.StatusQueued,
+	}}}
+	h := NewHermes(srv.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	result := make(chan error, 1)
+	go func() { result <- h.Run(context.Background(), jobID) }()
+	<-started
+	if _, err := fs.UpdateJob(context.Background(), jobID, func(j *store.Job) {
+		j.Status = store.StatusCancelled
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(streamRelease)
+	if err := <-result; err != nil {
+		t.Fatalf("Run returned error after authoritative cancellation: %v", err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusCancelled || got.ResultDigest != "" {
+		t.Fatalf("stale completion overwrote cancellation: %+v", got)
+	}
+}
+
+func TestSilentEventStreamStopsRunAndReleasesResources(t *testing.T) {
+	const jobID = "silent-stream"
+	streamClosed := make(chan struct{})
+	var stopCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			_, _ = io.WriteString(w, `{"run_id":"run-silent-stream","status":"started"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-silent-stream/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			close(streamClosed)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-silent-stream/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Silent stream", Task: "must not hang", Status: store.StatusQueued,
+	}}}
+	h := NewHermes(srv.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	h.StreamIdleAfter = 25 * time.Millisecond
+	err := h.Run(context.Background(), jobID)
+	if err == nil || !strings.Contains(err.Error(), "event stream silent") {
+		t.Fatalf("Run error = %v, want silent-stream failure", err)
+	}
+	select {
+	case <-streamClosed:
+	case <-time.After(time.Second):
+		t.Fatal("silent SSE response was not closed")
+	}
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop calls=%d, want 1", got)
+	}
+	j, _ := fs.ResolveJob(context.Background(), jobID)
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "event stream silent") {
+		t.Fatalf("silent stream job = %+v", j)
+	}
+	h.mu.Lock()
+	_, hasCancel := h.cancels[jobID]
+	_, hasRun := h.runIDs[jobID]
+	h.mu.Unlock()
+	if hasCancel || hasRun {
+		t.Fatalf("silent stream retained resources: cancel=%t run=%t", hasCancel, hasRun)
+	}
 }
 
 func cloneJob(j store.Job) store.Job {
@@ -481,11 +745,10 @@ func TestSilentApprovalParksWithoutDecisionAndReleasesExecutionResources(t *test
 	}
 	h.mu.Lock()
 	_, hasCancel := h.cancels[jobID]
-	_, hasAnswer := h.answers[jobID]
 	_, hasRun := h.runIDs[jobID]
 	h.mu.Unlock()
-	if hasCancel || hasAnswer || hasRun {
-		t.Fatalf("execution resources retained: cancel=%v answer=%v run=%v", hasCancel, hasAnswer, hasRun)
+	if hasCancel || hasRun {
+		t.Fatalf("parked job retained execution resources: cancel=%t run=%t", hasCancel, hasRun)
 	}
 }
 
@@ -521,6 +784,52 @@ func TestPermanentDenyAutoResolvesExactPattern(t *testing.T) {
 	j, _ := fs.ResolveJob(context.Background(), jobID)
 	if j.Status != store.StatusRunning || len(j.Approvals) != 0 {
 		t.Fatalf("auto-denied request became pending: %+v", j)
+	}
+}
+
+func TestReconcileOrphansPreservesDurableNeedsInput(t *testing.T) {
+	t.Parallel()
+	const cleanID = "01J0000000000000000000000NI"
+	fs := &fakeStore{jobs: map[string]store.Job{cleanID: {
+		ID: cleanID, Status: store.StatusNeedsInput, Question: "Which target?",
+	}}}
+	h := NewHermes("http://127.0.0.1:1", "", "m", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), cleanID)
+	if got.Status != store.StatusNeedsInput || got.Question != "Which target?" || got.HermesRunID != "" {
+		t.Fatalf("durable input changed during restart: %+v", got)
+	}
+}
+
+func TestReconcileOrphansReleasesStaleNeedsInputRun(t *testing.T) {
+	t.Parallel()
+	var stopCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/stop") {
+			stopCalls++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	const jobID = "01J0000000000000000000000NS"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusNeedsInput, Question: "Which target?", HermesRunID: "run-stale-input",
+	}}}
+	h := NewHermes(srv.URL, "", "m", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusNeedsInput || got.Question != "Which target?" || got.HermesRunID != "" {
+		t.Fatalf("stale input cleanup changed durable state: %+v", got)
+	}
+	if stopCalls != 1 {
+		t.Fatalf("stop calls = %d, want 1", stopCalls)
 	}
 }
 
@@ -587,6 +896,81 @@ func TestReconcileOrphansParksApprovalAndReclaimsRiverDelivery(t *testing.T) {
 	}
 	if err := h.Run(context.Background(), jobID); err != nil {
 		t.Fatalf("reclaimed River delivery should complete without a new run: %v", err)
+	}
+}
+
+func TestNeedsInputReleasesWorkerAndResumesAfterProcessRestart(t *testing.T) {
+	const jobID = "job-durable-input"
+	var mu sync.Mutex
+	var starts []struct {
+		Input   string    `json:"input"`
+		History []chatMsg `json:"conversation_history"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/sessions/"+jobID+"/messages":
+			_, _ = io.WriteString(w, `{"object":"list","session_id":"job-durable-input","data":[{"role":"user","content":"original task"},{"role":"assistant","content":"Should I proceed?"}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			var body struct {
+				Input   string    `json:"input"`
+				History []chatMsg `json:"conversation_history"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode run start: %v", err)
+			}
+			mu.Lock()
+			starts = append(starts, body)
+			n := len(starts)
+			mu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"run_id":"run-%d","status":"started"}`, n)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-1/events":
+			_, _ = io.WriteString(w, "data: {\"event\":\"run.completed\",\"output\":\"Should I proceed?\"}\n\n")
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-2/events":
+			_, _ = io.WriteString(w, "data: {\"event\":\"run.completed\",\"output\":\"completed after answer\"}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Durable input", Task: "original task", Status: store.StatusQueued,
+	}}}
+	first := NewHermes(srv.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	if err := first.Run(context.Background(), jobID); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	parked, _ := fs.ResolveJob(context.Background(), jobID)
+	if parked.Status != store.StatusNeedsInput || parked.Question != "Should I proceed?" || parked.HermesRunID != "" {
+		t.Fatalf("question was not durably parked: %+v", parked)
+	}
+	first.mu.Lock()
+	_, hasCancel := first.cancels[jobID]
+	_, hasRun := first.runIDs[jobID]
+	first.mu.Unlock()
+	if hasCancel || hasRun {
+		t.Fatalf("needs_input retained worker resources: cancel=%t run=%t", hasCancel, hasRun)
+	}
+	if _, err := fs.UpdateJob(context.Background(), jobID, func(j *store.Job) {
+		j.Status = store.StatusQueued
+		j.Question = ""
+		j.PendingInput = "yes, proceed"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := NewHermes(srv.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	if err := second.Run(context.Background(), jobID); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(starts) != 2 || starts[1].Input != "yes, proceed" || len(starts[1].History) != 2 {
+		t.Fatalf("restart did not consume durable answer with history: %#v", starts)
+	}
+	completed, _ := fs.ResolveJob(context.Background(), jobID)
+	if completed.Status != store.StatusDone || completed.ResultDigest != "completed after answer" || completed.PendingInput != "" {
+		t.Fatalf("resumed answer did not complete: %+v", completed)
 	}
 }
 

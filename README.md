@@ -293,7 +293,8 @@ docs/vendor/         the exact API docs this code was written against
    `hermes.hook`).
 2. `TRANSCRIBE_MODEL` and `TTS_MODEL` names against current docs.
 3. Truncation field path in `session.update`
-   (`truncation.retention_ratio`, per realtime-costs.md).
+   (`truncation.retention_ratio`, per
+   [`realtime-costs.md`](docs/vendor/openai/realtime-costs.md)).
 4. Needs-input intent remains a trailing-question heuristic; approvals and
    tool progress are structured Runs events.
 
@@ -304,13 +305,14 @@ docs/vendor/         the exact API docs this code was written against
   auth — the tailnet is the perimeter, and there is exactly one user.
 - Budget breaker: `DAILY_BUDGET_USD` gates new calls on the day's
   estimated spend from the usage ledger (estimates currently logged at
-  zero cost; wire rates from docs/vendor/openai/pricing.md when it
+  zero cost; wire rates from [`pricing.md`](docs/vendor/openai/pricing.md) when it
   matters).
 - A process restart fail-closes in-flight Hermes work: Thornhill stops known
-  run IDs, marks running/input jobs failed, parks a sole pending approval
-  unresolved, and reclaims stale River delivery. Queued jobs remain eligible to
-  start normally; failed and parked-approval jobs can be resumed through the
-  verification-first recovery path described above.
+  running run IDs, preserves already parked `needs_input` questions for a later
+  durable answer, parks a sole pending approval unresolved, and reclaims stale
+  River delivery. Queued jobs remain eligible to start normally; failed and
+  parked-approval jobs can be resumed through the verification-first recovery
+  path described above.
 
 ## Contributing and security
 

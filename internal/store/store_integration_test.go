@@ -58,6 +58,30 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 			t.Fatalf("table %s exists=%v err=%v", table, exists, err)
 		}
 	}
+	resumable, err := st.CreateJob(ctx, randomTestValue(t, "drain_resume_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumable, err = st.UpdateJob(ctx, resumable.ID, func(j *Job) { j.Status = StatusFailed })
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := st.CreateJob(ctx, randomTestValue(t, "drain_active_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err = st.UpdateJob(ctx, active.ID, func(j *Job) { j.Status = StatusRunning })
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeApproval, err := st.CreateJob(ctx, randomTestValue(t, "active_approval_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeApproval, err = st.UpdateJob(ctx, activeApproval.ID, func(j *Job) { j.Status = StatusRunning })
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := st.Pool.Exec(ctx, `UPDATE deployment_control SET dispatch_paused=TRUE, updated_at=now() WHERE singleton=TRUE`); err != nil {
 		t.Fatal(err)
@@ -69,6 +93,18 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 	}
 	if _, err := st.CreateJob(ctx, randomTestValue(t, "paused_", 24), randomTestValue(t, "task_", 48)); !errors.Is(err, ErrDispatchPaused) {
 		t.Fatalf("CreateJob while paused err=%v, want ErrDispatchPaused", err)
+	}
+	if _, err := st.UpdateJob(ctx, resumable.ID, func(j *Job) { j.Status = StatusQueued }); !errors.Is(err, ErrDispatchPaused) {
+		t.Fatalf("resume transition while paused err=%v, want ErrDispatchPaused", err)
+	}
+	if _, err := st.UpdateJob(ctx, active.ID, func(j *Job) { j.Status = StatusNeedsInput }); err != nil {
+		t.Fatalf("active job could not park for input while dispatch paused: %v", err)
+	}
+	if _, err := st.UpdateJob(ctx, activeApproval.ID, func(j *Job) { j.Status = StatusNeedsApproval }); err != nil {
+		t.Fatalf("active job could not park for approval while dispatch paused: %v", err)
+	}
+	if _, err := st.UpdateJob(ctx, active.ID, func(j *Job) { j.Status = StatusDone }); err != nil {
+		t.Fatalf("active job could not finish while dispatch paused: %v", err)
 	}
 	if _, err := st.Pool.Exec(ctx, `UPDATE deployment_control SET dispatch_paused=FALSE, updated_at=now() WHERE singleton=TRUE`); err != nil {
 		t.Fatal(err)
