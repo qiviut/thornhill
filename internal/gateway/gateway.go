@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -97,8 +99,110 @@ func (g *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /hooks/hermes", g.Hooks)
 	mux.Handle("GET /audio/prebaked/", http.StripPrefix("/audio/prebaked/",
 		http.FileServer(http.Dir(g.Cfg.PrebakeDir))))
-	mux.Handle("GET /", http.FileServer(http.Dir(g.Cfg.StaticDir)))
+	mux.Handle("GET /", staticHandler(g.Cfg.StaticDir))
 	return withLogging(mux, g.Log)
+}
+
+const immutableAssetCacheControl = "public, max-age=31536000, immutable"
+
+// staticHandler compresses only Vite's text assets. Audio may already be
+// compressed and can need byte ranges, so it stays on its dedicated identity
+// handler above. Cache policy is injected only after FileServer chooses a
+// successful response, so a transient missing asset cannot be held for a year.
+func staticHandler(dir string) http.Handler {
+	files := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/assets/") {
+			// The HTML document names content-hashed assets. Revalidate it so a
+			// deploy points browsers at the next asset generation promptly.
+			if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
+			files.ServeHTTP(w, r)
+			return
+		}
+
+		cw := &cachedAssetWriter{ResponseWriter: w, gzip: acceptsGzipAsset(r)}
+		files.ServeHTTP(cw, r)
+		_ = cw.Close()
+	})
+}
+
+func acceptsGzipAsset(r *http.Request) bool {
+	if r.Method != http.MethodGet || r.Header.Get("Range") != "" {
+		return false
+	}
+	switch strings.ToLower(path.Ext(r.URL.Path)) {
+	case ".css", ".js", ".json", ".svg":
+	default:
+		return false
+	}
+	for _, token := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		coding, params, _ := strings.Cut(strings.TrimSpace(token), ";")
+		if !strings.EqualFold(strings.TrimSpace(coding), "gzip") {
+			continue
+		}
+		for _, param := range strings.Split(params, ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(key), "q") {
+				continue
+			}
+			quality, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			return err == nil && quality > 0
+		}
+		return true
+	}
+	return false
+}
+
+type cachedAssetWriter struct {
+	http.ResponseWriter
+	gzip        bool
+	gzipWriter  *gzip.Writer
+	wroteHeader bool
+}
+
+func (w *cachedAssetWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	// Cache only a representation FileServer accepted. Vary keeps compressed
+	// and identity responses distinct in shared and browser caches.
+	if (status >= http.StatusOK && status < http.StatusMultipleChoices) || status == http.StatusNotModified {
+		w.Header().Set("Cache-Control", immutableAssetCacheControl)
+		w.Header().Add("Vary", "Accept-Encoding")
+	}
+	if w.gzip && status >= http.StatusOK && status < http.StatusMultipleChoices {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Del("Content-Length")
+	} else {
+		w.gzip = false
+	}
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *cachedAssetWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if !w.gzip {
+		return w.ResponseWriter.Write(p)
+	}
+	if w.gzipWriter == nil {
+		w.gzipWriter = gzip.NewWriter(w.ResponseWriter)
+	}
+	return w.gzipWriter.Write(p)
+}
+
+func (w *cachedAssetWriter) Close() error {
+	if !w.gzip {
+		return nil
+	}
+	if w.gzipWriter == nil {
+		w.gzipWriter = gzip.NewWriter(w.ResponseWriter)
+	}
+	return w.gzipWriter.Close()
 }
 
 func (g *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {

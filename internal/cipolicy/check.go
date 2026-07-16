@@ -22,6 +22,7 @@ type workflow struct {
 type workflowJob struct {
 	Name        string            `yaml:"name"`
 	If          string            `yaml:"if"`
+	Needs       any               `yaml:"needs"`
 	Permissions map[string]string `yaml:"permissions"`
 	Steps       []workflowStep    `yaml:"steps"`
 }
@@ -130,30 +131,8 @@ func Check(root string) error {
 			return fmt.Errorf("%s triggers = %v, want %v", relative, gotTriggers, wantTriggers)
 		}
 		if relative == ".github/workflows/ci.yml" {
-			verify, ok := wf.Jobs["verify"]
-			if !ok || verify.Name != requiredCheck {
-				return fmt.Errorf("CI verify job must retain required check name %q", requiredCheck)
-			}
-			var lane strings.Builder
-			for _, step := range verify.Steps {
-				lane.WriteString(step.Uses)
-				lane.WriteByte('\n')
-				lane.WriteString(step.Run)
-				lane.WriteByte('\n')
-			}
-			for _, required := range []string{
-				"go tool actionlint",
-				"go tool staticcheck",
-				"go tool govulncheck",
-				"npm run lint",
-				"docker buildx build --check",
-				"scripts/test-container-hardening.sh",
-				"scripts/run-security-scans.sh",
-				"actions/upload-artifact@",
-			} {
-				if !strings.Contains(lane.String(), required) {
-					return fmt.Errorf("CI qualification lane must include %q", required)
-				}
+			if err := checkQualificationLanes(wf, requiredCheck); err != nil {
+				return err
 			}
 		}
 	}
@@ -167,6 +146,97 @@ func Check(root string) error {
 		return err
 	}
 	return nil
+}
+
+// checkQualificationLanes preserves the protection contract while allowing
+// source analysis/fuzzing and image/security work to run concurrently after a
+// history-and-policy gate. The protected check is a fail-closed aggregator:
+// it does not evaluate checkout content itself.
+func checkQualificationLanes(wf workflow, requiredCheck string) error {
+	preflight, ok := wf.Jobs["preflight"]
+	if !ok {
+		return fmt.Errorf("CI must include history and policy preflight")
+	}
+	if err := requireLaneSteps("CI preflight", preflight, []string{
+		"gitleaks/gitleaks-action@",
+		"scripts/check-ci-policy.sh",
+	}); err != nil {
+		return err
+	}
+
+	source, ok := wf.Jobs["source"]
+	if !ok || !needs(source, "preflight") {
+		return fmt.Errorf("CI source qualification lane must depend on preflight")
+	}
+	if err := requireLaneSteps("CI source qualification lane", source, []string{
+		"go tool actionlint",
+		"go tool staticcheck",
+		"go tool govulncheck",
+		"go test -race ./...",
+		"scripts/test-fuzz.sh",
+		"TestProviderProcessConformance",
+		"npm run lint",
+		"npm audit --audit-level=high",
+	}); err != nil {
+		return err
+	}
+
+	image, ok := wf.Jobs["image"]
+	if !ok || !needs(image, "preflight") {
+		return fmt.Errorf("CI image qualification lane must depend on preflight")
+	}
+	if err := requireLaneSteps("CI image qualification lane", image, []string{
+		"docker buildx build --check",
+		"scripts/test-container-hardening.sh",
+		"scripts/test-postgres-integration.sh",
+		"scripts/run-security-scans.sh",
+		"actions/upload-artifact@",
+	}); err != nil {
+		return err
+	}
+
+	verify, ok := wf.Jobs["verify"]
+	if !ok || verify.Name != requiredCheck {
+		return fmt.Errorf("CI verify job must retain required check name %q", requiredCheck)
+	}
+	if !strings.Contains(verify.If, "always()") || !needs(verify, "source") || !needs(verify, "image") {
+		return fmt.Errorf("CI verify job must fail closed after source and image qualification lanes")
+	}
+	if len(verify.Steps) != 1 || !strings.Contains(verify.Steps[0].Run, "needs.source.result") ||
+		!strings.Contains(verify.Steps[0].Run, "needs.image.result") {
+		return fmt.Errorf("CI verify job must explicitly require source and image success")
+	}
+	return nil
+}
+
+func requireLaneSteps(name string, job workflowJob, required []string) error {
+	var lane strings.Builder
+	for _, step := range job.Steps {
+		lane.WriteString(step.Uses)
+		lane.WriteByte('\n')
+		lane.WriteString(step.Run)
+		lane.WriteByte('\n')
+	}
+	for _, want := range required {
+		if !strings.Contains(lane.String(), want) {
+			return fmt.Errorf("%s must include %q", name, want)
+		}
+	}
+	return nil
+}
+
+func needs(job workflowJob, wanted string) bool {
+	switch raw := job.Needs.(type) {
+	case string:
+		return raw == wanted
+	case []any:
+		for _, value := range raw {
+			if name, ok := value.(string); ok && name == wanted {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func checkDependabotApproval(root string) error {

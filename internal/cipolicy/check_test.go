@@ -22,6 +22,55 @@ func TestCheckRepositoryPolicy(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsCIQualificationLaneBypass(t *testing.T) {
+	tests := []struct {
+		name    string
+		old     string
+		new     string
+		contain string
+	}{
+		{
+			name:    "source skips preflight",
+			old:     "    needs: preflight\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n",
+			new:     "    needs: []\n    runs-on: ubuntu-latest\n    timeout-minutes: 20\n",
+			contain: "source qualification lane must depend on preflight",
+		},
+		{
+			name:    "image omits security scan",
+			old:     "        run: scripts/run-security-scans.sh thornhill:ci thornhill-postgres:ci",
+			new:     "        run: true",
+			contain: "image qualification lane must include",
+		},
+		{
+			name:    "verify does not aggregate failures",
+			old:     "    if: ${{ always() }}\n",
+			new:     "    if: ${{ success() }}\n",
+			contain: "verify job must fail closed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/ci.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
+	}
+}
+
 func policyFixture(t *testing.T) string {
 	t.Helper()
 	source := repositoryRoot(t)
