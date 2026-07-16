@@ -10,3 +10,6 @@ coverage.out
 /.beads/*.lock
 # br doctor per-run artifacts
 .doctor/
+
+# bv (beads viewer) local config and caches
+.bv/

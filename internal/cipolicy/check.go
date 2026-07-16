@@ -3,6 +3,7 @@
 package cipolicy
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -46,6 +47,12 @@ type scannerCompose struct {
 	Services map[string]struct {
 		Image string `yaml:"image"`
 	} `yaml:"services"`
+}
+
+type rollbackCompatibility struct {
+	SchemaSHA256 string `json:"schema_sha256"`
+	Mode         string `json:"mode"`
+	Rationale    string `json:"rationale"`
 }
 
 type protection struct {
@@ -145,6 +152,54 @@ func Check(root string) error {
 	if err := checkPinnedImages(root); err != nil {
 		return err
 	}
+	if err := checkRollbackCompatibility(root); err != nil {
+		return err
+	}
+	return nil
+}
+
+func checkRollbackCompatibility(root string) error {
+	storeData, err := os.ReadFile(filepath.Join(root, "internal/store/store.go"))
+	if err != nil {
+		return err
+	}
+	const marker = "const schema = `"
+	start := strings.Index(string(storeData), marker)
+	if start < 0 {
+		return fmt.Errorf("store schema marker is missing")
+	}
+	start += len(marker)
+	end := strings.Index(string(storeData[start:]), "`")
+	if end < 0 {
+		return fmt.Errorf("store schema terminator is missing")
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(storeData[start:start+end]))
+
+	policyData, err := os.ReadFile(filepath.Join(root, "docs/rollback-compatibility.json"))
+	if err != nil {
+		return err
+	}
+	var policy rollbackCompatibility
+	if err := json.Unmarshal(policyData, &policy); err != nil {
+		return fmt.Errorf("decode rollback compatibility policy: %w", err)
+	}
+	if policy.SchemaSHA256 != digest {
+		return fmt.Errorf("rollback compatibility policy does not cover current schema: got %q want %q", policy.SchemaSHA256, digest)
+	}
+	if policy.Mode != "backward-compatible-additive" && policy.Mode != "manual-forward-only" {
+		return fmt.Errorf("rollback compatibility mode %q is not recognized", policy.Mode)
+	}
+	if len(strings.TrimSpace(policy.Rationale)) < 80 {
+		return fmt.Errorf("rollback compatibility rationale must explain the migration and rollback consequence")
+	}
+	deployer, err := os.ReadFile(filepath.Join(root, "scripts/deploy-passed-main.sh"))
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(deployer), "docs/rollback-compatibility.json") ||
+		!strings.Contains(string(deployer), "backward-compatible-additive") {
+		return fmt.Errorf("deployer must gate automatic promotion on rollback compatibility mode")
+	}
 	return nil
 }
 
@@ -173,9 +228,11 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 		"go tool staticcheck",
 		"go tool govulncheck",
 		"go test -race ./...",
+		"scripts/test-deployer-policy.sh",
 		"scripts/test-fuzz.sh",
 		"TestProviderProcessConformance",
 		"npm run lint",
+		"npm test",
 		"npm audit --audit-level=high",
 	}); err != nil {
 		return err
@@ -293,6 +350,7 @@ func checkDependabotApproval(root string) error {
 		`.head.sha == $sha`,
 		`repos/${REPOSITORY}/pulls/${pull_request}/reviews`,
 		"-f event=APPROVE",
+		`-f "commit_id=${head_sha}"`,
 	} {
 		if !strings.Contains(lane.String(), required) {
 			return fmt.Errorf("%s approval lane must include %q", relative, required)

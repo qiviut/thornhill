@@ -38,7 +38,7 @@ The required `Go, web, and image build` job is one secretless, read-only qualifi
 - ShellCheck over every tracked shell script;
 - Trivy repository dependency and Dockerfile-misconfiguration scans;
 - Trivy scans of the built application and PostgreSQL images;
-- a runtime harness that verifies application and PostgreSQL runtime identities, image health, exact source-revision reporting, read-only roots, least capabilities, `no-new-privileges`, PID limits, and graceful application `SIGTERM` shutdown;
+- a runtime harness that first renders and asserts the checked-in Compose security model, then verifies application and PostgreSQL runtime identities, image health, exact source-revision reporting, read-only roots, least capabilities, `no-new-privileges`, both PID limits, and graceful application `SIGTERM` shutdown;
 - real PostgreSQL migration/concurrency integration tests and Compose-model validation;
 - CycloneDX SBOM generation and 30-day artifact retention for both images.
 

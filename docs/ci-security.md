@@ -68,12 +68,15 @@ PR trigger and never executes a pull-request checkout. It selects the newest
 successful `push` CI run for `main`, verifies that SHA is an ancestor of current
 `origin/main`, builds from a detached worktree at that exact revision, and
 injects the full SHA into the binary and OCI image label. Once the build is
-ready, a PostgreSQL row lock atomically pauses job creation; the deployer then
-rechecks that no queued or active work exists before replacing the app.
+ready, a PostgreSQL transaction atomically sets the dispatch pause. A database
+trigger then rejects inserts and transitions into `queued` or `running`, while
+already-running work may still complete or park safely. The deployer rechecks
+that no queued or active work exists before replacing the services.
 
 Both local and Tailnet UI/status probes, the running OCI label, and the in-container
-binary must agree. Failure restores the prior image using the prior revision's
-Compose model and verifies the rollback. A revision that fails host verification
+binary must agree. Failure restores the prior application **and PostgreSQL**
+images using the prior revision's Compose model, force-recreates both services,
+and verifies the rollback. A revision that fails host verification
 is recorded in `failed.json` and suppressed until a newer passing SHA arrives or
 an operator explicitly sets `RETRY_FAILED=1`.
 
@@ -98,7 +101,17 @@ deploying, and stays quiet. Direct script execution remains fail-closed for the
 same conditions. After a merge, update the checkout, run the service once, and
 enable the timer only after the deployed receipt and live revision agree.
 `CHECK_ONLY=1 scripts/deploy-passed-main.sh` fails whenever the live revision
-differs from the latest passing CI revision.
+differs from the latest passing CI revision. It also fails if another deployment
+holds the lock; lock contention is never reported as successful correspondence.
+
+Automatic rollback reuses the persistent database after candidate startup has
+applied its schema. `docs/rollback-compatibility.json` therefore binds an
+explicit compatibility mode and rationale to the SHA-256 of the embedded schema
+SQL. CI rejects an uncovered schema edit. The host deployer accepts only
+`backward-compatible-additive`; `manual-forward-only` documents an incompatible
+migration but blocks automatic promotion and rollback. A breaking migration
+requires an operator-controlled backup/restore or forward-recovery runbook before
+deployment—not a best-effort image downgrade.
 
 This is **source-revision correspondence**, not binary artifact promotion: CI and
 the host independently rebuild the same commit. OCI labels, linker metadata,

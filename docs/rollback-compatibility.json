@@ -1,0 +1,5 @@
+{
+  "schema_sha256": "cfe7fbae21586d9756b87e8b2bb80c4af8e490d6c013620809924f1adf6aa84f",
+  "mode": "backward-compatible-additive",
+  "rationale": "The pending_input column is additive with a non-null default. The deployment trigger replacement changes admission behavior without removing data or columns, so the prior app and PostgreSQL image can still operate after the candidate schema has been applied. Destructive or version-coupled migrations must use mode manual-forward-only and are ineligible for automatic rollback deployment."
+}

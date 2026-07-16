@@ -72,4 +72,5 @@ jobs:
 
           gh api --method POST "repos/${REPOSITORY}/pulls/${pull_request}/reviews" \
             -f event=APPROVE \
+            -f "commit_id=${head_sha}" \
             -f "body=Approved automatically after CI succeeded for ${head_sha}."

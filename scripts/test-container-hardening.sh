@@ -2,13 +2,31 @@
 # Exercise the built image under the same hardening controls used by Compose.
 set -euo pipefail
 
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 app_image=${1:-thornhill:ci}
 db_image=${2:-thornhill-postgres:ci}
 suffix="${GITHUB_RUN_ID:-local}-$$"
 network="thornhill-hardening-${suffix}"
 db="thornhill-hardening-db-${suffix}"
 app="thornhill-hardening-app-${suffix}"
-db_url="postgres://thornhill:thornhill-test-only@${db}:5432/thornhill?sslmode=disable"
+db_url="postgres://thornhill:***@${db}:5432/thornhill?sslmode=disable"
+
+compose_model=$(THORNHILL_ENV_FILE="${root}/.env.example" \
+  THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+  docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" config --format json)
+jq -e '
+  (.services.app | .init == true and .read_only == true and .pids_limit == 256 and
+    .cap_drop == ["ALL"] and (.security_opt | index("no-new-privileges:true")) != null and
+    (.tmpfs | index("/tmp:rw,noexec,nosuid,size=64m")) != null) and
+  (.services.db | .init == true and .read_only == true and .pids_limit == 256 and
+    .cap_drop == ["ALL"] and
+    (.cap_add | sort) == (["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"] | sort) and
+    (.security_opt | index("no-new-privileges:true")) != null and
+    any(.tmpfs[]; startswith("/run/postgresql:rw,noexec,nosuid,size=16m")))
+' <<<"${compose_model}" >/dev/null || {
+  printf 'Checked-in Compose hardening model does not match the qualified runtime policy\n' >&2
+  exit 1
+}
 
 cleanup() {
   docker rm --force "$app" "$db" >/dev/null 2>&1 || true
@@ -120,9 +138,11 @@ done
 readonly=$(docker inspect "$app" --format '{{.HostConfig.ReadonlyRootfs}}')
 cap_drop=$(docker inspect "$app" --format '{{json .HostConfig.CapDrop}}')
 security_opt=$(docker inspect "$app" --format '{{json .HostConfig.SecurityOpt}}')
+app_pids_limit=$(docker inspect "$app" --format '{{.HostConfig.PidsLimit}}')
 [[ "$readonly" == true ]]
 [[ "$cap_drop" == *'ALL'* ]]
 [[ "$security_opt" == *'no-new-privileges'* ]]
+[[ "$app_pids_limit" == 256 ]]
 
 published=$(docker port "$app" 8787/tcp)
 port=${published##*:}
@@ -134,5 +154,5 @@ versioned=$(jq -r '.versioned // false' <<<"$status")
 docker stop --time 10 "$app" >/dev/null
 [[ "$(docker inspect "$app" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'Application did not stop cleanly on SIGTERM'
 
-printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL db_user=%s db_read_only=true db_cap_drop=ALL\n' \
+printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL app_pids=256 db_user=%s db_read_only=true db_cap_drop=ALL db_pids=256\n' \
   "$revision" "$runtime_user" "$db_uid"
