@@ -5,6 +5,7 @@ fuzztime=${FUZZTIME:-5s}
 targets=(
   './internal/store:FuzzApprovalPatternHash'
   './internal/bridge:FuzzApprovalDecisionIsSingleUse'
+  './internal/bridge:FuzzParkedApprovalNeverInvokesAuthority'
   './internal/openairt:FuzzRealtimeEventExtractors'
   './internal/gateway:FuzzValidCallID'
   './internal/gateway:FuzzOriginPolicy'

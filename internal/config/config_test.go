@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadParsesAllowedOrigins(t *testing.T) {
@@ -12,6 +13,7 @@ func TestLoadParsesAllowedOrigins(t *testing.T) {
 	t.Setenv("ALLOWED_ORIGINS", " localhost:5173, https://dev.example.test , ")
 	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:49123/")
 	t.Setenv("OPENAI_REALTIME_WS_URL", "ws://127.0.0.1:49123/v1/realtime")
+	t.Setenv("APPROVAL_PARK_AFTER", "45s")
 
 	cfg, err := Load()
 	if err != nil {
@@ -23,6 +25,9 @@ func TestLoadParsesAllowedOrigins(t *testing.T) {
 	}
 	if cfg.OpenAIBaseURL != "http://127.0.0.1:49123" || cfg.OpenAIRealtimeWSURL != "ws://127.0.0.1:49123/v1/realtime" {
 		t.Fatalf("OpenAI endpoints = %q / %q", cfg.OpenAIBaseURL, cfg.OpenAIRealtimeWSURL)
+	}
+	if cfg.ApprovalParkAfter != 45*time.Second {
+		t.Fatalf("ApprovalParkAfter = %s, want 45s", cfg.ApprovalParkAfter)
 	}
 }
 
@@ -68,5 +73,15 @@ func TestLoadRejectsUnsafeProviderEndpoints(t *testing.T) {
 				t.Fatalf("Load() error = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadRejectsNonPositiveApprovalParkingThreshold(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("DATABASE_URL", "postgres://test:test@localhost/test")
+	t.Setenv("APPROVAL_PARK_AFTER", "0s")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "APPROVAL_PARK_AFTER") {
+		t.Fatalf("Load() error = %v, want approval parking threshold error", err)
 	}
 }

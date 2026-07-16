@@ -29,9 +29,10 @@ type Config struct {
 	SafetyID            string // SAFETY_IDENTIFIER, sent as OpenAI-Safety-Identifier (single user, static)
 
 	// --- hermes ---
-	HermesBaseURL string // HERMES_BASE_URL: OpenAI-compatible API server of the Hermes instance. Empty => stub worker.
-	HermesAPIKey  string // HERMES_API_KEY: optional bearer for the Hermes API server
-	HermesModel   string // HERMES_MODEL: model name passed through; Hermes decides. Default "default".
+	HermesBaseURL     string        // HERMES_BASE_URL: OpenAI-compatible API server of the Hermes instance. Empty => stub worker.
+	HermesAPIKey      string        // HERMES_API_KEY: optional bearer for the Hermes API server
+	HermesModel       string        // HERMES_MODEL: model name passed through; Hermes decides. Default "default".
+	ApprovalParkAfter time.Duration // APPROVAL_PARK_AFTER, default 15m: reclaim a silent approval run without deciding it
 
 	// --- server ---
 	ListenAddr string // LISTEN_ADDR, default :8787 (bind to tailscale iface or firewall on host)
@@ -145,6 +146,7 @@ func Load() (*Config, error) {
 		HermesBaseURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("HERMES_BASE_URL")), "/"),
 		HermesAPIKey:        os.Getenv("HERMES_API_KEY"),
 		HermesModel:         getenv("HERMES_MODEL", "default"),
+		ApprovalParkAfter:   getdur("APPROVAL_PARK_AFTER", 15*time.Minute),
 		ListenAddr:          getenv("LISTEN_ADDR", ":8787"),
 		StaticDir:           getenv("STATIC_DIR", "web/dist"),
 		AllowedOrigins:      splitCSV(os.Getenv("ALLOWED_ORIGINS")),
@@ -174,6 +176,9 @@ func Load() (*Config, error) {
 		if err := validateProviderURL("HERMES_BASE_URL", c.HermesBaseURL, false); err != nil {
 			return nil, err
 		}
+	}
+	if c.ApprovalParkAfter <= 0 {
+		return nil, fmt.Errorf("APPROVAL_PARK_AFTER must be greater than zero")
 	}
 	if c.OpenAIKey == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY is required")

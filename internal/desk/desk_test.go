@@ -78,6 +78,38 @@ func TestApprovalAnnouncementIsProactiveAndConversational(t *testing.T) {
 	}
 }
 
+func TestParkedApprovalAnnouncementCannotResolveStaleAuthority(t *testing.T) {
+	t.Parallel()
+	job := store.Job{DisplayName: "System audit", Status: store.StatusParkedApproval,
+		Approvals: []store.Approval{{ID: "stale-id", DecisionNonce: "stale-nonce", State: store.ApprovalStateParked}}}
+	payload, _ := json.Marshal(job)
+	d := &Desk{}
+	inj, ok := d.announcementFor(events.Event{Kind: events.KindJobApprovalParked, Payload: payload})
+	if !ok || !inj.respond || inj.isQuestion || inj.role != "system" {
+		t.Fatalf("announcement flags: %+v, ok=%v", inj, ok)
+	}
+	for _, want := range []string{"without allowing or denying", "resume_job", "fresh authority request", "Do not call resolve_approval"} {
+		if !strings.Contains(inj.text, want) {
+			t.Errorf("parked announcement missing %q: %s", want, inj.text)
+		}
+	}
+
+	view := full(job)
+	if _, ok := view["pending_approval"]; ok {
+		t.Fatalf("parked request exposed as pending: %#v", view)
+	}
+	if _, ok := view["approval_choices"]; ok {
+		t.Fatalf("parked request exposed authority choices: %#v", view)
+	}
+	if _, ok := view["parked_approval"]; !ok {
+		t.Fatalf("parked evidence missing: %#v", view)
+	}
+	encoded, _ := json.Marshal(view)
+	if strings.Contains(string(encoded), "stale-id") || strings.Contains(string(encoded), "stale-nonce") {
+		t.Fatalf("parked authority token leaked through desk view: %s", encoded)
+	}
+}
+
 type recordingRealtime struct {
 	outputCallIDs  []string
 	outputBodies   []string

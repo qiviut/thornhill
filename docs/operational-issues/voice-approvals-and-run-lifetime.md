@@ -92,20 +92,39 @@ Background Hermes jobs continue throughout parking. Reopening creates a fresh
 Realtime call reconstructed from durable job, event, and debrief state; it does
 not attempt byte-identical restoration of an old media stream.
 
-## Explicit approval with no elapsed decision
+## Explicit approval without inferred elapsed decision
 
-Silence is neither approval nor denial. A healthy approval stays pending until
-one of these distinct outcomes occurs:
+Silence is neither approval nor denial. A pending authority record remains
+unresolved until the operator explicitly decides it. Execution resources do not
+need to remain attached to that record indefinitely: `APPROVAL_PARK_AFTER`
+(default `15m`) is a resource-reclamation threshold, not a decision deadline.
 
-- the operator explicitly allows or denies it;
-- the operator explicitly cancels or stops the session;
-- the owning execution is interrupted or shuts down; or
-- the control/transport operation fails.
+When the threshold expires, Thornhill atomically changes the exact
+`needs_approval`/`pending` record to `parked_approval`/`parked`, preserving its
+redacted request evidence, pattern scope, original request time, parking time,
+and reason. Only after that durable transition does it request that the Hermes
+run stop, close the event stream, return the River worker, and release its
+in-memory run, answer, and cancellation slots. It sends no allow or deny control
+request. A confirmed upstream stop clears the retained run ID. If stop cannot be
+confirmed, bounded detached retries and startup/explicit-resume reconciliation
+use that durable ID; no River worker or open SSE is retained for cleanup.
+
+A decision claim and a parking claim race under the same PostgreSQL row lock and
+one-use approval ID/nonce. Exactly one may win. After parking, the old ID/nonce
+is stale and cannot be resolved or replayed. If the durable transition fails,
+Thornhill retains the pending record and resource owner for retry/restart
+reconciliation rather than pretending reclamation or a decision succeeded.
+
+Process restart applies the same rule to a sole durable pending request: it parks
+the request, stops the known upstream run, and lets stale River redelivery finish
+without starting work. A request already in `sending` cannot be reconstructed as
+pending; it becomes failed with an indeterminate authority outcome instead.
 
 Thornhill no longer wraps the whole Hermes run in a 4m30s timer, and its River
 worker reports no elapsed runtime timeout. Hermes CLI, gateway, API, ACP, MCP,
 Matrix, Discord, and QQ approval paths likewise do not synthesize a decision
-from elapsed time. Gateway heartbeats keep a healthy pending wait active.
+from elapsed time. Before the parking threshold, gateway heartbeats keep a
+healthy pending wait active.
 
 A decision does not make network operations unbounded. The post-decision
 approval control request has a short transport deadline, and an indeterminate
@@ -116,8 +135,9 @@ then resumes ordinary deadline accounting after the decision.
 Exact one-use approval IDs/nonces, FIFO correlation, collision fail-closed
 handling, and exact-pattern-set job/permanent policies remain intact. Platform
 buttons may become unusable when their UI lifetime ends, but that only disables
-the component; it does not decide the still-pending approval. Text approval and
-deny commands remain available.
+the component; it does not decide the unresolved approval. Text approval and
+deny commands remain available while the request is pending; a parked request
+must instead be resumed and reissued with fresh authority if still needed.
 
 ## Progressive approval and safer alternatives
 
@@ -148,26 +168,36 @@ when practical. The script must be either:
 This is approval-friction reduction, not an authority bypass. Hard blocks and
 exact reusable approval scope are unchanged.
 
-## Safe failed-job resume
+## Safe failed-job and parked-approval resume
 
-Process restart still stops known in-flight Hermes runs fail-closed. Thornhill
-preserves the job's error and last progress evidence rather than erasing the
-uncertain outcome.
+Process restart still stops known in-flight Hermes runs fail-closed. Ordinary
+running/input work preserves the job's error and last progress evidence rather
+than erasing the uncertain outcome. A sole pending approval is parked unresolved
+as described above; restart never converts it to allow or deny.
 
-`resume_job` is allowed only for a failed job. It atomically claims the
-failed-to-queued transition, so concurrent resume attempts cannot enqueue the
-same job twice. It clears stale execution control fields and approvals while
-retaining the durable job identity and Hermes session ID. The new run receives:
+`resume_job` atomically claims either a `failed` or `parked_approval` job into
+`queued`, so concurrent resume attempts cannot enqueue the same job twice. It
+clears stale execution control fields. A failed job clears any stale approval
+record; a parked job retains its durable evidence just long enough for `Run` to
+build the recovery brief, then clears the stale ID/nonce before starting a new
+Hermes run.
+
+The new run receives:
 
 - the newest bounded user/assistant history from the durable Hermes session;
 - the original task;
-- the prior interruption and progress checkpoint; and
-- an explicit instruction to verify current workspace/service state before
-  repeating any potentially side-effecting operation.
+- the prior interruption and progress checkpoint;
+- for a parked request, quoted untrusted command/description/pattern/timestamp
+  evidence without the old approval ID or nonce; and
+- explicit instructions to verify current state, infer no permission from the
+  parked request, and issue a fresh approval record if the action remains needed.
 
 This is reconciliation-first continuation, not blind replay. A successful
-resumed run writes a new terminal result while retaining the prior error as
-historical evidence; job status remains the authoritative current outcome.
+resumed run writes a new terminal result while retaining a failed job's prior
+error as historical evidence; job status remains the authoritative current
+outcome. If queue submission fails, a parked job rolls back to
+`parked_approval` with its evidence intact rather than becoming an opaque failed
+job.
 
 ## Known limits
 

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func randomTestValue(t *testing.T, prefix string, bytes int) string {
@@ -115,8 +116,67 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 		t.Fatalf("claim results won=%d stale=%d other=%d", won.Load(), stale.Load(), other.Load())
 	}
 	claimed, err := st.ResolveJob(ctx, job.ID)
-	if err != nil || len(claimed.Approvals) != 1 || claimed.Approvals[0].State != "sending" {
+	if err != nil || len(claimed.Approvals) != 1 || claimed.Approvals[0].State != ApprovalStateSending {
 		t.Fatalf("claimed state=%+v err=%v", claimed.Approvals, err)
+	}
+
+	parkJob, err := st.CreateJob(ctx, randomTestValue(t, "park_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parkApprovalID := randomTestValue(t, "approval_", 32)
+	parkNonce := randomTestValue(t, "nonce_", 48)
+	parkJob, err = st.UpdateJob(ctx, parkJob.ID, func(x *Job) {
+		x.Status = StatusNeedsApproval
+		x.HermesRunID = randomTestValue(t, "run_", 24)
+		x.Approvals = []Approval{{ID: parkApprovalID, DecisionNonce: parkNonce, State: ApprovalStatePending}}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decisionWon, parkingWon, claimStale atomic.Int32
+	startRace := make(chan struct{})
+	var raceWG sync.WaitGroup
+	raceWG.Add(2)
+	go func() {
+		defer raceWG.Done()
+		<-startRace
+		if _, claimErr := st.ClaimApproval(ctx, parkJob.ID, parkApprovalID, parkNonce); claimErr == nil {
+			decisionWon.Add(1)
+		} else if errors.Is(claimErr, ErrApprovalStale) {
+			claimStale.Add(1)
+		} else {
+			other.Add(1)
+		}
+	}()
+	go func() {
+		defer raceWG.Done()
+		<-startRace
+		if _, parkErr := st.ParkApproval(ctx, parkJob.ID, parkApprovalID, parkNonce, "integration race", parkJob.UpdatedAt.Add(time.Second)); parkErr == nil {
+			parkingWon.Add(1)
+		} else if errors.Is(parkErr, ErrApprovalStale) {
+			claimStale.Add(1)
+		} else {
+			other.Add(1)
+		}
+	}()
+	close(startRace)
+	raceWG.Wait()
+	if decisionWon.Load()+parkingWon.Load() != 1 || claimStale.Load() != 1 || other.Load() != 0 {
+		t.Fatalf("decision/parking race decision=%d parking=%d stale=%d other=%d",
+			decisionWon.Load(), parkingWon.Load(), claimStale.Load(), other.Load())
+	}
+	raced, err := st.ResolveJob(ctx, parkJob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parkingWon.Load() == 1 {
+		if raced.Status != StatusParkedApproval || len(raced.Approvals) != 1 ||
+			raced.Approvals[0].State != ApprovalStateParked || raced.Approvals[0].ParkedAt == nil {
+			t.Fatalf("parking winner state=%+v", raced)
+		}
+	} else if raced.Status != StatusNeedsApproval || raced.Approvals[0].State != ApprovalStateSending {
+		t.Fatalf("decision winner state=%+v", raced)
 	}
 
 	source := randomTestValue(t, "source_", 18)

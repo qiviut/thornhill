@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id                TEXT PRIMARY KEY,
     display_name      TEXT NOT NULL,
     task              TEXT NOT NULL,
-    status            TEXT NOT NULL, -- queued|running|needs_input|needs_approval|done|failed|cancelled
+    status            TEXT NOT NULL, -- queued|running|needs_input|needs_approval|parked_approval|done|failed|cancelled
     question          TEXT NOT NULL DEFAULT '',
     result_digest     TEXT NOT NULL DEFAULT '',
     error             TEXT NOT NULL DEFAULT '',
@@ -119,14 +119,16 @@ type Job struct {
 // Approval is a redacted, user-visible authority request from Hermes. The
 // Runs API resolves approvals FIFO, so callers may decide only the first entry.
 type Approval struct {
-	ID             string    `json:"id"`
-	DecisionNonce  string    `json:"decision_nonce"`
-	State          string    `json:"state"` // pending|sending|indeterminate
-	Command        string    `json:"command,omitempty"`
-	Description    string    `json:"description,omitempty"`
-	PatternKeys    []string  `json:"pattern_keys,omitempty"`
-	AllowPermanent bool      `json:"allow_permanent"`
-	RequestedAt    time.Time `json:"requested_at"`
+	ID             string     `json:"id"`
+	DecisionNonce  string     `json:"decision_nonce"`
+	State          string     `json:"state"` // pending|sending|parked|indeterminate
+	Command        string     `json:"command,omitempty"`
+	Description    string     `json:"description,omitempty"`
+	PatternKeys    []string   `json:"pattern_keys,omitempty"`
+	AllowPermanent bool       `json:"allow_permanent"`
+	RequestedAt    time.Time  `json:"requested_at"`
+	ParkedAt       *time.Time `json:"parked_at,omitempty"`
+	ParkReason     string     `json:"park_reason,omitempty"`
 }
 
 // Progress is the most recent structured Hermes tool lifecycle event.
@@ -138,13 +140,21 @@ type Progress struct {
 }
 
 const (
-	StatusQueued        = "queued"
-	StatusRunning       = "running"
-	StatusNeedsInput    = "needs_input"
-	StatusNeedsApproval = "needs_approval"
-	StatusDone          = "done"
-	StatusFailed        = "failed"
-	StatusCancelled     = "cancelled"
+	StatusQueued         = "queued"
+	StatusRunning        = "running"
+	StatusNeedsInput     = "needs_input"
+	StatusNeedsApproval  = "needs_approval"
+	StatusParkedApproval = "parked_approval"
+	StatusDone           = "done"
+	StatusFailed         = "failed"
+	StatusCancelled      = "cancelled"
+)
+
+const (
+	ApprovalStatePending       = "pending"
+	ApprovalStateSending       = "sending"
+	ApprovalStateParked        = "parked"
+	ApprovalStateIndeterminate = "indeterminate"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -266,8 +276,8 @@ func (s *Store) ClaimApproval(ctx context.Context, jobID, approvalID, nonce stri
 	j, err := s.UpdateJob(ctx, jobID, func(x *Job) {
 		if x.Status == StatusNeedsApproval && len(x.Approvals) == 1 &&
 			x.Approvals[0].ID == approvalID && x.Approvals[0].DecisionNonce == nonce &&
-			x.Approvals[0].State == "pending" {
-			x.Approvals[0].State = "sending"
+			x.Approvals[0].State == ApprovalStatePending {
+			x.Approvals[0].State = ApprovalStateSending
 			claimed = true
 		}
 	})
@@ -275,6 +285,38 @@ func (s *Store) ClaimApproval(ctx context.Context, jobID, approvalID, nonce stri
 		return j, err
 	}
 	if !claimed {
+		return j, ErrApprovalStale
+	}
+	return j, nil
+}
+
+// ParkApproval atomically competes with ClaimApproval for the same one-use
+// nonce. Parking preserves the unresolved request as durable evidence but does
+// not consume an authority decision.
+func (s *Store) ParkApproval(ctx context.Context, jobID, approvalID, nonce, reason string, at time.Time) (Job, error) {
+	parked := false
+	at = at.UTC()
+	j, err := s.UpdateJob(ctx, jobID, func(x *Job) {
+		if x.Status == StatusNeedsApproval && len(x.Approvals) == 1 &&
+			x.Approvals[0].ID == approvalID && x.Approvals[0].DecisionNonce == nonce &&
+			x.Approvals[0].State == ApprovalStatePending {
+			x.Status = StatusParkedApproval
+			x.Approvals[0].State = ApprovalStateParked
+			x.Approvals[0].ParkedAt = &at
+			x.Approvals[0].ParkReason = reason
+			x.Progress = &Progress{
+				Tool:      "approval",
+				State:     ApprovalStateParked,
+				Label:     "approval parked unresolved; resume requires a fresh authority request",
+				UpdatedAt: at,
+			}
+			parked = true
+		}
+	})
+	if err != nil {
+		return j, err
+	}
+	if !parked {
 		return j, ErrApprovalStale
 	}
 	return j, nil
@@ -334,7 +376,7 @@ func (s *Store) ResolveJob(ctx context.Context, ref string) (Job, error) {
 		return Job{}, ErrAmbiguous
 	}
 	rows, err = s.Pool.Query(ctx, selectJob+
-		` WHERE display_name ILIKE '%'||$1||'%' AND status IN ('queued','running','needs_input','needs_approval')
+		` WHERE display_name ILIKE '%'||$1||'%' AND status IN ('queued','running','needs_input','needs_approval','parked_approval')
 		  ORDER BY created_at DESC`, ref)
 	if err != nil {
 		return Job{}, err
@@ -370,7 +412,7 @@ func collect(rows pgx.Rows) ([]Job, error) {
 // table the desk model keeps in context.
 func (s *Store) ActiveJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.Pool.Query(ctx, selectJob+
-		` WHERE status IN ('queued','running','needs_input','needs_approval') ORDER BY created_at DESC`)
+		` WHERE status IN ('queued','running','needs_input','needs_approval','parked_approval') ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
