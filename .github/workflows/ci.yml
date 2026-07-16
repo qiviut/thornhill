@@ -20,12 +20,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Go, web, and image build
+  # This lane keeps the historical secret scan and branch-policy check ahead of
+  # every command that evaluates checkout content. Its toolchain outputs avoid
+  # version drift between the independent source qualification lane and images.
+  preflight:
+    name: History and policy preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 10
+    outputs:
+      go: ${{ steps.toolchains.outputs.go }}
+      node: ${{ steps.toolchains.outputs.node }}
     steps:
-      - name: Check out source
+      - name: Check out source and history
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
@@ -54,10 +60,19 @@ jobs:
           test -n "${go_version}" && test -n "${node_version}"
           printf 'go=%s\nnode=%s\n' "${go_version}" "${node_version}" >> "${GITHUB_OUTPUT}"
 
+  source:
+    name: Source analysis and fuzzing
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: ${{ steps.toolchains.outputs.go }}
+          go-version: ${{ needs.preflight.outputs.go }}
           # Do not restore mutable caches into the untrusted qualification lane.
           cache: false
 
@@ -85,7 +100,7 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # Deliberately omit `cache` in the public-PR qualification lane.
-          node-version: ${{ steps.toolchains.outputs.node }}
+          node-version: ${{ needs.preflight.outputs.node }}
 
       - name: Verify web client
         working-directory: web
@@ -95,6 +110,15 @@ jobs:
           npm run lint
           npm run build
           npm audit --audit-level=high
+
+  image:
+    name: Image build and security
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Validate Dockerfiles with BuildKit
         run: |
@@ -145,3 +169,17 @@ jobs:
           path: ${{ runner.temp }}/thornhill-scan/*.cdx.json
           if-no-files-found: warn
           retention-days: 30
+
+  # Keep this exact check name: branch protection and the CI-gated deployer use
+  # it as the single green gate. It intentionally carries no untrusted code.
+  verify:
+    name: Go, web, and image build
+    needs: [source, image]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every qualification lane to pass
+        run: |
+          test "${{ needs.source.result }}" = success
+          test "${{ needs.image.result }}" = success
