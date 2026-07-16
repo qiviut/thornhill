@@ -9,7 +9,7 @@ suffix="${GITHUB_RUN_ID:-local}-$$"
 network="thornhill-hardening-${suffix}"
 db="thornhill-hardening-db-${suffix}"
 app="thornhill-hardening-app-${suffix}"
-db_url="postgres://thornhill:***@${db}:5432/thornhill?sslmode=disable"
+db_url="postgres://thornhill:thornhill-test-only@${db}:5432/thornhill?sslmode=disable"
 
 compose_model=$(THORNHILL_ENV_FILE="${root}/.env.example" \
   THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
