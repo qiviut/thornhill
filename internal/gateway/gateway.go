@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -47,6 +48,8 @@ type Gateway struct {
 	mu       sync.Mutex
 	deskStop context.CancelFunc
 	current  *desk.Desk
+	deskWG   sync.WaitGroup
+	closing  bool
 
 	// deskLaunch overrides desk startup in tests; nil means g.startDesk.
 	deskLaunch func(callID string)
@@ -337,6 +340,10 @@ func validCallID(callID string) bool {
 
 func (g *Gateway) startDesk(callID string) {
 	g.mu.Lock()
+	if g.closing {
+		g.mu.Unlock()
+		return
+	}
 	if g.deskStop != nil {
 		g.deskStop() // single user: a new call supersedes the old desk
 	}
@@ -357,16 +364,21 @@ func (g *Gateway) startDesk(callID string) {
 		},
 	})
 	g.current = d
+	g.deskWG.Add(1)
 	g.mu.Unlock()
 
 	go func() {
+		defer g.deskWG.Done()
 		defer cancel()
 		reason, err := d.Run(dctx, callID)
-		if err != nil {
+		switch {
+		case err == nil:
+			g.Log.Info("desk parked", "reason", reason)
+		case errors.Is(err, context.Canceled):
+			g.Log.Debug("desk cancelled", "reason", reason)
+		default:
 			g.Log.Warn("desk ended with error", "reason", reason, "err", err)
 			g.voiceDown("session error: " + err.Error())
-		} else {
-			g.Log.Info("desk parked", "reason", reason)
 		}
 		g.mu.Lock()
 		if g.current == d {
@@ -377,6 +389,29 @@ func (g *Gateway) startDesk(callID string) {
 	}()
 }
 
+// Shutdown prevents new desks, cancels the active generation, and waits for
+// every superseded Desk goroutine before shared River/store dependencies close.
+func (g *Gateway) Shutdown(ctx context.Context) error {
+	g.mu.Lock()
+	g.closing = true
+	stop := g.deskStop
+	g.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	done := make(chan struct{})
+	go func() {
+		g.deskWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (g *Gateway) publishDeskState(d *desk.Desk, state desk.State, reason string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -384,7 +419,7 @@ func (g *Gateway) publishDeskState(d *desk.Desk, state desk.State, reason string
 	// section. Otherwise a replacement Desk can publish LIVE after the check
 	// and then be torn down by the old Desk's stale PARKED event.
 	if g.current == d {
-		g.Bus.Publish(events.KindSessionState, "", map[string]string{"state": string(state), "reason": reason})
+		g.Bus.PublishSync(events.KindSessionState, "", map[string]string{"state": string(state), "reason": reason})
 	}
 }
 

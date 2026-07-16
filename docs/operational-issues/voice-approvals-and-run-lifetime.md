@@ -68,6 +68,13 @@ error, false speech detection, browser Park, or WebRTC teardown. Voice offer
 negotiation is bounded, and ending a disposable Desk cancels any remaining
 front-desk helper context without cancelling dispatched durable jobs.
 
+Event fanout remains immediate, while durable event-log writes use one bounded,
+ordered queue so slow PostgreSQL writes do not stall ordinary producers. Session
+state transitions use the same queue with an acknowledgement fence; they cannot
+overtake earlier accepted events. Process shutdown first cancels and waits for
+the owned Desk, then stops River, drains accepted event persistence, and closes
+PostgreSQL.
+
 ## Truthful Park lifecycle
 
 Explicit Park is a drain request, not an immediate disconnect:
@@ -104,7 +111,7 @@ When the threshold expires, Thornhill atomically changes the exact
 redacted request evidence, pattern scope, original request time, parking time,
 and reason. Only after that durable transition does it request that the Hermes
 run stop, close the event stream, return the River worker, and release its
-in-memory run, answer, and cancellation slots. It sends no allow or deny control
+in-memory run and cancellation slots. It sends no allow or deny control
 request. A confirmed upstream stop clears the retained run ID. If stop cannot be
 confirmed, bounded detached retries and startup/explicit-resume reconciliation
 use that durable ID; no River worker or open SSE is retained for cleanup.
@@ -170,10 +177,12 @@ exact reusable approval scope are unchanged.
 
 ## Safe failed-job and parked-approval resume
 
-Process restart still stops known in-flight Hermes runs fail-closed. Ordinary
-running/input work preserves the job's error and last progress evidence rather
-than erasing the uncertain outcome. A sole pending approval is parked unresolved
-as described above; restart never converts it to allow or deny.
+Process restart still stops known in-flight Hermes runs fail-closed. Running work
+preserves the job's error and last progress evidence rather than erasing the
+uncertain outcome. A job already parked in `needs_input` retains its durable
+question and can consume a persisted answer after restart; a legacy stale run ID
+is stopped and conditionally cleared first. A sole pending approval is parked
+unresolved as described above; restart never converts it to allow or deny.
 
 `resume_job` atomically claims either a `failed` or `parked_approval` job into
 `queued`, so concurrent resume attempts cannot enqueue the same job twice. It
@@ -219,7 +228,8 @@ Before shipping a revision:
 1. Run `git diff --check`, `go vet ./...`, and `go test -race ./...`.
 2. Run the bounded PR fuzz smoke, randomized PostgreSQL integration, and
    deterministic provider conformance tests.
-3. Run `npm ci`, `npm run check`, and `npm run build` under `web/`.
+3. Run `npm ci --ignore-scripts`, `npm run check`, `npm run lint`, `npm test`,
+   `npm run build`, and `npm audit --audit-level=high` under `web/`.
 4. Build both container images; verify the app image label and binary version
    contain the candidate source revision.
 5. Push the complete code, test, documentation, and issue-ledger commit and wait

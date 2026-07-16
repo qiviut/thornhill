@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/oklog/ulid/v2"
 
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     task              TEXT NOT NULL,
     status            TEXT NOT NULL, -- queued|running|needs_input|needs_approval|parked_approval|done|failed|cancelled
     question          TEXT NOT NULL DEFAULT '',
+    pending_input     TEXT NOT NULL DEFAULT '',
     result_digest     TEXT NOT NULL DEFAULT '',
     error             TEXT NOT NULL DEFAULT '',
     hermes_session_id TEXT NOT NULL DEFAULT '',
@@ -40,6 +42,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at       TIMESTAMPTZ
 );
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hermes_run_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pending_input TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approvals JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress JSONB;
 CREATE TABLE IF NOT EXISTS approval_denials (
@@ -59,9 +62,15 @@ CREATE TABLE IF NOT EXISTS deployment_control (
 );
 INSERT INTO deployment_control (singleton, dispatch_paused)
 VALUES (TRUE, FALSE) ON CONFLICT (singleton) DO NOTHING;
-CREATE OR REPLACE FUNCTION thornhill_guard_job_insert() RETURNS trigger
+CREATE OR REPLACE FUNCTION thornhill_guard_job_dispatch() RETURNS trigger
 LANGUAGE plpgsql AS $guard$
 BEGIN
+	IF TG_OP = 'UPDATE' AND NEW.status IS NOT DISTINCT FROM OLD.status THEN
+		RETURN NEW;
+	END IF;
+	IF NEW.status NOT IN ('queued', 'running') THEN
+		RETURN NEW;
+	END IF;
     PERFORM pg_advisory_xact_lock(72623859790382856);
     IF (SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE) THEN
         RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='job dispatch is temporarily paused for deployment';
@@ -69,14 +78,12 @@ BEGIN
     RETURN NEW;
 END
 $guard$;
-DO $trigger$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='thornhill_guard_job_insert_trigger') THEN
-        CREATE TRIGGER thornhill_guard_job_insert_trigger
-        BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION thornhill_guard_job_insert();
-    END IF;
-END
-$trigger$;
+DROP TRIGGER IF EXISTS thornhill_guard_job_insert_trigger ON jobs;
+DROP TRIGGER IF EXISTS thornhill_guard_job_dispatch_trigger ON jobs;
+DROP FUNCTION IF EXISTS thornhill_guard_job_insert();
+CREATE TRIGGER thornhill_guard_job_dispatch_trigger
+BEFORE INSERT OR UPDATE OF status ON jobs
+FOR EACH ROW EXECUTE FUNCTION thornhill_guard_job_dispatch();
 CREATE TABLE IF NOT EXISTS event_log (
     seq     BIGSERIAL PRIMARY KEY,
     ts      TIMESTAMPTZ NOT NULL,
@@ -105,6 +112,7 @@ type Job struct {
 	Task            string     `json:"task"`
 	Status          string     `json:"status"`
 	Question        string     `json:"question,omitempty"`
+	PendingInput    string     `json:"-"`
 	ResultDigest    string     `json:"result_digest,omitempty"`
 	Error           string     `json:"error,omitempty"`
 	HermesSessionID string     `json:"hermes_session_id,omitempty"`
@@ -203,13 +211,24 @@ func nullableJSON(r json.RawMessage) any {
 // --- jobs ---
 
 func (s *Store) CreateJob(ctx context.Context, name, task string) (Job, error) {
-	j := Job{ID: NewULID(), DisplayName: name, Task: task, Status: StatusQueued,
-		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback(ctx)
+	j, err := s.CreateJobTx(ctx, tx, name, task)
+	if err != nil {
+		return Job{}, err
+	}
+	return j, tx.Commit(ctx)
+}
+
+// CreateJobTx inserts a queued job in the caller's transaction. Dispatch uses
+// this with River's InsertTx so the durable record and delivery commit together.
+func (s *Store) CreateJobTx(ctx context.Context, tx pgx.Tx, name, task string) (Job, error) {
+	now := time.Now().UTC()
+	j := Job{ID: NewULID(), DisplayName: name, Task: task, Status: StatusQueued,
+		CreatedAt: now, UpdatedAt: now}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(72623859790382856)`); err != nil {
 		return Job{}, err
 	}
@@ -225,9 +244,9 @@ func (s *Store) CreateJob(ctx context.Context, name, task string) (Job, error) {
 		`INSERT INTO jobs (id, display_name, task, status, created_at, updated_at)
 		 VALUES ($1,$2,$3,$4,$5,$6)`,
 		j.ID, j.DisplayName, j.Task, j.Status, j.CreatedAt, j.UpdatedAt); err != nil {
-		return Job{}, err
+		return Job{}, normalizeDispatchError(err)
 	}
-	return j, tx.Commit(ctx)
+	return j, nil
 }
 
 func (s *Store) UpdateJob(ctx context.Context, id string, mut func(*Job)) (Job, error) {
@@ -236,6 +255,15 @@ func (s *Store) UpdateJob(ctx context.Context, id string, mut func(*Job)) (Job, 
 		return Job{}, err
 	}
 	defer tx.Rollback(ctx)
+	j, err := s.UpdateJobTx(ctx, tx, id, mut)
+	if err != nil {
+		return Job{}, err
+	}
+	return j, tx.Commit(ctx)
+}
+
+// UpdateJobTx locks and updates a job inside the caller's transaction.
+func (s *Store) UpdateJobTx(ctx context.Context, tx pgx.Tx, id string, mut func(*Job)) (Job, error) {
 	j, err := scanJob(tx.QueryRow(ctx, selectJob+` WHERE id=$1 FOR UPDATE`, id))
 	if err != nil {
 		return Job{}, err
@@ -260,13 +288,21 @@ func (s *Store) UpdateJob(ctx context.Context, id string, mut func(*Job)) (Job, 
 	}
 	_, err = tx.Exec(ctx, `UPDATE jobs SET display_name=$2, status=$3, question=$4,
 		result_digest=$5, error=$6, hermes_session_id=$7, updated_at=$8, finished_at=$9,
-		hermes_run_id=$10, approvals=$11, progress=$12 WHERE id=$1`,
+		hermes_run_id=$10, approvals=$11, progress=$12, pending_input=$13 WHERE id=$1`,
 		j.ID, j.DisplayName, j.Status, j.Question, j.ResultDigest, j.Error,
-		j.HermesSessionID, j.UpdatedAt, j.FinishedAt, j.HermesRunID, approvals, progress)
+		j.HermesSessionID, j.UpdatedAt, j.FinishedAt, j.HermesRunID, approvals, progress, j.PendingInput)
 	if err != nil {
-		return Job{}, err
+		return Job{}, normalizeDispatchError(err)
 	}
-	return j, tx.Commit(ctx)
+	return j, nil
+}
+
+func normalizeDispatchError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrDispatchPaused.Error() {
+		return ErrDispatchPaused
+	}
+	return err
 }
 
 // ClaimApproval atomically validates and consumes the one-use decision nonce.
@@ -323,7 +359,7 @@ func (s *Store) ParkApproval(ctx context.Context, jobID, approvalID, nonce, reas
 }
 
 const selectJob = `SELECT id, display_name, task, status, question, result_digest,
-	error, hermes_session_id, hermes_run_id, approvals, progress,
+	error, hermes_session_id, hermes_run_id, approvals, progress, pending_input,
 	created_at, updated_at, finished_at FROM jobs`
 
 func scanJob(row pgx.Row) (Job, error) {
@@ -331,7 +367,7 @@ func scanJob(row pgx.Row) (Job, error) {
 	var approvals, progress []byte
 	err := row.Scan(&j.ID, &j.DisplayName, &j.Task, &j.Status, &j.Question,
 		&j.ResultDigest, &j.Error, &j.HermesSessionID, &j.HermesRunID,
-		&approvals, &progress, &j.CreatedAt, &j.UpdatedAt, &j.FinishedAt)
+		&approvals, &progress, &j.PendingInput, &j.CreatedAt, &j.UpdatedAt, &j.FinishedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return j, ErrNotFound
 	}

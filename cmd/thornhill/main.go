@@ -66,6 +66,13 @@ func main() {
 	defer st.Pool.Close()
 
 	bus := events.NewBus(st, log.With("comp", "bus"))
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := bus.Close(closeCtx); err != nil {
+			log.Warn("event bus close", "err", err)
+		}
+	}()
 
 	var runner dispatch.Runner
 	if cfg.HermesBaseURL == "" {
@@ -116,6 +123,13 @@ func main() {
 		Cfg: cfg, Bus: bus, Store: st, Dispatcher: disp,
 		Hooks: hooks, Log: log.With("comp", "gateway"),
 	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := gw.Shutdown(shutdownCtx); err != nil {
+			log.Warn("gateway shutdown", "err", err)
+		}
+	}()
 	// Do not set WriteTimeout: the service deliberately holds SSE and WebSocket
 	// responses open. Header and request-body deadlines still bound slowloris
 	// connections and oversized SDP submissions.

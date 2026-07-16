@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/riverqueue/river"
 
 	"thornhill/internal/events"
@@ -25,18 +26,19 @@ type Runner interface {
 	// Run drives the job to a terminal state or needs_input, updating the
 	// store and publishing events as it goes.
 	Run(ctx context.Context, jobID string) error
-	// Answer forwards operator input to a job in needs_input.
-	Answer(ctx context.Context, jobID, text string) error
 	// DecideApproval resolves the oldest pending authority request using one
 	// of Thornhill's typed allow/deny/safer-alternative decisions.
 	DecideApproval(ctx context.Context, jobID, approvalID, nonce, decision string) (store.Job, error)
+	// ReleaseRun confirms that one captured upstream run stopped. It must never
+	// retarget a newer execution for the same Thornhill job.
+	ReleaseRun(ctx context.Context, jobID, runID string) error
 	// Cancel best-effort aborts a running job's agent work.
 	Cancel(ctx context.Context, jobID string)
 }
 
 // Queue abstracts River so the dispatcher is testable without Postgres.
 type Queue interface {
-	EnqueueRun(ctx context.Context, jobID string) error
+	EnqueueRunTx(ctx context.Context, tx pgx.Tx, jobID string) error
 }
 
 type Dispatcher struct {
@@ -52,16 +54,20 @@ func New(st *store.Store, bus *events.Bus, q Queue, r Runner, log *slog.Logger) 
 }
 
 func (d *Dispatcher) Dispatch(ctx context.Context, name, task string) (store.Job, error) {
-	j, err := d.store.CreateJob(ctx, name, task)
+	tx, err := d.store.Pool.Begin(ctx)
 	if err != nil {
 		return store.Job{}, err
 	}
-	if err := d.queue.EnqueueRun(ctx, j.ID); err != nil {
-		_, _ = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) {
-			x.Status = store.StatusFailed
-			x.Error = "enqueue failed: " + err.Error()
-		})
+	defer tx.Rollback(ctx)
+	j, err := d.store.CreateJobTx(ctx, tx, name, task)
+	if err != nil {
+		return store.Job{}, err
+	}
+	if err := d.queue.EnqueueRunTx(ctx, tx, j.ID); err != nil {
 		return store.Job{}, fmt.Errorf("enqueue: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Job{}, fmt.Errorf("commit dispatch: %w", err)
 	}
 	d.bus.Publish(events.KindJobQueued, j.ID, j)
 	d.log.Info("job dispatched", "id", j.ID, "name", name)
@@ -81,15 +87,23 @@ func (d *Dispatcher) Cancel(ctx context.Context, ref string) (store.Job, error) 
 	if err != nil {
 		return store.Job{}, err
 	}
-	if j.Status == store.StatusDone || j.Status == store.StatusFailed || j.Status == store.StatusCancelled {
-		return j, fmt.Errorf("job %q already %s", j.DisplayName, j.Status)
-	}
-	d.runner.Cancel(ctx, j.ID)
-	j, err = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) { x.Status = store.StatusCancelled })
+	cancelled := false
+	j, err = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) {
+		if x.Status != store.StatusDone && x.Status != store.StatusFailed && x.Status != store.StatusCancelled {
+			x.Status = store.StatusCancelled
+			cancelled = true
+		}
+	})
 	if err != nil {
 		return store.Job{}, err
 	}
+	if !cancelled {
+		return j, fmt.Errorf("job %q already %s", j.DisplayName, j.Status)
+	}
 	d.bus.Publish(events.KindJobCancelled, j.ID, j)
+	// Persisted cancellation is authoritative. The runner signal is best effort;
+	// stale workers are separately fenced from writing any later state.
+	d.runner.Cancel(ctx, j.ID)
 	return j, nil
 }
 
@@ -101,17 +115,33 @@ func (d *Dispatcher) Answer(ctx context.Context, ref, text string) (store.Job, e
 	if j.Status != store.StatusNeedsInput {
 		return j, fmt.Errorf("job %q is %s, not waiting for input", j.DisplayName, j.Status)
 	}
-	if err := d.runner.Answer(ctx, j.ID, text); err != nil {
-		return store.Job{}, err
+	tx, err := d.store.Pool.Begin(ctx)
+	if err != nil {
+		return j, err
 	}
-	j, err = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) {
-		x.Status = store.StatusRunning
-		x.Question = ""
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+	claimed := false
+	j, err = d.store.UpdateJobTx(ctx, tx, j.ID, func(x *store.Job) {
+		if x.Status == store.StatusNeedsInput {
+			x.Status = store.StatusQueued
+			x.Question = ""
+			x.PendingInput = text
+			claimed = true
+		}
 	})
 	if err != nil {
 		return store.Job{}, err
 	}
-	d.bus.Publish(events.KindJobRunning, j.ID, j)
+	if !claimed {
+		return j, fmt.Errorf("job %s is %s, not waiting for input", j.DisplayName, j.Status)
+	}
+	if err := d.queue.EnqueueRunTx(ctx, tx, j.ID); err != nil {
+		return j, fmt.Errorf("enqueue answered job: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return j, err
+	}
+	d.bus.Publish(events.KindJobQueued, j.ID, j)
 	return j, nil
 }
 
@@ -135,12 +165,23 @@ func (d *Dispatcher) Resume(ctx context.Context, ref string) (store.Job, error) 
 		return j, fmt.Errorf("job %q is %s; only failed or parked-approval jobs can be resumed", j.DisplayName, j.Status)
 	}
 	wasParked := j.Status == store.StatusParkedApproval
-	// Stop any persisted upstream run before clearing its identity. Hermes.Cancel
-	// falls back to the durable run ID after a Thornhill restart.
-	d.runner.Cancel(ctx, j.ID)
+	expectedStatus := j.Status
+	expectedRunID := j.HermesRunID
+	if expectedRunID != "" {
+		if err := d.runner.ReleaseRun(ctx, j.ID, expectedRunID); err != nil {
+			return j, fmt.Errorf("release prior Hermes run %s: %w", expectedRunID, err)
+		}
+	}
+	tx, err := d.store.Pool.Begin(ctx)
+	if err != nil {
+		return store.Job{}, err
+	}
+	defer tx.Rollback(ctx)
 	claimed := false
-	j, err = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) {
-		claimed = prepareForResume(x)
+	j, err = d.store.UpdateJobTx(ctx, tx, j.ID, func(x *store.Job) {
+		if x.Status == expectedStatus && x.HermesRunID == expectedRunID {
+			claimed = prepareForResume(x)
+		}
 	})
 	if err != nil {
 		return store.Job{}, err
@@ -148,16 +189,11 @@ func (d *Dispatcher) Resume(ctx context.Context, ref string) (store.Job, error) 
 	if !claimed {
 		return j, fmt.Errorf("job %q is %s; another resume or state transition won the race", j.DisplayName, j.Status)
 	}
-	if err := d.queue.EnqueueRun(ctx, j.ID); err != nil {
-		failed, _ := d.store.UpdateJob(ctx, j.ID, func(x *store.Job) {
-			if wasParked {
-				x.Status = store.StatusParkedApproval
-			} else {
-				x.Status = store.StatusFailed
-			}
-			x.Error = "resume enqueue failed after: " + x.Error + "; " + err.Error()
-		})
-		return failed, fmt.Errorf("resume enqueue: %w", err)
+	if err := d.queue.EnqueueRunTx(ctx, tx, j.ID); err != nil {
+		return j, fmt.Errorf("resume enqueue: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return j, fmt.Errorf("commit resume: %w", err)
 	}
 	d.bus.Publish(events.KindJobQueued, j.ID, j)
 	d.log.Info("job queued for safe resume", "id", j.ID, "name", j.DisplayName, "from_parked_approval", wasParked)

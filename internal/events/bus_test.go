@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 )
@@ -14,6 +15,27 @@ func testLog() *slog.Logger {
 type testWriter struct{}
 
 func (testWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type blockingPersister struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	events  []Event
+}
+
+func (p *blockingPersister) AppendEvent(ctx context.Context, e Event) error {
+	p.once.Do(func() { close(p.entered) })
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	p.mu.Lock()
+	p.events = append(p.events, e)
+	p.mu.Unlock()
+	return nil
+}
 
 func TestPublishFanoutAndReplay(t *testing.T) {
 	b := NewBus(nil, testLog())
@@ -79,6 +101,78 @@ func TestLaggingSubscriberDoesNotBlockPublish(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("publish blocked on a lagging subscriber")
+	}
+}
+
+func TestPublishDoesNotWaitForPersistenceAndCloseDrainsInOrder(t *testing.T) {
+	p := &blockingPersister{entered: make(chan struct{}), release: make(chan struct{})}
+	b := NewBus(p, testLog())
+	published := make(chan struct{})
+	go func() {
+		b.Publish(KindJobQueued, "j1", nil)
+		b.Publish(KindJobRunning, "j1", nil)
+		close(published)
+	}()
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("Publish waited for blocked persistence")
+	}
+	select {
+	case <-p.entered:
+	case <-time.After(time.Second):
+		t.Fatal("persistence worker did not start")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- b.Close(context.Background()) }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before queued persistence drained: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(p.release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.events) != 2 || p.events[0].Kind != KindJobQueued || p.events[1].Kind != KindJobRunning {
+		t.Fatalf("persisted events out of order: %+v", p.events)
+	}
+}
+
+func TestSynchronousPublishWaitsBehindEarlierQueuedEvents(t *testing.T) {
+	p := &blockingPersister{entered: make(chan struct{}), release: make(chan struct{})}
+	b := NewBus(p, testLog())
+	b.Publish(KindJobQueued, "j1", nil)
+	select {
+	case <-p.entered:
+	case <-time.After(time.Second):
+		t.Fatal("persistence worker did not start")
+	}
+	syncDone := make(chan struct{})
+	go func() {
+		b.PublishSync(KindSessionState, "", map[string]string{"state": "LIVE"})
+		close(syncDone)
+	}()
+	select {
+	case <-syncDone:
+		t.Fatal("synchronous publish returned before earlier persistence completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(p.release)
+	select {
+	case <-syncDone:
+	case <-time.After(time.Second):
+		t.Fatal("synchronous publish did not receive persistence acknowledgement")
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.events) != 2 || p.events[0].Kind != KindJobQueued || p.events[1].Kind != KindSessionState {
+		t.Fatalf("mixed persistence order = %+v", p.events)
 	}
 }
 

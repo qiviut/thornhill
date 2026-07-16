@@ -22,8 +22,8 @@ type RiverQueue struct {
 	Client *river.Client[pgx.Tx]
 }
 
-func (q *RiverQueue) EnqueueRun(ctx context.Context, jobID string) error {
-	_, err := q.Client.Insert(ctx, RunArgs{JobID: jobID}, nil)
+func (q *RiverQueue) EnqueueRunTx(ctx context.Context, tx pgx.Tx, jobID string) error {
+	_, err := q.Client.InsertTx(ctx, tx, RunArgs{JobID: jobID}, nil)
 	return err
 }
 
@@ -74,60 +74,62 @@ type StubRunner struct {
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
-	answers map[string]chan string
 }
 
 func NewStubRunner(st *store.Store, bus *events.Bus, dur time.Duration, log *slog.Logger) *StubRunner {
 	return &StubRunner{Store: st, Bus: bus, Duration: dur, Log: log,
-		cancels: map[string]context.CancelFunc{}, answers: map[string]chan string{}}
+		cancels: map[string]context.CancelFunc{}}
 }
 
 func (s *StubRunner) Run(ctx context.Context, jobID string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
 	s.cancels[jobID] = cancel
-	ans := make(chan string, 1)
-	s.answers[jobID] = ans
 	s.mu.Unlock()
 	defer func() {
 		cancel()
 		s.mu.Lock()
 		delete(s.cancels, jobID)
-		delete(s.answers, jobID)
 		s.mu.Unlock()
 	}()
 
-	j, err := s.Store.UpdateJob(ctx, jobID, func(x *store.Job) { x.Status = store.StatusRunning })
+	claimed := false
+	continuing := false
+	j, err := s.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+		if x.Status == store.StatusQueued {
+			continuing = x.PendingInput != ""
+			x.Status = store.StatusRunning
+			x.PendingInput = ""
+			claimed = true
+		}
+	})
 	if err != nil {
 		return err
+	}
+	if !claimed {
+		return nil
 	}
 	s.Bus.Publish(events.KindJobRunning, jobID, j)
 	s.Log.Info("stub job running", "id", jobID, "for", s.Duration)
 
 	half := s.Duration / 2
-	select {
-	case <-ctx.Done():
-		return nil // cancelled via Cancel(); status already set by dispatcher
-	case <-time.After(half):
-	}
+	if !continuing {
+		select {
+		case <-ctx.Done():
+			return nil // cancelled via Cancel(); status already set by dispatcher
+		case <-time.After(half):
+		}
 
-	// One synthetic clarifying question exercises the needs_input bridge.
-	j, err = s.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
-		x.Status = store.StatusNeedsInput
-		x.Question = "Stub checkpoint: proceed with the default approach?"
-	})
-	if err != nil {
-		return err
-	}
-	s.Bus.Publish(events.KindJobNeedsInput, jobID, j)
-
-	select {
-	case <-ctx.Done():
+		// One synthetic clarifying question exercises durable needs_input parking.
+		j, err = s.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+			x.Status = store.StatusNeedsInput
+			x.Question = "Stub checkpoint: proceed with the default approach?"
+		})
+		if err != nil {
+			return err
+		}
+		s.Bus.Publish(events.KindJobNeedsInput, jobID, j)
 		return nil
-	case a := <-ans:
-		s.Log.Info("stub job got answer", "id", jobID, "answer", a)
-	case <-time.After(30 * time.Minute):
-		// Operator never answered; finish anyway so the stub can't wedge.
 	}
 
 	select {
@@ -147,19 +149,7 @@ func (s *StubRunner) Run(ctx context.Context, jobID string) error {
 	return nil
 }
 
-func (s *StubRunner) Answer(_ context.Context, jobID, text string) error {
-	s.mu.Lock()
-	ch, ok := s.answers[jobID]
-	s.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("job not waiting in this process (restart lost the in-memory conversation)")
-	}
-	select {
-	case ch <- text:
-	default:
-	}
-	return nil
-}
+func (s *StubRunner) ReleaseRun(context.Context, string, string) error { return nil }
 
 func (s *StubRunner) DecideApproval(ctx context.Context, jobID, _, _, _ string) (store.Job, error) {
 	j, err := s.Store.ResolveJob(ctx, jobID)

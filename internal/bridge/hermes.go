@@ -25,11 +25,15 @@ import (
 )
 
 const (
-	defaultApprovalControlTimeout = 15 * time.Second
+	defaultApprovalControlTimeout = 30 * time.Second
 	defaultApprovalParkAfter      = 15 * time.Minute
+	defaultStreamIdleAfter        = 20 * time.Minute
 )
 
-var errApprovalParked = errors.New("approval parked unresolved")
+var (
+	errApprovalParked = errors.New("approval parked unresolved")
+	errRunSuperseded  = errors.New("Hermes run no longer owns the durable job state")
+)
 
 type noRetryError struct{ err error }
 
@@ -37,6 +41,24 @@ func (e *noRetryError) Error() string { return e.err.Error() }
 func (e *noRetryError) Unwrap() error { return e.err }
 func (e *noRetryError) NoRetry()      {}
 func noRetry(err error) error         { return &noRetryError{err: err} }
+
+type approvalLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func runOwnsState(j *store.Job, runID string) bool {
+	if j.HermesRunID != runID {
+		return false
+	}
+	return j.Status == store.StatusRunning || j.Status == store.StatusNeedsApproval
+}
+
+func (h *Hermes) ownedRunID(jobID string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.runIDs[jobID]
+}
 
 const (
 	DecisionAllowOnce        = "allow_once"
@@ -70,13 +92,13 @@ type Hermes struct {
 	HTTP                   *http.Client
 	ApprovalControlTimeout time.Duration
 	ApprovalParkAfter      time.Duration
+	StreamIdleAfter        time.Duration
 
 	mu             sync.Mutex
-	approvalMu     sync.Mutex // serializes the non-idempotent FIFO authority call
 	convos         map[string][]chatMsg
 	cancels        map[string]context.CancelFunc
-	answers        map[string]chan string
 	runIDs         map[string]string
+	approvalLocks  map[string]*approvalLock
 	sessionAllows  map[string]map[string]struct{}
 	sessionDenials map[string]map[string]struct{}
 }
@@ -88,12 +110,43 @@ func NewHermes(baseURL, apiKey, model string, st JobStore, bus *events.Bus, log 
 		HTTP:                   &http.Client{Timeout: 0}, // event stream; request context governs
 		ApprovalControlTimeout: defaultApprovalControlTimeout,
 		ApprovalParkAfter:      defaultApprovalParkAfter,
+		StreamIdleAfter:        defaultStreamIdleAfter,
 		convos:                 map[string][]chatMsg{},
 		cancels:                map[string]context.CancelFunc{},
-		answers:                map[string]chan string{},
 		runIDs:                 map[string]string{},
+		approvalLocks:          map[string]*approvalLock{},
 		sessionAllows:          map[string]map[string]struct{}{},
 		sessionDenials:         map[string]map[string]struct{}{},
+	}
+}
+
+func approvalLockKey(jobID, runID string) string {
+	if runID != "" {
+		return "run:" + runID
+	}
+	return "job:" + jobID
+}
+
+func (h *Hermes) lockApproval(jobID, runID string) func() {
+	key := approvalLockKey(jobID, runID)
+	h.mu.Lock()
+	lock := h.approvalLocks[key]
+	if lock == nil {
+		lock = &approvalLock{}
+		h.approvalLocks[key] = lock
+	}
+	lock.refs++
+	h.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		h.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(h.approvalLocks, key)
+		}
+		h.mu.Unlock()
 	}
 }
 
@@ -136,6 +189,21 @@ func (h *Hermes) ReconcileOrphans(ctx context.Context) error {
 		return err
 	}
 	for _, j := range jobs {
+		if j.Status == store.StatusNeedsInput {
+			if j.HermesRunID != "" {
+				if err := h.ReleaseRun(context.WithoutCancel(ctx), j.ID, j.HermesRunID); err != nil {
+					return fmt.Errorf("release stale input run %s: %w", j.HermesRunID, err)
+				}
+				if _, err := h.Store.UpdateJob(context.WithoutCancel(ctx), j.ID, func(x *store.Job) {
+					if x.Status == store.StatusNeedsInput && x.HermesRunID == j.HermesRunID {
+						x.HermesRunID = ""
+					}
+				}); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if j.Status == store.StatusParkedApproval {
 			if j.HermesRunID != "" {
 				if _, releaseErr := h.releaseParkedRun(j.ID, j.HermesRunID); releaseErr != nil {
@@ -151,10 +219,10 @@ func (h *Hermes) ReconcileOrphans(ctx context.Context) error {
 		if j.Status == store.StatusNeedsApproval && len(j.Approvals) == 1 &&
 			j.Approvals[0].State == store.ApprovalStatePending {
 			a := j.Approvals[0]
-			h.approvalMu.Lock()
+			unlockApproval := h.lockApproval(j.ID, j.HermesRunID)
 			_, parkErr := h.parkApprovalLocked(context.WithoutCancel(ctx), j.ID, j.HermesRunID,
 				a.ID, a.DecisionNonce, "process restarted while approval was pending")
-			h.approvalMu.Unlock()
+			unlockApproval()
 			if parkErr != nil {
 				return parkErr
 			}
@@ -191,144 +259,188 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 	if before.Status == store.StatusFailed && strings.Contains(before.Error, "orphaned by process restart") {
 		return noRetry(errors.New(before.Error))
 	}
+	if before.Status != store.StatusQueued {
+		return nil
+	}
+	workerCtx := ctx
 	resuming := before.HermesSessionID != ""
 	initial := before.Task
-	var recovered []chatMsg
-	if resuming {
-		recovered, err = h.loadSessionHistory(ctx, jobID)
-		if err != nil {
-			h.Log.Warn("Hermes session history unavailable; resuming from durable job checkpoint", "job", jobID, "err", err)
-		}
-		initial = resumePrompt(before, len(recovered))
+	hasPendingInput := strings.TrimSpace(before.PendingInput) != ""
+	if hasPendingInput {
+		initial = before.PendingInput
 	}
-	j, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
-		x.Status = store.StatusRunning
-		x.HermesSessionID = jobID
-		x.HermesRunID = ""
-		x.Question = ""
-		x.Approvals = nil // parked requests are evidence only; authority must be reissued with a fresh nonce
-		if !resuming {
-			x.Error = ""
+	claimed := false
+	j, err := h.Store.UpdateJob(workerCtx, jobID, func(x *store.Job) {
+		if x.Status == store.StatusQueued {
+			x.Status = store.StatusRunning
+			x.HermesSessionID = jobID
+			x.HermesRunID = ""
+			x.Question = ""
+			x.Approvals = nil // parked requests are evidence only; authority must be reissued with a fresh nonce
+			if !resuming {
+				x.Error = ""
+			}
+			claimed = true
 		}
 	})
 	if err != nil {
 		return err
 	}
-	h.Bus.Publish(events.KindJobRunning, jobID, j)
+	if !claimed {
+		return nil
+	}
 
-	workerCtx := ctx
 	ctx, cancel := context.WithCancel(workerCtx)
 	h.mu.Lock()
 	h.cancels[jobID] = cancel
-	ans := make(chan string, 1)
-	h.answers[jobID] = ans
-	h.convos[jobID] = append(recovered, chatMsg{Role: "user", Content: initial})
-	h.sessionAllows[jobID] = map[string]struct{}{}
-	h.sessionDenials[jobID] = map[string]struct{}{}
 	h.mu.Unlock()
 	defer func() {
 		cancel()
 		h.mu.Lock()
 		delete(h.cancels, jobID)
-		delete(h.answers, jobID)
 		delete(h.runIDs, jobID)
 		delete(h.sessionAllows, jobID)
 		delete(h.sessionDenials, jobID)
 		h.mu.Unlock()
 	}()
+	current, err := h.Store.ResolveJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if current.Status != store.StatusRunning || current.HermesRunID != "" {
+		return nil // cancellation or another transition won after the durable claim
+	}
+	h.Bus.Publish(events.KindJobRunning, jobID, current)
 
-	for turn := 0; ; turn++ {
-		h.mu.Lock()
-		msgs := append([]chatMsg(nil), h.convos[jobID]...)
-		h.mu.Unlock()
-		input := msgs[len(msgs)-1].Content
-		history := msgs[:len(msgs)-1]
-
-		reply, err := h.runTurn(ctx, j, input, history)
+	var recovered []chatMsg
+	if resuming {
+		recovered, err = h.loadSessionHistory(ctx, jobID)
 		if err != nil {
-			if errors.Is(err, errApprovalParked) {
-				return nil // durable parked state owns the unresolved outcome
-			}
 			if ctx.Err() != nil {
-				recoveryCtx, done := context.WithTimeout(context.WithoutCancel(workerCtx), 15*time.Second)
-				defer done()
-				current, _ := h.Store.ResolveJob(recoveryCtx, jobID)
-				if current.Status == store.StatusCancelled || current.Status == store.StatusParkedApproval {
-					return nil // dispatcher or the parking transition owns the state
+				return nil
+			}
+			h.Log.Warn("Hermes session history unavailable; resuming from durable job checkpoint", "job", jobID, "err", err)
+		}
+		if !hasPendingInput {
+			initial = resumePrompt(before, len(recovered))
+		}
+	}
+
+	h.mu.Lock()
+	h.convos[jobID] = append(recovered, chatMsg{Role: "user", Content: initial})
+	h.sessionAllows[jobID] = map[string]struct{}{}
+	h.sessionDenials[jobID] = map[string]struct{}{}
+	h.mu.Unlock()
+
+	h.mu.Lock()
+	msgs := append([]chatMsg(nil), h.convos[jobID]...)
+	h.mu.Unlock()
+	input := msgs[len(msgs)-1].Content
+	history := msgs[:len(msgs)-1]
+
+	reply, err := h.runTurn(ctx, j, input, history)
+	runID := h.ownedRunID(jobID)
+	if err != nil {
+		if errors.Is(err, errApprovalParked) {
+			return nil // durable parked state owns the unresolved outcome
+		}
+		if ctx.Err() != nil {
+			recoveryCtx, done := context.WithTimeout(context.WithoutCancel(workerCtx), 15*time.Second)
+			defer done()
+			current, _ := h.Store.ResolveJob(recoveryCtx, jobID)
+			if current.Status == store.StatusCancelled || current.Status == store.StatusParkedApproval {
+				return nil // dispatcher or the parking transition owns the state
+			}
+			if current.Status == store.StatusNeedsApproval && len(current.Approvals) == 1 &&
+				current.Approvals[0].State == store.ApprovalStatePending {
+				a := current.Approvals[0]
+				if _, parkErr := h.parkApproval(recoveryCtx, jobID, current.HermesRunID,
+					a.ID, a.DecisionNonce, "worker context ended while approval was pending"); parkErr == nil {
+					return nil
+				} else {
+					h.Log.Error("could not persist approval parking during shutdown; leaving request pending for startup reconciliation",
+						"job", jobID, "err", parkErr)
+					return noRetry(fmt.Errorf("approval remained pending for startup reconciliation: %w", parkErr))
 				}
-				if current.Status == store.StatusNeedsApproval && len(current.Approvals) == 1 &&
-					current.Approvals[0].State == store.ApprovalStatePending {
-					a := current.Approvals[0]
-					if _, parkErr := h.parkApproval(recoveryCtx, jobID, current.HermesRunID,
-						a.ID, a.DecisionNonce, "worker context ended while approval was pending"); parkErr == nil {
-						return nil
-					} else {
-						h.Log.Error("could not persist approval parking during shutdown; leaving request pending for startup reconciliation",
-							"job", jobID, "err", parkErr)
-						return noRetry(fmt.Errorf("approval remained pending for startup reconciliation: %w", parkErr))
-					}
-				}
-				failed, _ := h.Store.UpdateJob(recoveryCtx, jobID, func(x *store.Job) {
+			}
+			failedTransition := false
+			failed, _ := h.Store.UpdateJob(recoveryCtx, jobID, func(x *store.Job) {
+				if runOwnsState(x, runID) {
 					x.Status = store.StatusFailed
 					appendFailureEvidence(x, "job execution context ended; active Hermes run was stopped: "+ctx.Err().Error())
 					x.Approvals = nil
-				})
-				h.Bus.Publish(events.KindJobFailed, jobID, failed)
-				return noRetry(errors.New(failed.Error))
-			}
-			_, _ = h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
-				if x.Status != store.StatusFailed {
-					x.Status = store.StatusFailed
-					appendFailureEvidence(x, err.Error())
-					x.Approvals = nil
+					failedTransition = true
 				}
 			})
-			jj, _ := h.Store.ResolveJob(context.WithoutCancel(ctx), jobID)
-			h.Bus.Publish(events.KindJobFailed, jobID, jj)
-			return fmt.Errorf("hermes run: %w", err)
+			if !failedTransition {
+				return nil
+			}
+			h.Bus.Publish(events.KindJobFailed, jobID, failed)
+			return noRetry(errors.New(failed.Error))
 		}
+		failedTransition := false
+		failed, _ := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
+			if runOwnsState(x, runID) {
+				x.Status = store.StatusFailed
+				appendFailureEvidence(x, err.Error())
+				x.Approvals = nil
+				failedTransition = true
+			}
+		})
+		if !failedTransition {
+			return nil
+		}
+		h.Bus.Publish(events.KindJobFailed, jobID, failed)
+		return fmt.Errorf("hermes run: %w", err)
+	}
 
-		h.mu.Lock()
-		h.convos[jobID] = append(h.convos[jobID], chatMsg{Role: "assistant", Content: reply})
-		h.mu.Unlock()
+	h.mu.Lock()
+	h.convos[jobID] = append(h.convos[jobID], chatMsg{Role: "assistant", Content: reply})
+	h.mu.Unlock()
 
-		if q, isQ := trailingQuestion(reply); isQ && turn < 16 {
-			jj, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+	if q, isQ := trailingQuestion(reply); isQ {
+		transitioned := false
+		jj, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+			if runOwnsState(x, runID) {
 				x.Status = store.StatusNeedsInput
 				x.Question = q
+				x.HermesRunID = ""
 				x.Progress = nil
-			})
-			if err != nil {
-				return err
+				transitioned = true
 			}
-			h.Bus.Publish(events.KindJobNeedsInput, jobID, jj)
-			select {
-			case <-ctx.Done():
-				return nil
-			case a := <-ans:
-				h.mu.Lock()
-				h.convos[jobID] = append(h.convos[jobID], chatMsg{Role: "user", Content: a})
-				h.mu.Unlock()
-				continue
-			}
-		}
-
-		digest := reply
-		if len(digest) > 700 {
-			digest = digest[:700] + "…"
-		}
-		jj, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
-			x.Status = store.StatusDone
-			x.ResultDigest = digest
-			x.Approvals = nil
-			x.Progress = nil
 		})
 		if err != nil {
 			return err
 		}
-		h.Bus.Publish(events.KindJobDone, jobID, jj)
+		if !transitioned {
+			return nil
+		}
+		h.Bus.Publish(events.KindJobNeedsInput, jobID, jj)
+		return nil // operator input resumes through a new durable River delivery
+	}
+
+	digest := reply
+	if len(digest) > 700 {
+		digest = digest[:700] + "…"
+	}
+	transitioned := false
+	jj, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+		if runOwnsState(x, runID) {
+			x.Status = store.StatusDone
+			x.ResultDigest = digest
+			x.Approvals = nil
+			x.Progress = nil
+			transitioned = true
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if !transitioned {
 		return nil
 	}
+	h.Bus.Publish(events.KindJobDone, jobID, jj)
+	return nil
 }
 
 func systemHeader(j store.Job) string {
@@ -460,13 +572,22 @@ func (h *Hermes) runTurn(ctx context.Context, job store.Job, input string, histo
 	h.mu.Lock()
 	h.runIDs[job.ID] = started.RunID
 	h.mu.Unlock()
+	persisted := false
 	updated, err := h.Store.UpdateJob(ctx, job.ID, func(x *store.Job) {
-		x.HermesRunID = started.RunID
-		x.Status = store.StatusRunning
+		if runOwnsState(x, "") {
+			x.HermesRunID = started.RunID
+			x.Status = store.StatusRunning
+			x.PendingInput = ""
+			persisted = true
+		}
 	})
 	if err != nil {
 		h.stopRun(started.RunID)
 		return "", noRetry(fmt.Errorf("persist Hermes run identity; run stopped: %w", err))
+	}
+	if !persisted {
+		h.stopRun(started.RunID)
+		return "", noRetry(errRunSuperseded)
 	}
 	h.Bus.Publish(events.KindJobRunning, job.ID, updated)
 	h.Log.Info("Hermes run started", "job", job.ID, "run", started.RunID)
@@ -492,6 +613,21 @@ func (h *Hermes) runTurn(ctx context.Context, job store.Job, input string, histo
 	streamCtx, stopStream := context.WithCancel(ctx)
 	defer stopStream()
 	eventCh, scanErrCh := h.scanRunEvents(streamCtx, resp.Body)
+	idleAfter := h.StreamIdleAfter
+	if idleAfter <= 0 {
+		idleAfter = defaultStreamIdleAfter
+	}
+	idleTimer := time.NewTimer(idleAfter)
+	defer idleTimer.Stop()
+	resetIdle := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleAfter)
+	}
 
 	var parkTimer *time.Timer
 	var parkC <-chan time.Time
@@ -520,6 +656,9 @@ func (h *Hermes) runTurn(ctx context.Context, job store.Job, input string, histo
 		case <-ctx.Done():
 			h.stopRun(started.RunID)
 			return "", noRetry(fmt.Errorf("Hermes run context ended; run stopped: %w", ctx.Err()))
+		case <-idleTimer.C:
+			h.stopRun(started.RunID)
+			return "", noRetry(fmt.Errorf("Hermes event stream silent for %s; run stopped fail-closed", idleAfter))
 		case <-parkC:
 			parkCtx, cancelPark := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			current, resolveErr := h.Store.ResolveJob(parkCtx, job.ID)
@@ -565,6 +704,7 @@ func (h *Hermes) runTurn(ctx context.Context, job store.Job, input string, histo
 				}
 				return output.String(), nil
 			}
+			resetIdle()
 
 			switch ev.Event {
 			case "message.delta":
@@ -645,21 +785,30 @@ func eventError(v any) string {
 
 func (h *Hermes) updateProgress(ctx context.Context, jobID, tool, label, state string) {
 	p := &store.Progress{Tool: tool, Label: label, State: state, UpdatedAt: time.Now().UTC()}
-	j, err := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) { x.Progress = p })
+	runID := h.ownedRunID(jobID)
+	transitioned := false
+	j, err := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
+		if runOwnsState(x, runID) {
+			x.Progress = p
+			transitioned = true
+		}
+	})
 	if err != nil {
 		h.Log.Warn("progress persist failed", "job", jobID, "err", err)
 		return
 	}
-	h.Bus.Publish(events.KindJobProgress, jobID, j)
+	if transitioned {
+		h.Bus.Publish(events.KindJobProgress, jobID, j)
+	}
 }
 
 func (h *Hermes) parkApproval(ctx context.Context, jobID, runID, approvalID, nonce, reason string) (store.Job, error) {
-	h.approvalMu.Lock()
-	defer h.approvalMu.Unlock()
+	unlockApproval := h.lockApproval(jobID, runID)
+	defer unlockApproval()
 	return h.parkApprovalLocked(ctx, jobID, runID, approvalID, nonce, reason)
 }
 
-// parkApprovalLocked must run under approvalMu so parking and a non-idempotent
+// parkApprovalLocked must run under the run-scoped approval lock so parking and a non-idempotent
 // authority POST cannot both win. The database transition supplies the same
 // exclusion across store clients and process boundaries.
 func (h *Hermes) parkApprovalLocked(ctx context.Context, jobID, runID, approvalID, nonce, reason string) (store.Job, error) {
@@ -668,7 +817,7 @@ func (h *Hermes) parkApprovalLocked(ctx context.Context, jobID, runID, approvalI
 		return j, err
 	}
 	if runID != "" {
-		updated, stopErr := h.releaseParkedRun(jobID, runID)
+		updated, stopErr := h.releaseParkedRunLocked(jobID, runID)
 		if stopErr != nil {
 			h.Log.Warn("parked approval but upstream stop was not confirmed; bounded cleanup retry scheduled",
 				"job", jobID, "run", runID, "err", stopErr)
@@ -688,6 +837,12 @@ func (h *Hermes) parkApprovalLocked(ctx context.Context, jobID, runID, approvalI
 // an inspectable, restart-recoverable cleanup obligation rather than a false
 // claim that all upstream resources were released.
 func (h *Hermes) releaseParkedRun(jobID, runID string) (store.Job, error) {
+	unlockApproval := h.lockApproval(jobID, runID)
+	defer unlockApproval()
+	return h.releaseParkedRunLocked(jobID, runID)
+}
+
+func (h *Hermes) releaseParkedRunLocked(jobID, runID string) (store.Job, error) {
 	if runID == "" {
 		return store.Job{}, nil
 	}
@@ -730,8 +885,8 @@ func (h *Hermes) retryParkedRunStop(jobID, runID string) {
 }
 
 func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string, ev runEvent) error {
-	h.approvalMu.Lock()
-	defer h.approvalMu.Unlock()
+	unlockApproval := h.lockApproval(jobID, runID)
+	defer unlockApproval()
 
 	keys := ev.PatternKeys
 	if len(keys) == 0 && ev.PatternKey != "" {
@@ -750,12 +905,18 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 	if len(existing.Approvals) > 0 {
 		denyErr := h.postApproval(ctx, runID, "deny", true)
 		h.stopRun(runID)
+		transitioned := false
 		j, _ := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
-			x.Status = store.StatusFailed
-			x.Error = "multiple concurrent Hermes approvals could not be correlated safely; all were denied and the run was stopped"
-			x.Approvals = nil
+			if runOwnsState(x, runID) {
+				x.Status = store.StatusFailed
+				x.Error = "multiple concurrent Hermes approvals could not be correlated safely; all were denied and the run was stopped"
+				x.Approvals = nil
+				transitioned = true
+			}
 		})
-		h.Bus.Publish(events.KindJobFailed, jobID, j)
+		if transitioned {
+			h.Bus.Publish(events.KindJobFailed, jobID, j)
+		}
 		if denyErr != nil {
 			return noRetry(fmt.Errorf("approval collision; run stopped after deny-all failed: %w", denyErr))
 		}
@@ -816,13 +977,20 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		}
 	}
 
+	admitted := false
 	j, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
-		x.Approvals = append(x.Approvals, approval)
-		x.Status = store.StatusNeedsApproval
-		x.Progress = nil
+		if runOwnsState(x, runID) {
+			x.Approvals = append(x.Approvals, approval)
+			x.Status = store.StatusNeedsApproval
+			x.Progress = nil
+			admitted = true
+		}
 	})
 	if err != nil {
 		return err
+	}
+	if !admitted {
+		return noRetry(errRunSuperseded)
 	}
 	h.Bus.Publish(events.KindJobNeedsApproval, jobID, j)
 	h.Log.Info("job waiting for approval", "job", jobID, "approval", approval.ID, "patterns", keys)
@@ -866,9 +1034,6 @@ func (h *Hermes) matchesSessionDenial(jobID string, keys []string) string {
 // speech, while this broker validates identity, nonce, scope, and state before
 // making a single non-idempotent authority call.
 func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, decision string) (store.Job, error) {
-	h.approvalMu.Lock()
-	defer h.approvalMu.Unlock()
-
 	apiChoice := ""
 	switch decision {
 	case DecisionAllowOnce:
@@ -891,6 +1056,18 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	j, err := h.Store.ResolveJob(ctx, jobID)
 	if err != nil {
 		return store.Job{}, err
+	}
+	approvalRunKey := j.HermesRunID
+	unlockApproval := h.lockApproval(jobID, approvalRunKey)
+	defer unlockApproval()
+	// The run or approval may have changed while this caller waited for the
+	// run-scoped authority lock; only the post-lock snapshot may authorize I/O.
+	j, err = h.Store.ResolveJob(ctx, jobID)
+	if err != nil {
+		return store.Job{}, err
+	}
+	if j.HermesRunID != approvalRunKey {
+		return j, errors.New("approval run changed while waiting for authority lock")
 	}
 	if j.Status != store.StatusNeedsApproval || len(j.Approvals) != 1 {
 		return j, fmt.Errorf("job %q does not have exactly one pending approval", j.DisplayName)
@@ -949,16 +1126,25 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	// This broker has already correlated and claimed one FIFO approval. Even
 	// deny-session/always records future policy locally; it must not deny an
 	// unseen concurrent request. Collision handling is the only deny-all path.
-	if err := h.postApproval(ctx, j.HermesRunID, apiChoice, false); err != nil {
-		h.stopRun(j.HermesRunID)
+	approvalRunID := j.HermesRunID
+	if err := h.postApproval(ctx, approvalRunID, apiChoice, false); err != nil {
+		h.stopRun(approvalRunID)
+		transitioned := false
 		j, _ = h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
-			x.Status = store.StatusFailed
-			x.Error = "approval response was indeterminate; the run was stopped and the decision will not be retried: " + err.Error()
-			if len(x.Approvals) > 0 {
-				x.Approvals[0].State = store.ApprovalStateIndeterminate
+			if runOwnsState(x, approvalRunID) {
+				x.Status = store.StatusFailed
+				x.Error = "approval response was indeterminate; the run was stopped and the decision will not be retried: " + err.Error()
+				if len(x.Approvals) > 0 {
+					x.Approvals[0].State = store.ApprovalStateIndeterminate
+				}
+				transitioned = true
 			}
 		})
-		h.Bus.Publish(events.KindJobFailed, jobID, j)
+		if transitioned {
+			h.Bus.Publish(events.KindJobFailed, jobID, j)
+		} else {
+			return j, nil
+		}
 		return j, errors.New(j.Error)
 	}
 	if decision == DecisionAllowAlways {
@@ -975,20 +1161,27 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 		h.mu.Unlock()
 	}
 
+	resolved := false
 	j, err = h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
-		x.Approvals = nil
-		x.Status = store.StatusRunning
-		if decision == DecisionSaferAlternative {
-			x.Progress = &store.Progress{
-				Tool:      "approval",
-				Label:     "operator denied the proposed mechanism and requested a safer native or managed alternative",
-				State:     "safer_alternative",
-				UpdatedAt: time.Now().UTC(),
+		if runOwnsState(x, approvalRunID) {
+			x.Approvals = nil
+			x.Status = store.StatusRunning
+			if decision == DecisionSaferAlternative {
+				x.Progress = &store.Progress{
+					Tool:      "approval",
+					Label:     "operator denied the proposed mechanism and requested a safer native or managed alternative",
+					State:     "safer_alternative",
+					UpdatedAt: time.Now().UTC(),
+				}
 			}
+			resolved = true
 		}
 	})
 	if err != nil {
 		return j, err
+	}
+	if !resolved {
+		return j, nil
 	}
 	h.Bus.Publish(events.KindJobApprovalResolved, jobID, j)
 	h.Log.Info("approval resolved", "job", jobID, "approval", current.ID, "decision", decision)
@@ -1088,26 +1281,29 @@ func trailingQuestion(reply string) (string, bool) {
 	return "", false
 }
 
-func (h *Hermes) Answer(_ context.Context, jobID, text string) error {
-	h.mu.Lock()
-	ch, ok := h.answers[jobID]
-	h.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("job conversation not live in this process (restart orphaned it; re-dispatch)")
-	}
-	select {
-	case ch <- text:
+func (h *Hermes) ReleaseRun(ctx context.Context, jobID, runID string) error {
+	if runID == "" {
 		return nil
-	default:
-		return errors.New("job already has a pending answer")
 	}
+	unlockApproval := h.lockApproval(jobID, runID)
+	defer unlockApproval()
+	controlCtx, done := context.WithTimeout(ctx, 5*time.Second)
+	defer done()
+	if err := h.doJSON(controlCtx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	owned := h.runIDs[jobID] == runID
+	cancel := h.cancels[jobID]
+	h.mu.Unlock()
+	if owned && cancel != nil {
+		cancel()
+	}
+	return nil
 }
 
 func (h *Hermes) Cancel(ctx context.Context, jobID string) {
-	h.approvalMu.Lock()
-	defer h.approvalMu.Unlock()
 	h.mu.Lock()
-	cancel := h.cancels[jobID]
 	runID := h.runIDs[jobID]
 	h.mu.Unlock()
 	if runID == "" {
@@ -1115,12 +1311,19 @@ func (h *Hermes) Cancel(ctx context.Context, jobID string) {
 			runID = j.HermesRunID
 		}
 	}
+	unlockApproval := h.lockApproval(jobID, runID)
+	defer unlockApproval()
+
+	h.mu.Lock()
+	ownedRunID := h.runIDs[jobID]
+	cancel := h.cancels[jobID]
+	h.mu.Unlock()
 	if runID != "" {
-		ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = h.doJSON(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil)
+		stopCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = h.doJSON(stopCtx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil)
 		done()
 	}
-	if cancel != nil {
+	if cancel != nil && (runID == "" || ownedRunID == runID) {
 		cancel()
 	}
 }
