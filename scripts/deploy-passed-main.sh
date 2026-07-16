@@ -16,6 +16,9 @@ install -d -m 0700 "${STATE_DIR}"
 exec 9>"${STATE_DIR}/deploy.lock"
 if ! flock -n 9; then
   echo "A Thornhill deployment is already running"
+	if [[ "${CHECK_ONLY:-0}" == 1 ]]; then
+		exit 1
+	fi
   exit 0
 fi
 
@@ -104,9 +107,15 @@ CREATE TABLE IF NOT EXISTS deployment_control (
 );
 INSERT INTO deployment_control (singleton, dispatch_paused)
 VALUES (TRUE, FALSE) ON CONFLICT (singleton) DO NOTHING;
-CREATE OR REPLACE FUNCTION thornhill_guard_job_insert() RETURNS trigger
+CREATE OR REPLACE FUNCTION thornhill_guard_job_dispatch() RETURNS trigger
 LANGUAGE plpgsql AS $guard$
 BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.status IS NOT DISTINCT FROM OLD.status THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.status NOT IN ('queued', 'running') THEN
+    RETURN NEW;
+  END IF;
   PERFORM pg_advisory_xact_lock(72623859790382856);
   IF (SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE) THEN
     RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='job dispatch is temporarily paused for deployment';
@@ -114,14 +123,12 @@ BEGIN
   RETURN NEW;
 END
 $guard$;
-DO $trigger$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='thornhill_guard_job_insert_trigger') THEN
-    CREATE TRIGGER thornhill_guard_job_insert_trigger
-    BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION thornhill_guard_job_insert();
-  END IF;
-END
-$trigger$;
+DROP TRIGGER IF EXISTS thornhill_guard_job_insert_trigger ON jobs;
+DROP TRIGGER IF EXISTS thornhill_guard_job_dispatch_trigger ON jobs;
+DROP FUNCTION IF EXISTS thornhill_guard_job_insert();
+CREATE TRIGGER thornhill_guard_job_dispatch_trigger
+BEFORE INSERT OR UPDATE OF status ON jobs
+FOR EACH ROW EXECUTE FUNCTION thornhill_guard_job_dispatch();
 SQL
 }
 
@@ -245,6 +252,11 @@ if ! git diff --quiet -- "${controller}" || ! git diff --cached --quiet -- "${co
 fi
 if [[ $(git hash-object "${controller}") != $(git rev-parse "${revision}:${controller}") ]]; then
   defer_or_fail_checkout "controller does not match passing revision ${revision}; update the local checkout"
+fi
+rollback_mode=$(git show "${revision}:docs/rollback-compatibility.json" | jq -er '.mode')
+if [[ "${rollback_mode}" != backward-compatible-additive ]]; then
+  echo "Refusing automatic deployment: schema policy mode is ${rollback_mode@Q}, not backward-compatible-additive" >&2
+  exit 1
 fi
 
 previous_revision=$(status_revision "${LOCAL_STATUS_URL}" 2>/dev/null || true)

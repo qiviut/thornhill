@@ -44,7 +44,7 @@ services:
       args:
         THORNHILL_REVISION: ${THORNHILL_REVISION:-unknown}
     image: ${THORNHILL_APP_IMAGE:-thornhill-app}
-    env_file: .env
+    env_file: ${THORNHILL_ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgres://thornhill:thornhill@db:5432/thornhill?sslmode=disable
     ports:

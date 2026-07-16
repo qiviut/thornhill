@@ -36,6 +36,12 @@ func TestCheckRejectsCIQualificationLaneBypass(t *testing.T) {
 			contain: "source qualification lane must depend on preflight",
 		},
 		{
+			name:    "source omits frontend tests",
+			old:     "          npm test\n",
+			new:     "",
+			contain: "source qualification lane must include",
+		},
+		{
 			name:    "image omits security scan",
 			old:     "        run: scripts/run-security-scans.sh thornhill:ci thornhill-postgres:ci",
 			new:     "        run: true",
@@ -84,6 +90,9 @@ func policyFixture(t *testing.T) string {
 		".github/workflows/fuzz.yml",
 		"Dockerfile",
 		"Dockerfile.postgres",
+		"docs/rollback-compatibility.json",
+		"internal/store/store.go",
+		"scripts/deploy-passed-main.sh",
 	} {
 		data, err := os.ReadFile(filepath.Join(source, relative))
 		if err != nil {
@@ -118,6 +127,12 @@ func TestCheckRejectsUnsafeDependabotApproval(t *testing.T) {
 			old:     "    steps:\n",
 			new:     "    steps:\n      - uses: actions/checkout@0000000000000000000000000000000000000000\n",
 			contain: "must not access secrets",
+		},
+		{
+			name:    "review creation is not commit bound",
+			old:     "            -f \"commit_id=${head_sha}\" \\\n",
+			new:     "",
+			contain: "approval lane must include",
 		},
 	}
 	for _, tc := range tests {
@@ -211,5 +226,25 @@ func TestCheckRejectsMissingScannerUpdateCoverage(t *testing.T) {
 	err = Check(root)
 	if err == nil || !strings.Contains(err.Error(), "docker-compose|/.github/scanners") {
 		t.Fatalf("Check() error = %v, want scanner Dependabot coverage error", err)
+	}
+}
+
+func TestCheckRejectsSchemaWithoutUpdatedRollbackDeclaration(t *testing.T) {
+	root := policyFixture(t)
+	path := filepath.Join(root, "internal/store/store.go")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := strings.Replace(string(data), "CREATE TABLE IF NOT EXISTS jobs (", "-- compatibility-affecting schema edit\nCREATE TABLE IF NOT EXISTS jobs (", 1)
+	if changed == string(data) {
+		t.Fatal("schema fixture marker missing")
+	}
+	if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Check(root)
+	if err == nil || !strings.Contains(err.Error(), "does not cover current schema") {
+		t.Fatalf("Check() error = %v, want rollback compatibility hash error", err)
 	}
 }

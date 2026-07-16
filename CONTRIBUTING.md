@@ -21,12 +21,14 @@ FUZZTIME=5s scripts/test-fuzz.sh
 go test -tags=integration -count=1 -run '^TestProviderProcessConformance$' ./internal/dummyopenai
 (
   cd web
-  npm ci
+  npm ci --ignore-scripts
   npm run check
+  npm run lint
+  npm test
   npm run build
+  npm audit --audit-level=high
 )
-cp .env.example .env
-docker compose config --quiet
+THORNHILL_ENV_FILE=.env.example docker compose config --quiet
 ```
 
 Container and PostgreSQL integration checks also run in GitHub Actions. See [`docs/ci-security.md`](docs/ci-security.md) for the trust model.
