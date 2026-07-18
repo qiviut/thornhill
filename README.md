@@ -84,8 +84,9 @@ configuration.
 After deployment, open Thornhill over HTTPS and select **Enable alerts**. On
 iPhone/iPad, install the PWA to the Home Screen first; notification permission is
 available only to installed web apps. Subscription endpoints are bearer
-capabilities: Thornhill accepts them only through same-origin browser writes,
-never returns or logs them, rejects non-public destinations, and deletes them on
+capabilities: Thornhill accepts them only through browser writes whose canonical
+scheme and host exactly match the trusted external request origin; it never
+returns or logs them, rejects non-public destinations, and deletes them on
 explicit unsubscribe. Provider requests bypass environment proxies, do not
 follow redirects, and re-check resolved addresses before dialing. A provider
 `404`/`410` disables the endpoint automatically.
@@ -99,8 +100,9 @@ uses a PostgreSQL outbox. Network failures, provider `429`, and `5xx` responses
 retry with bounded backoff for at most six attempts; other permanent responses
 are recorded without retry. A call becoming live cancels an in-flight Push
 attempt and releases the lease. Push is a best-effort attention channel only: it
-never changes job state or grants authority, and unacknowledged
-items remain available for the next spoken resume briefing.
+never changes job state or grants authority. Interrupted or inaudible briefings
+are retried while the call survives; unacknowledged items remain available for
+the next spoken resume briefing after disconnect.
 
 ### CI-proven live revision
 

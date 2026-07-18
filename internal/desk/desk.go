@@ -86,23 +86,25 @@ type realtimeClient interface {
 // Desk is one materialized session. Create per call; throw away on park.
 type Desk struct {
 	Deps
-	fsm                   *FSM
-	inject                chan injection
-	urgent                chan injection
-	client                realtimeClient
-	pendingUserTurn       bool
-	pendingContinuation   bool
-	responseMu            sync.Mutex
-	responseCreateEventID string
-	responseSeq           uint64
-	toolResults           chan toolBatch
-	attentionClaimToken   string
-	responseAttention     []int64
-	attentionRequestID    string
-	attentionResponseID   string
-	attentionResponseDone bool
-	attentionAudioStarted bool
-	attentionAudioStopped bool
+	fsm                       *FSM
+	inject                    chan injection
+	urgent                    chan injection
+	client                    realtimeClient
+	pendingUserTurn           bool
+	pendingContinuation       bool
+	responseMu                sync.Mutex
+	responseCreateEventID     string
+	responseSeq               uint64
+	toolResults               chan toolBatch
+	attentionClaimToken       string
+	responseAttention         []int64
+	attentionRequestID        string
+	attentionResponseID       string
+	attentionResponseDone     bool
+	attentionAudioStarted     bool
+	attentionAudioStopped     bool
+	responseAttentionBriefing injection
+	attentionRetry            *injection
 }
 
 func New(d Deps) *Desk {
@@ -258,6 +260,11 @@ func (d *Desk) Run(ctx context.Context, callID string) (reason ParkReason, err e
 }
 
 func (d *Desk) nextInjection() (injection, bool) {
+	if d.attentionRetry != nil {
+		inj := cloneInjection(*d.attentionRetry)
+		d.attentionRetry = nil
+		return inj, true
+	}
 	select {
 	case inj := <-d.urgent:
 		return inj, true
@@ -307,10 +314,15 @@ func (d *Desk) pendingApprovalOnResume(ctx context.Context) (injection, bool) {
 
 func (d *Desk) doInject(ctx context.Context, inj injection) error {
 	if err := d.client.InjectMessage(ctx, inj.role, inj.text); err != nil {
+		d.queueAttentionRetry(inj)
 		return err
 	}
 	if inj.respond {
-		return d.requestResponseFor(ctx, inj.attention)
+		err := d.requestResponseFor(ctx, inj.attention, inj)
+		if err != nil {
+			d.queueAttentionRetry(inj)
+		}
+		return err
 	}
 	return nil
 }
@@ -319,10 +331,10 @@ func (d *Desk) doInject(ctx context.Context, inj injection) error {
 // request in-flight before OpenAI asynchronously acknowledges response.created,
 // closing the race between user turns, tool continuations, and announcements.
 func (d *Desk) requestResponse(ctx context.Context) error {
-	return d.requestResponseFor(ctx, nil)
+	return d.requestResponseFor(ctx, nil, injection{})
 }
 
-func (d *Desk) requestResponseFor(ctx context.Context, attention []int64) error {
+func (d *Desk) requestResponseFor(ctx context.Context, attention []int64, briefing injection) error {
 	// Serialize the actual client event with RequestPark. If response admission
 	// wins, the event is written before PARKING; if Park wins, admission fails.
 	d.responseMu.Lock()
@@ -334,12 +346,8 @@ func (d *Desk) requestResponseFor(ctx context.Context, attention []int64) error 
 	d.responseSeq++
 	eventID := fmt.Sprintf("thornhill_response_create_%d_%d", now.UnixNano(), d.responseSeq)
 	d.responseCreateEventID = eventID
-	if err := d.client.CreateResponse(ctx, eventID); err != nil {
-		d.responseCreateEventID = ""
-		d.fsm.ResponseDone(time.Now())
-		return err
-	}
 	d.responseAttention = append(d.responseAttention[:0], attention...)
+	d.responseAttentionBriefing = cloneInjection(briefing)
 	d.attentionRequestID = ""
 	if len(attention) > 0 {
 		d.attentionRequestID = eventID
@@ -348,6 +356,12 @@ func (d *Desk) requestResponseFor(ctx context.Context, attention []int64) error 
 	d.attentionResponseDone = false
 	d.attentionAudioStarted = false
 	d.attentionAudioStopped = false
+	if err := d.client.CreateResponse(ctx, eventID); err != nil {
+		d.responseCreateEventID = ""
+		d.fsm.ResponseDone(time.Now())
+		d.requeueResponseAttention()
+		return err
+	}
 	return nil
 }
 
@@ -495,9 +509,9 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 	case openairt.EvOutputAudioCleared:
 		d.fsm.AudioStopped(now)
 		// Cleared audio was not fully presented to the operator. Preserve the
-		// durable obligation for a later call rather than acknowledging it.
+		// durable obligation and retry the same bounded briefing at the next lull.
 		if d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
-			d.resetResponseAttention()
+			d.requeueResponseAttention()
 		}
 		return d.maybeCreateResponse(ctx)
 
@@ -507,12 +521,14 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		status := openairt.ExtractResponseStatus(ev.Raw)
 		ref := openairt.ExtractResponseRef(ev.Raw)
 		if len(d.responseAttention) > 0 && ref.ID != "" && ref.ID == d.attentionResponseID {
-			d.attentionResponseDone = status == "completed"
-			d.maybeAcknowledgeAttention(ctx)
-			if !d.attentionAudioStarted {
+			if status == "completed" {
+				d.attentionResponseDone = true
+				d.maybeAcknowledgeAttention(ctx)
+			}
+			if len(d.responseAttention) > 0 && (status != "completed" || !d.attentionAudioStarted) {
 				// A completed text-only or rejected response is not evidence that
-				// the operator heard the briefing. Leave durable rows pending.
-				d.resetResponseAttention()
+				// the operator heard the briefing. Retry the exact bounded briefing.
+				d.requeueResponseAttention()
 			}
 		}
 		if status != "" && status != "completed" {
@@ -546,7 +562,7 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		errorEventID := openairt.ExtractErrorEventID(ev.Raw)
 		matchesPendingCreate := d.responseCreateEventID != "" && errorEventID == d.responseCreateEventID
 		if matchesPendingCreate && errorEventID == d.attentionRequestID {
-			d.resetResponseAttention()
+			d.requeueResponseAttention()
 		}
 		if openairt.ExtractErrorCode(ev.Raw) == "conversation_already_has_active_response" {
 			// Preserve the active turn and avoid an audible error loop, which
@@ -650,11 +666,35 @@ func (d *Desk) maybeAcknowledgeAttention(ctx context.Context) {
 
 func (d *Desk) resetResponseAttention() {
 	d.responseAttention = nil
+	d.responseAttentionBriefing = injection{}
 	d.attentionRequestID = ""
 	d.attentionResponseID = ""
 	d.attentionResponseDone = false
 	d.attentionAudioStarted = false
 	d.attentionAudioStopped = false
+}
+
+func (d *Desk) requeueResponseAttention() {
+	if len(d.responseAttention) == 0 {
+		return
+	}
+	briefing := cloneInjection(d.responseAttentionBriefing)
+	briefing.attention = append(briefing.attention[:0], d.responseAttention...)
+	d.resetResponseAttention()
+	d.queueAttentionRetry(briefing)
+}
+
+func (d *Desk) queueAttentionRetry(inj injection) {
+	if len(inj.attention) == 0 {
+		return
+	}
+	retry := cloneInjection(inj)
+	d.attentionRetry = &retry
+}
+
+func cloneInjection(inj injection) injection {
+	inj.attention = append([]int64(nil), inj.attention...)
+	return inj
 }
 
 // announcementFor turns a job event into a system-message injection the

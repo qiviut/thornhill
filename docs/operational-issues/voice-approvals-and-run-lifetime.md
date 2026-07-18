@@ -221,7 +221,9 @@ to brief the operator. The `response.create` client event ID is copied into
 Realtime response metadata. A row becomes spoken only when that exact response
 is `completed` and its exact `response_id` has both started and fully drained
 audio. Interruption, buffer clear, text-only output, disconnect, error, or stale
-callbacks preserve the row for a later call.
+callbacks never acknowledge the row. While the call survives, the exact bounded
+briefing is requeued behind the active response; disconnect releases the claim so
+the next call can brief it again.
 
 Optional Web Push consumes the same attention rows through a separate durable
 outbox. Delivery is suppressed while the voice desk is live; a transition to

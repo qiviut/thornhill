@@ -87,12 +87,20 @@ func TestPushSubscriptionRequiresSameOriginAndValidKeys(t *testing.T) {
 	body := `{"endpoint":"https://push.example.test/capability","keys":{"p256dh":"` + p256dh + `","auth":"` + auth + `"}}`
 
 	for _, tc := range []struct {
-		name   string
-		origin string
-		body   string
-		want   int
+		name           string
+		requestURL     string
+		forwardedProto string
+		allowedOrigins []string
+		origin         string
+		body           string
+		want           int
 	}{
 		{name: "same origin", origin: "https://thornhill.example", body: body, want: http.StatusNoContent},
+		{name: "same origin behind HTTPS proxy", requestURL: "http://thornhill.example/api/push/subscriptions", forwardedProto: "https", origin: "https://thornhill.example", body: body, want: http.StatusNoContent},
+		{name: "HTTP to HTTPS cross scheme", origin: "http://thornhill.example", body: body, want: http.StatusForbidden},
+		{name: "configured host cannot bypass scheme", allowedOrigins: []string{"thornhill.example"}, origin: "http://thornhill.example", body: body, want: http.StatusForbidden},
+		{name: "configured cross origin cannot enroll", allowedOrigins: []string{"evil.example"}, origin: "https://evil.example", body: body, want: http.StatusForbidden},
+		{name: "HTTPS to HTTP cross scheme", requestURL: "http://thornhill.example/api/push/subscriptions", origin: "https://thornhill.example", body: body, want: http.StatusForbidden},
 		{name: "missing origin", body: body, want: http.StatusForbidden},
 		{name: "cross origin", origin: "https://evil.example", body: body, want: http.StatusForbidden},
 		{name: "plaintext endpoint", origin: "https://thornhill.example", body: strings.Replace(body, "https://push.example.test", "http://push.example.test", 1), want: http.StatusBadRequest},
@@ -107,8 +115,16 @@ func TestPushSubscriptionRequiresSameOriginAndValidKeys(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &pushTestStore{}
 			g := pushTestGateway(st, true)
-			req := httptest.NewRequest(http.MethodPost, "https://thornhill.example/api/push/subscriptions", strings.NewReader(tc.body))
+			g.Cfg.AllowedOrigins = tc.allowedOrigins
+			requestURL := tc.requestURL
+			if requestURL == "" {
+				requestURL = "https://thornhill.example/api/push/subscriptions"
+			}
+			req := httptest.NewRequest(http.MethodPost, requestURL, strings.NewReader(tc.body))
 			req.Host = "thornhill.example"
+			if tc.forwardedProto != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
+			}
 			if tc.origin != "" {
 				req.Header.Set("Origin", tc.origin)
 			}

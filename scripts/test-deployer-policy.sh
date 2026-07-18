@@ -2,6 +2,12 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+controller=$(<"${root}/scripts/deploy-passed-main.sh")
+[[ "${controller}" == *"trap on_exit EXIT"* && "${controller}" == *"trap 'exit 130' INT"* && \
+  "${controller}" == *"trap 'exit 143' TERM"* && "${controller}" != *"trap on_exit EXIT INT TERM"* ]] || {
+  printf 'Deployer signal traps must route INT/TERM through a nonzero EXIT rollback\n' >&2
+  exit 1
+}
 state_dir=$(mktemp -d)
 cleanup() {
   rm -rf "${state_dir}"

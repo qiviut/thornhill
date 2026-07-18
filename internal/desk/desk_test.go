@@ -115,6 +115,8 @@ type recordingRealtime struct {
 	outputBodies   []string
 	createEventIDs []string
 	creates        int
+	injectErr      error
+	createErr      error
 }
 
 func (*recordingRealtime) Close() {}
@@ -124,7 +126,9 @@ func (*recordingRealtime) Read(context.Context) (openairt.ServerEvent, error) {
 func (*recordingRealtime) SessionUpdate(context.Context, string, []openairt.Tool, string) error {
 	return nil
 }
-func (*recordingRealtime) InjectMessage(context.Context, string, string) error { return nil }
+func (r *recordingRealtime) InjectMessage(context.Context, string, string) error {
+	return r.injectErr
+}
 func (r *recordingRealtime) FunctionOutput(_ context.Context, callID, output string) error {
 	r.outputCallIDs = append(r.outputCallIDs, callID)
 	r.outputBodies = append(r.outputBodies, output)
@@ -133,7 +137,7 @@ func (r *recordingRealtime) FunctionOutput(_ context.Context, callID, output str
 func (r *recordingRealtime) CreateResponse(_ context.Context, eventID string) error {
 	r.creates++
 	r.createEventIDs = append(r.createEventIDs, eventID)
-	return nil
+	return r.createErr
 }
 func (r *recordingRealtime) CancelResponse(context.Context) error { return nil }
 
@@ -220,6 +224,30 @@ func TestDurableAttentionAcknowledgesOnlyAfterCompletedOutputAudio(t *testing.T)
 	}
 }
 
+func TestAttentionTransportFailuresRequeueBriefing(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		injectErr error
+		createErr error
+	}{
+		{name: "message injection", injectErr: fmt.Errorf("inject failed")},
+		{name: "response creation", createErr: fmt.Errorf("create failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &recordingRealtime{injectErr: tc.injectErr, createErr: tc.createErr}
+			d := testDesk(t, client)
+			inj, _ := d.attentionBriefing([]store.Attention{{ID: 10, SpeechText: "pending"}})
+			if err := d.doInject(context.Background(), inj); err == nil {
+				t.Fatal("transport failure unexpectedly succeeded")
+			}
+			retry, ok := d.nextInjection()
+			if !ok || retry.text != inj.text || !reflect.DeepEqual(retry.attention, []int64{10}) {
+				t.Fatalf("retry=%+v ok=%v", retry, ok)
+			}
+		})
+	}
+}
+
 func TestStaleResponseCallbacksCannotAcknowledgeAttention(t *testing.T) {
 	client := &recordingRealtime{}
 	d := testDesk(t, client)
@@ -250,13 +278,36 @@ func TestStaleResponseCallbacksCannotAcknowledgeAttention(t *testing.T) {
 	}
 }
 
-func TestClearedOrTextOnlyAttentionRemainsPending(t *testing.T) {
+func TestInterruptedOrInaudibleAttentionRequeuesUntilHeard(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		cleared bool
+		name   string
+		finish func(*testing.T, *Desk, *bool)
 	}{
-		{name: "cleared audio", cleared: true},
-		{name: "text only"},
+		{name: "cleared audio", finish: func(t *testing.T, d *Desk, pendingQuestion *bool) {
+			audio := json.RawMessage(`{"response_id":"resp-pending"}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: audio}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioCleared, Raw: audio}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "text only", finish: func(t *testing.T, d *Desk, pendingQuestion *bool) {
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "interrupted", finish: func(t *testing.T, d *Desk, pendingQuestion *bool) {
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"cancelled","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &recordingRealtime{}
@@ -272,21 +323,36 @@ func TestClearedOrTextOnlyAttentionRemainsPending(t *testing.T) {
 			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: created}, &pendingQuestion); err != nil {
 				t.Fatal(err)
 			}
-			if tc.cleared {
-				audio := json.RawMessage(`{"response_id":"resp-pending"}`)
-				if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: audio}, &pendingQuestion); err != nil {
-					t.Fatal(err)
-				}
-				if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioCleared, Raw: audio}, &pendingQuestion); err != nil {
-					t.Fatal(err)
-				}
-			}
-			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
-			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, &pendingQuestion); err != nil {
-				t.Fatal(err)
-			}
+			tc.finish(t, d, &pendingQuestion)
 			if len(st.acknowledged) != 0 {
 				t.Fatalf("inaudible briefing acknowledged: %v", st.acknowledged)
+			}
+
+			retry, ok := d.nextInjection()
+			if !ok || retry.text != inj.text || !reflect.DeepEqual(retry.attention, []int64{9}) {
+				t.Fatalf("retry=%+v ok=%v", retry, ok)
+			}
+			if err := d.doInject(context.Background(), retry); err != nil {
+				t.Fatal(err)
+			}
+			retryRequestID := client.createEventIDs[len(client.createEventIDs)-1]
+			retryCreated := json.RawMessage(fmt.Sprintf(`{"response":{"id":"resp-retry","metadata":{"thornhill_request_id":%q}}}`, retryRequestID))
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: retryCreated}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			retryAudio := json.RawMessage(`{"response_id":"resp-retry"}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: retryAudio}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			retryDone := json.RawMessage(`{"response":{"id":"resp-retry","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: retryDone}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStopped, Raw: retryAudio}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(st.acknowledged, []int64{9}) || len(d.responseAttention) != 0 {
+				t.Fatalf("acknowledged=%v pending=%v", st.acknowledged, d.responseAttention)
 			}
 		})
 	}

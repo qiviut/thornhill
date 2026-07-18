@@ -226,7 +226,9 @@ on_exit() {
   cleanup_worktrees
   exit "${rc}"
 }
-trap on_exit EXIT INT TERM
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "${ROOT}"
 timeout 60s git fetch --quiet --prune origin main
