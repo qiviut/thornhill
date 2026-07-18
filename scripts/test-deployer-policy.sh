@@ -8,6 +8,13 @@ controller=$(<"${root}/scripts/deploy-passed-main.sh")
   printf 'Deployer signal traps must route INT/TERM through a nonzero EXIT rollback\n' >&2
   exit 1
 }
+direct_stop_pattern="docker stop --timeout 30 \"\${container}\""
+compose_stop_pattern="\"\${compose[@]}\" stop"
+[[ "${controller}" == *"${direct_stop_pattern}"* && \
+  "${controller}" != *"${compose_stop_pattern}"* ]] || {
+  printf 'Deployer must stop identified containers without Compose image interpolation\n' >&2
+  exit 1
+}
 pg_ctl_pattern="pg_ctl -D \"\$PGDATA\" -m fast -w -t 30 stop"
 [[ "${controller}" == *"stop_database_cleanly()"* && \
   "${controller}" == *"docker update --restart=no"* && \

@@ -192,7 +192,7 @@ stop_application_cleanly() {
   if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
     return 1
   fi
-  if [[ "${running}" == true ]] && ! "${compose[@]}" stop --timeout 30 app; then
+  if [[ "${running}" == true ]] && ! docker stop --timeout 30 "${container}" >/dev/null; then
     return 1
   fi
   verify_clean_stopped_container "${container}"
@@ -211,7 +211,7 @@ stop_database_cleanly() {
     return 1
   fi
   if [[ "${pid1_uid}" == 70 ]]; then
-    if ! "${compose[@]}" stop --timeout 30 db; then
+    if ! docker stop --timeout 30 "${container}" >/dev/null; then
       return 1
     fi
     verify_clean_stopped_container "${container}"

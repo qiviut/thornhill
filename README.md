@@ -132,8 +132,10 @@ runs directly as PID 1 so the signal reaches its UID-70 process without granting
 `CAP_KILL` to a root-owned init shim. On the one-time upgrade from the former
 shim model, the controller disables its persisted automatic-restart policy,
 asks PostgreSQL to checkpoint and stop through `pg_ctl` running as UID 70, and
-verifies that it remains cleanly stopped before recreation. Every deployment and
-rollback samples both app and database state after stop and requires a stable
+verifies that it remains cleanly stopped before recreation. The controller stops
+the already identified app and database containers directly, so shutdown cannot
+be blocked by Compose image-variable interpolation. Every deployment and rollback
+samples both app and database state after stop and requires a stable
 `Running=false`, `Restarting=false`, exit-zero result; missing, forced, or
 ambiguous stops fail closed before recreation. The controller then verifies the
 UI, status endpoint, OCI label, binary revision, and database runtime. Failed
