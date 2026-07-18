@@ -158,8 +158,7 @@ verify_running_db() {
   cap_drop=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.CapDrop}}')
   security_opt=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.SecurityOpt}}')
   pids_limit=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.PidsLimit}}')
-  runtime_uid=$(docker exec "${PROJECT_NAME}-db-1" sh -c \
-    'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1; stat -c %u "/proc/$1"')
+  runtime_uid=$(docker exec "${PROJECT_NAME}-db-1" stat -c %u /proc/1)
   [[ "${actual_image}" == "${expected_image}" && "${health}" == healthy && "${read_only}" == true && \
     "${cap_drop}" == *ALL* && "${security_opt}" == *no-new-privileges* && \
     "${pids_limit}" == 256 && "${runtime_uid}" == 70 ]]
@@ -190,6 +189,10 @@ rollback() {
   local rollback_ok=false deadline
   if [[ "${deployed}" == true && -n "${previous_image}" && -n "${previous_db_image}" && ${#previous_compose[@]} -gt 0 ]]; then
     echo "${stage} failed; rolling back to ${previous_revision} (${previous_image}, ${previous_db_image})" >&2
+    # Stop the application before PostgreSQL so the database can checkpoint and
+    # exit cleanly even when the failed stack still owns pooled connections.
+    "${compose[@]}" stop --timeout 30 app >/dev/null 2>&1 || true
+    "${compose[@]}" stop --timeout 30 db >/dev/null 2>&1 || true
     if THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
       "${previous_compose[@]}" up -d --no-build --force-recreate db app >/dev/null; then
       deadline=$((SECONDS + TIMEOUT_SECONDS))
@@ -342,8 +345,13 @@ if [[ "${active}" != 0 ]]; then
   exit 0
 fi
 
-stage=deploy
 deployed=true
+stage=stop
+# Compose replacement can otherwise stop the dependency before its client. Stop
+# the app first, then give PostgreSQL its full clean-shutdown grace period.
+"${compose[@]}" stop --timeout 30 app
+"${compose[@]}" stop --timeout 30 db
+stage=deploy
 THORNHILL_APP_IMAGE="${image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
   "${compose[@]}" up -d --no-build --force-recreate db app
 stage=verify

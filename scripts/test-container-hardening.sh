@@ -18,10 +18,11 @@ jq -e '
   (.services.app | .init == true and .read_only == true and .pids_limit == 256 and
     .cap_drop == ["ALL"] and (.security_opt | index("no-new-privileges:true")) != null and
     (.tmpfs | index("/tmp:rw,noexec,nosuid,size=64m")) != null) and
-  (.services.db | .init == true and .read_only == true and .pids_limit == 256 and
+  (.services.db | .init == false and .read_only == true and .pids_limit == 256 and
     .cap_drop == ["ALL"] and
     (.cap_add | sort) == (["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"] | sort) and
     (.security_opt | index("no-new-privileges:true")) != null and
+    .stop_signal == "SIGINT" and .stop_grace_period == "30s" and
     any(.tmpfs[]; startswith("/run/postgresql:rw,noexec,nosuid,size=16m")))
 ' <<<"${compose_model}" >/dev/null || {
   printf 'Checked-in Compose hardening model does not match the qualified runtime policy\n' >&2
@@ -47,11 +48,11 @@ fail_with_logs() {
 
 postgres_ready() {
   # The official image briefly starts a temporary PostgreSQL server during
-  # initialization, then stops it before exec'ing the final server as the sole
-  # direct child of Docker's init. Requiring that process shape prevents a
-  # transient pg_isready success from racing the intentional shutdown.
+  # initialization, then stops it before exec'ing the final server as PID 1.
+  # Requiring that process shape prevents a transient pg_isready success from
+  # racing the intentional shutdown.
   docker exec "$db" sh -c \
-    'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1 && test "$(cat "/proc/$1/comm")" = postgres && pg_isready --username thornhill --dbname thornhill' \
+    'test "$(cat /proc/1/comm)" = postgres && pg_isready --username thornhill --dbname thornhill' \
     >/dev/null 2>&1
 }
 
@@ -74,7 +75,6 @@ docker run --detach --name "$db" --network "$network" \
   --env POSTGRES_USER=thornhill \
   --env POSTGRES_PASSWORD=thornhill-test-only \
   --env POSTGRES_DB=thornhill \
-  --init \
   --read-only \
   --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \
   --tmpfs /run/postgresql:rw,noexec,nosuid,size=16m,uid=70,gid=70,mode=2775 \
@@ -87,6 +87,8 @@ docker run --detach --name "$db" --network "$network" \
   --cap-add SETUID \
   --security-opt no-new-privileges:true \
   --pids-limit 256 \
+  --stop-signal SIGINT \
+  --stop-timeout 30 \
   "$db_image" >/dev/null
 
 for _ in {1..60}; do
@@ -97,12 +99,14 @@ for _ in {1..60}; do
 done
 postgres_ready || fail_with_logs 'PostgreSQL did not become ready'
 
-db_uid=$(docker exec "$db" sh -c 'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1; stat -c %u "/proc/$1"')
+db_uid=$(docker exec "$db" stat -c %u /proc/1)
 db_readonly=$(docker inspect "$db" --format '{{.HostConfig.ReadonlyRootfs}}')
 db_cap_drop=$(docker inspect "$db" --format '{{json .HostConfig.CapDrop}}')
 db_cap_add=$(docker inspect "$db" --format '{{json .HostConfig.CapAdd}}')
 db_security_opt=$(docker inspect "$db" --format '{{json .HostConfig.SecurityOpt}}')
 db_pids_limit=$(docker inspect "$db" --format '{{.HostConfig.PidsLimit}}')
+db_stop_signal=$(docker inspect "$db" --format '{{.Config.StopSignal}}')
+db_stop_timeout=$(docker inspect "$db" --format '{{.Config.StopTimeout}}')
 [[ "$db_uid" == 70 ]]
 [[ "$db_readonly" == true ]]
 [[ "$db_cap_drop" == *'ALL'* ]]
@@ -111,6 +115,8 @@ for capability in CHOWN DAC_OVERRIDE FOWNER SETGID SETUID; do
 done
 [[ "$db_security_opt" == *'no-new-privileges'* ]]
 [[ "$db_pids_limit" == 256 ]]
+[[ "$db_stop_signal" == SIGINT ]]
+[[ "$db_stop_timeout" == 30 ]]
 
 docker run --detach --name "$app" --network "$network" \
   --publish 127.0.0.1::8787 \
@@ -151,8 +157,14 @@ actual_revision=$(jq -r '.source_commit // empty' <<<"$status")
 versioned=$(jq -r '.versioned // false' <<<"$status")
 [[ "$actual_revision" == "$revision" && "$versioned" == true ]]
 
+docker stop "$db" >/dev/null
+[[ "$(docker inspect "$db" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'PostgreSQL did not stop cleanly on SIGINT'
+db_logs=$(docker logs "$db" 2>&1)
+[[ "$db_logs" == *'database system is shut down'* && "$db_logs" != *'database system was not properly shut down'* ]] || \
+  fail_with_logs 'PostgreSQL fast shutdown did not produce a clean checkpointed exit'
+
 docker stop --time 10 "$app" >/dev/null
 [[ "$(docker inspect "$app" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'Application did not stop cleanly on SIGTERM'
 
-printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL app_pids=256 db_user=%s db_read_only=true db_cap_drop=ALL db_pids=256\n' \
+printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL app_pids=256 db_user=%s db_read_only=true db_cap_drop=ALL db_pids=256 db_stop=SIGINT/30s\n' \
   "$revision" "$runtime_user" "$db_uid"

@@ -120,8 +120,13 @@ The timer polls GitHub every 15 minutes for the newest successful
 **push-to-main** CI run and builds
 that exact commit from a detached temporary worktree. Immediately before
 replacement it atomically pauses new dispatches in PostgreSQL and rechecks that
-no work is active. It then recreates only the app service and verifies the local
-and Tailnet UI, status endpoint, OCI label, and binary revision. Failed
+no work is active. It then recreates the revision-pinned app and PostgreSQL
+services. PostgreSQL receives its fast clean-shutdown signal (`SIGINT`) with a
+30-second grace period after the old application is stopped, so lingering
+connections cannot turn a routine replacement into crash recovery. PostgreSQL
+runs directly as PID 1 so the signal reaches its UID-70 process without granting
+`CAP_KILL` to a root-owned init shim. The controller verifies the local and
+Tailnet UI, status endpoint, OCI label, binary revision, and database runtime. Failed
 verification restores the prior revision's image **and Compose model**; the bad
 SHA is quarantined instead of being retried. During active development the timer
 may be stopped. Polls against a modified or revision-mismatched deployment
