@@ -4,6 +4,9 @@
 package config
 
 import (
+	"bytes"
+	"crypto/ecdh"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/url"
@@ -42,6 +45,11 @@ type Config struct {
 	// Leave empty in production when the UI is served by Thornhill itself.
 	AllowedOrigins []string // ALLOWED_ORIGINS, e.g. localhost:5173 for Vite dev
 	PrebakeDir     string   // PREBAKE_DIR, default ./prebaked
+
+	// --- optional Web Push ---
+	PushVAPIDPublicKey  string // PUSH_VAPID_PUBLIC_KEY: URL-safe base64 P-256 public key
+	PushVAPIDPrivateKey string // PUSH_VAPID_PRIVATE_KEY: URL-safe base64 P-256 private key
+	PushVAPIDSubject    string // PUSH_VAPID_SUBJECT: mailto: or https: operator contact
 
 	// --- session lifecycle timer ladder ---
 	QuietAfter time.Duration // QUIET_AFTER, default 30s: model goes silent-listening
@@ -130,6 +138,45 @@ func realtimeURL(base string) string {
 	return u.String()
 }
 
+func validatePushConfig(c *Config) error {
+	configured := c.PushVAPIDPublicKey != "" || c.PushVAPIDPrivateKey != "" || c.PushVAPIDSubject != ""
+	if !configured {
+		return nil
+	}
+	if c.PushVAPIDPublicKey == "" || c.PushVAPIDPrivateKey == "" || c.PushVAPIDSubject == "" {
+		return fmt.Errorf("PUSH_VAPID_PUBLIC_KEY, PUSH_VAPID_PRIVATE_KEY, and PUSH_VAPID_SUBJECT must be set together")
+	}
+	public, err := base64.RawURLEncoding.DecodeString(c.PushVAPIDPublicKey)
+	if err != nil {
+		return fmt.Errorf("PUSH_VAPID_PUBLIC_KEY must be unpadded URL-safe base64: %w", err)
+	}
+	if _, err := ecdh.P256().NewPublicKey(public); err != nil {
+		return fmt.Errorf("PUSH_VAPID_PUBLIC_KEY is not a valid P-256 public key: %w", err)
+	}
+	private, err := base64.RawURLEncoding.DecodeString(c.PushVAPIDPrivateKey)
+	if err != nil {
+		return fmt.Errorf("PUSH_VAPID_PRIVATE_KEY must be unpadded URL-safe base64: %w", err)
+	}
+	privateKey, err := ecdh.P256().NewPrivateKey(private)
+	if err != nil {
+		return fmt.Errorf("PUSH_VAPID_PRIVATE_KEY is not a valid P-256 private key: %w", err)
+	}
+	if !bytes.Equal(privateKey.PublicKey().Bytes(), public) {
+		return fmt.Errorf("PUSH_VAPID_PUBLIC_KEY and PUSH_VAPID_PRIVATE_KEY are not the same P-256 key pair")
+	}
+	subject, err := url.Parse(c.PushVAPIDSubject)
+	if err != nil || (subject.Scheme != "mailto" && subject.Scheme != "https") {
+		return fmt.Errorf("PUSH_VAPID_SUBJECT must be a mailto: or https: URI")
+	}
+	if subject.Scheme == "https" && subject.Host == "" {
+		return fmt.Errorf("PUSH_VAPID_SUBJECT https URI must include a host")
+	}
+	if subject.Scheme == "mailto" && strings.TrimSpace(subject.Opaque+subject.Path) == "" {
+		return fmt.Errorf("PUSH_VAPID_SUBJECT mailto URI must include an address")
+	}
+	return nil
+}
+
 func Load() (*Config, error) {
 	c := &Config{
 		OpenAIKey:           os.Getenv("OPENAI_API_KEY"),
@@ -151,6 +198,9 @@ func Load() (*Config, error) {
 		StaticDir:           getenv("STATIC_DIR", "web/dist"),
 		AllowedOrigins:      splitCSV(os.Getenv("ALLOWED_ORIGINS")),
 		PrebakeDir:          getenv("PREBAKE_DIR", "prebaked"),
+		PushVAPIDPublicKey:  strings.TrimSpace(os.Getenv("PUSH_VAPID_PUBLIC_KEY")),
+		PushVAPIDPrivateKey: strings.TrimSpace(os.Getenv("PUSH_VAPID_PRIVATE_KEY")),
+		PushVAPIDSubject:    strings.TrimSpace(os.Getenv("PUSH_VAPID_SUBJECT")),
 		QuietAfter:          getdur("QUIET_AFTER", 30*time.Second),
 		ParkAfter:           getdur("PARK_AFTER", 10*time.Minute),
 		RolloverAt:          getdur("ROLLOVER_AT", 57*time.Minute),
@@ -179,6 +229,9 @@ func Load() (*Config, error) {
 	}
 	if c.ApprovalParkAfter <= 0 {
 		return nil, fmt.Errorf("APPROVAL_PARK_AFTER must be greater than zero")
+	}
+	if err := validatePushConfig(c); err != nil {
+		return nil, err
 	}
 	if c.OpenAIKey == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY is required")

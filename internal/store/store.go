@@ -45,6 +45,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS hermes_run_id TEXT NOT NULL DEFAULT ''
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pending_input TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approvals JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS state_version BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS approval_denials (
     pattern_key   TEXT PRIMARY KEY,
     source_job_id TEXT NOT NULL,
@@ -96,6 +97,47 @@ CREATE TABLE IF NOT EXISTS summaries (
     content    TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS attention_events (
+    id             BIGSERIAL PRIMARY KEY,
+    job_id         TEXT NOT NULL REFERENCES jobs(id),
+    job_version    BIGINT NOT NULL,
+    kind           TEXT NOT NULL,
+    speech_text    TEXT NOT NULL,
+    push_title     TEXT NOT NULL,
+    push_body      TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claim_token    TEXT NOT NULL DEFAULT '',
+    claim_until    TIMESTAMPTZ,
+    spoken_at      TIMESTAMPTZ,
+    UNIQUE (job_id, job_version, kind)
+);
+CREATE INDEX IF NOT EXISTS attention_events_pending_idx
+    ON attention_events (id) WHERE spoken_at IS NULL;
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id          BIGSERIAL PRIMARY KEY,
+    endpoint    TEXT NOT NULL UNIQUE,
+    p256dh      TEXT NOT NULL,
+    auth        TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    disabled_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS push_deliveries (
+    id              BIGSERIAL PRIMARY KEY,
+    attention_id    BIGINT NOT NULL REFERENCES attention_events(id) ON DELETE CASCADE,
+    subscription_id BIGINT NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claim_token     TEXT NOT NULL DEFAULT '',
+    claim_until     TIMESTAMPTZ,
+    sent_at         TIMESTAMPTZ,
+    failed_at       TIMESTAMPTZ,
+    last_error      TEXT NOT NULL DEFAULT '',
+    UNIQUE (attention_id, subscription_id)
+);
+ALTER TABLE push_deliveries ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS push_deliveries_ready_idx
+    ON push_deliveries (next_attempt_at, id) WHERE sent_at IS NULL AND failed_at IS NULL;
 CREATE TABLE IF NOT EXISTS usage_ledger (
     id            BIGSERIAL PRIMARY KEY,
     ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -122,6 +164,39 @@ type Job struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+	StateVersion    int64      `json:"state_version"`
+}
+
+// Attention is a durable operator-attention obligation created in the same
+// transaction as a noteworthy job transition. A voice call leases rows and
+// acknowledges them only after completed output audio.
+type Attention struct {
+	ID         int64
+	JobID      string
+	JobVersion int64
+	Kind       string
+	SpeechText string
+	PushTitle  string
+	PushBody   string
+	CreatedAt  time.Time
+}
+
+type PushSubscription struct {
+	Endpoint string
+	P256DH   string
+	Auth     string
+}
+
+type PushDelivery struct {
+	ID             int64
+	SubscriptionID int64
+	Endpoint       string
+	P256DH         string
+	Auth           string
+	Title          string
+	Body           string
+	AttentionID    int64
+	Attempts       int
 }
 
 // Approval is a redacted, user-visible authority request from Hermes. The
@@ -268,7 +343,9 @@ func (s *Store) UpdateJobTx(ctx context.Context, tx pgx.Tx, id string, mut func(
 	if err != nil {
 		return Job{}, err
 	}
+	previousStatus := j.Status
 	mut(&j)
+	j.StateVersion++
 	j.UpdatedAt = time.Now().UTC()
 	terminal := j.Status == StatusDone || j.Status == StatusFailed || j.Status == StatusCancelled
 	if terminal && j.FinishedAt == nil {
@@ -288,13 +365,61 @@ func (s *Store) UpdateJobTx(ctx context.Context, tx pgx.Tx, id string, mut func(
 	}
 	_, err = tx.Exec(ctx, `UPDATE jobs SET display_name=$2, status=$3, question=$4,
 		result_digest=$5, error=$6, hermes_session_id=$7, updated_at=$8, finished_at=$9,
-		hermes_run_id=$10, approvals=$11, progress=$12, pending_input=$13 WHERE id=$1`,
+		hermes_run_id=$10, approvals=$11, progress=$12, pending_input=$13, state_version=$14 WHERE id=$1`,
 		j.ID, j.DisplayName, j.Status, j.Question, j.ResultDigest, j.Error,
-		j.HermesSessionID, j.UpdatedAt, j.FinishedAt, j.HermesRunID, approvals, progress, j.PendingInput)
+		j.HermesSessionID, j.UpdatedAt, j.FinishedAt, j.HermesRunID, approvals, progress, j.PendingInput, j.StateVersion)
 	if err != nil {
 		return Job{}, normalizeDispatchError(err)
 	}
+	if previousStatus != j.Status {
+		if a, ok := attentionForTransition(j); ok {
+			if _, err := tx.Exec(ctx, `INSERT INTO attention_events
+				(job_id, job_version, kind, speech_text, push_title, push_body, created_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7)
+				ON CONFLICT (job_id, job_version, kind) DO NOTHING`,
+				j.ID, j.StateVersion, a.Kind, a.SpeechText, a.PushTitle, a.PushBody, j.UpdatedAt); err != nil {
+				return Job{}, fmt.Errorf("record attention transition: %w", err)
+			}
+		}
+	}
 	return j, nil
+}
+
+func attentionForTransition(j Job) (Attention, bool) {
+	name := compactAttentionText(j.DisplayName, 80)
+	a := Attention{JobID: j.ID, JobVersion: j.StateVersion, Kind: j.Status}
+	switch j.Status {
+	case StatusDone:
+		a.SpeechText = fmt.Sprintf("Job %q finished. Quoted result digest: %s", name, compactAttentionText(j.ResultDigest, 500))
+		a.PushTitle, a.PushBody = "Thornhill job finished", "A background job finished. Open Thornhill for details."
+	case StatusFailed:
+		a.SpeechText = fmt.Sprintf("Job %q failed. Quoted error: %s", name, compactAttentionText(j.Error, 500))
+		a.PushTitle, a.PushBody = "Thornhill job failed", "A background job failed. Open Thornhill for details."
+	case StatusNeedsInput:
+		a.SpeechText = fmt.Sprintf("Job %q needs input. Quoted question: %s", name, compactAttentionText(j.Question, 500))
+		a.PushTitle, a.PushBody = "Thornhill needs input", "A background job is waiting for input."
+	case StatusNeedsApproval:
+		a.SpeechText = fmt.Sprintf("Job %q needs approval. Retrieve the redacted pending request with job_status before asking for a decision.", name)
+		a.PushTitle, a.PushBody = "Thornhill needs approval", "A background job is waiting for approval."
+	case StatusParkedApproval:
+		a.SpeechText = fmt.Sprintf("Job %q parked an unresolved approval without making a decision. Offer to resume the job with fresh authority.", name)
+		a.PushTitle, a.PushBody = "Thornhill approval parked", "A background job released its run with an unresolved approval."
+	default:
+		return Attention{}, false
+	}
+	return a, true
+}
+
+func compactAttentionText(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return "(no details provided)"
+	}
+	runes := []rune(value)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return value
 }
 
 func normalizeDispatchError(err error) error {
@@ -360,14 +485,14 @@ func (s *Store) ParkApproval(ctx context.Context, jobID, approvalID, nonce, reas
 
 const selectJob = `SELECT id, display_name, task, status, question, result_digest,
 	error, hermes_session_id, hermes_run_id, approvals, progress, pending_input,
-	created_at, updated_at, finished_at FROM jobs`
+	created_at, updated_at, finished_at, state_version FROM jobs`
 
 func scanJob(row pgx.Row) (Job, error) {
 	var j Job
 	var approvals, progress []byte
 	err := row.Scan(&j.ID, &j.DisplayName, &j.Task, &j.Status, &j.Question,
 		&j.ResultDigest, &j.Error, &j.HermesSessionID, &j.HermesRunID,
-		&approvals, &progress, &j.PendingInput, &j.CreatedAt, &j.UpdatedAt, &j.FinishedAt)
+		&approvals, &progress, &j.PendingInput, &j.CreatedAt, &j.UpdatedAt, &j.FinishedAt, &j.StateVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return j, ErrNotFound
 	}
@@ -535,6 +660,206 @@ func (s *Store) MatchesPermanentAllow(ctx context.Context, patternKeys []string)
 		return "", nil
 	}
 	return found, err
+}
+
+// --- durable operator attention and Web Push outbox ---
+
+func (s *Store) ClaimPendingAttention(ctx context.Context, token string, limit int, lease time.Duration) ([]Attention, error) {
+	if token == "" {
+		return nil, errors.New("attention claim token is required")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	until := time.Now().UTC().Add(lease)
+	rows, err := s.Pool.Query(ctx, `WITH candidates AS (
+		SELECT id FROM attention_events
+		WHERE spoken_at IS NULL AND (claim_until IS NULL OR claim_until < now())
+		ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $2
+	)
+	UPDATE attention_events AS a
+	SET claim_token=$1, claim_until=$3
+	FROM candidates c WHERE a.id=c.id
+	RETURNING a.id, a.job_id, a.job_version, a.kind, a.speech_text,
+		a.push_title, a.push_body, a.created_at`, token, limit, until)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Attention
+	for rows.Next() {
+		var a Attention
+		if err := rows.Scan(&a.ID, &a.JobID, &a.JobVersion, &a.Kind, &a.SpeechText,
+			&a.PushTitle, &a.PushBody, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ReleaseAttentionClaim(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `UPDATE attention_events
+		SET claim_token='', claim_until=NULL
+		WHERE claim_token=$1 AND spoken_at IS NULL`, token)
+	return err
+}
+
+func (s *Store) MarkAttentionSpoken(ctx context.Context, token string, ids []int64) (int64, error) {
+	if token == "" || len(ids) == 0 {
+		return 0, nil
+	}
+	tag, err := s.Pool.Exec(ctx, `UPDATE attention_events
+		SET spoken_at=now(), claim_token='', claim_until=NULL
+		WHERE claim_token=$1 AND id=ANY($2) AND spoken_at IS NULL`, token, ids)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (s *Store) UpsertPushSubscription(ctx context.Context, sub PushSubscription) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var id int64
+	var disabled bool
+	err = tx.QueryRow(ctx, `SELECT id, disabled_at IS NOT NULL FROM push_subscriptions
+		WHERE endpoint=$1 FOR UPDATE`, sub.Endpoint).Scan(&id, &disabled)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		_, err = tx.Exec(ctx, `INSERT INTO push_subscriptions (endpoint, p256dh, auth)
+			VALUES ($1,$2,$3) ON CONFLICT (endpoint) DO UPDATE SET
+			p256dh=EXCLUDED.p256dh, auth=EXCLUDED.auth, updated_at=now()`,
+			sub.Endpoint, sub.P256DH, sub.Auth)
+	case err != nil:
+		return err
+	case disabled:
+		// Reactivation starts a new opt-in epoch. Pending deliveries tied to the
+		// revoked capability must not replay when the browser enrolls again.
+		if _, err = tx.Exec(ctx, `DELETE FROM push_deliveries
+			WHERE subscription_id=$1 AND sent_at IS NULL`, id); err == nil {
+			_, err = tx.Exec(ctx, `UPDATE push_subscriptions SET p256dh=$2, auth=$3,
+				created_at=now(), updated_at=now(), disabled_at=NULL WHERE id=$1`,
+				id, sub.P256DH, sub.Auth)
+		}
+	default:
+		_, err = tx.Exec(ctx, `UPDATE push_subscriptions SET p256dh=$2, auth=$3,
+			updated_at=now() WHERE id=$1`, id, sub.P256DH, sub.Auth)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) DeletePushSubscription(ctx context.Context, endpoint string) error {
+	_, err := s.Pool.Exec(ctx, `DELETE FROM push_subscriptions WHERE endpoint=$1`, endpoint)
+	return err
+}
+
+func (s *Store) ClaimPushDeliveries(ctx context.Context, token string, limit int, lease time.Duration) ([]PushDelivery, error) {
+	if token == "" {
+		return nil, errors.New("push claim token is required")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	// A subscription receives only attention created after it opted in. This
+	// avoids surprising historical notifications on first registration.
+	if _, err := tx.Exec(ctx, `INSERT INTO push_deliveries (attention_id, subscription_id)
+		SELECT a.id, s.id FROM attention_events a CROSS JOIN push_subscriptions s
+		WHERE a.spoken_at IS NULL AND s.disabled_at IS NULL AND a.created_at >= s.created_at
+		ON CONFLICT (attention_id, subscription_id) DO NOTHING`); err != nil {
+		return nil, err
+	}
+	until := time.Now().UTC().Add(lease)
+	rows, err := tx.Query(ctx, `WITH candidates AS (
+		SELECT d.id FROM push_deliveries d
+		JOIN attention_events a ON a.id=d.attention_id
+		JOIN push_subscriptions s ON s.id=d.subscription_id
+		WHERE d.sent_at IS NULL AND d.failed_at IS NULL
+		  AND a.spoken_at IS NULL AND s.disabled_at IS NULL
+		  AND d.next_attempt_at <= now()
+		  AND (d.claim_until IS NULL OR d.claim_until < now())
+		ORDER BY d.id FOR UPDATE OF d SKIP LOCKED LIMIT $2
+	)
+	UPDATE push_deliveries d SET claim_token=$1, claim_until=$3, attempts=d.attempts+1
+	FROM candidates c, attention_events a, push_subscriptions s
+	WHERE d.id=c.id AND a.id=d.attention_id AND s.id=d.subscription_id
+	RETURNING d.id, d.subscription_id, s.endpoint, s.p256dh, s.auth,
+		a.push_title, a.push_body, a.id, d.attempts`, token, limit, until)
+	if err != nil {
+		return nil, err
+	}
+	var out []PushDelivery
+	for rows.Next() {
+		var d PushDelivery
+		if err := rows.Scan(&d.ID, &d.SubscriptionID, &d.Endpoint, &d.P256DH, &d.Auth,
+			&d.Title, &d.Body, &d.AttentionID, &d.Attempts); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ReleasePushClaim(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `UPDATE push_deliveries
+		SET claim_token='', claim_until=NULL
+		WHERE claim_token=$1 AND sent_at IS NULL`, token)
+	return err
+}
+
+func (s *Store) MarkPushDelivered(ctx context.Context, token string, id int64) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE push_deliveries
+		SET sent_at=now(), claim_token='', claim_until=NULL, last_error=''
+		WHERE id=$1 AND claim_token=$2 AND sent_at IS NULL`, id, token)
+	return err
+}
+
+func (s *Store) MarkPushFailed(ctx context.Context, token string, id int64, retryAt time.Time, message string) error {
+	message = compactAttentionText(message, 300)
+	_, err := s.Pool.Exec(ctx, `UPDATE push_deliveries
+		SET next_attempt_at=$3, claim_token='', claim_until=NULL, last_error=$4
+		WHERE id=$1 AND claim_token=$2 AND sent_at IS NULL`, id, token, retryAt.UTC(), message)
+	return err
+}
+
+func (s *Store) MarkPushAbandoned(ctx context.Context, token string, id int64, message string) error {
+	message = compactAttentionText(message, 300)
+	_, err := s.Pool.Exec(ctx, `UPDATE push_deliveries
+		SET failed_at=now(), claim_token='', claim_until=NULL, last_error=$3
+		WHERE id=$1 AND claim_token=$2 AND sent_at IS NULL AND failed_at IS NULL`, id, token, message)
+	return err
+}
+
+func (s *Store) DisablePushSubscription(ctx context.Context, subscriptionID int64) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE push_subscriptions SET disabled_at=now(), updated_at=now()
+		WHERE id=$1`, subscriptionID)
+	return err
 }
 
 // --- summaries ---

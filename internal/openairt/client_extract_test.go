@@ -41,6 +41,20 @@ func TestExtractFuncCallsRejectsCancelledResponse(t *testing.T) {
 	}
 }
 
+func TestExtractResponseCorrelationFields(t *testing.T) {
+	t.Parallel()
+	ref := ExtractResponseRef(json.RawMessage(`{"response":{"id":"resp-42","metadata":{"thornhill_request_id":"request-7"}}}`))
+	if ref.ID != "resp-42" || ref.RequestID != "request-7" {
+		t.Fatalf("response ref = %+v", ref)
+	}
+	if got := ExtractAudioResponseID(json.RawMessage(`{"response_id":"resp-42"}`)); got != "resp-42" {
+		t.Fatalf("audio response id = %q", got)
+	}
+	if got := ExtractAudioResponseID(json.RawMessage(`{"response":{"id":"wrong-shape"}}`)); got != "" {
+		t.Fatalf("wrong-shaped audio event correlated as %q", got)
+	}
+}
+
 func TestExtractErrorEventIDSupportsNestedAndTopLevelShapes(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	webpush "github.com/SherClockHolmes/webpush-go"
 )
 
 func TestLoadParsesAllowedOrigins(t *testing.T) {
@@ -78,10 +80,62 @@ func TestLoadRejectsUnsafeProviderEndpoints(t *testing.T) {
 
 func TestLoadRejectsNonPositiveApprovalParkingThreshold(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
-	t.Setenv("DATABASE_URL", "postgres://test:test@localhost/test")
+	t.Setenv("DATABASE_URL", "postgres://test:***@localhost/test")
 	t.Setenv("APPROVAL_PARK_AFTER", "0s")
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "APPROVAL_PARK_AFTER") {
 		t.Fatalf("Load() error = %v, want approval parking threshold error", err)
+	}
+}
+
+func TestLoadAcceptsCompleteVAPIDConfiguration(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("DATABASE_URL", "postgres://test:***@localhost/test")
+	privateKey, publicKey, err := webpush.GenerateVAPIDKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PUSH_VAPID_PUBLIC_KEY", publicKey)
+	t.Setenv("PUSH_VAPID_PRIVATE_KEY", privateKey)
+	t.Setenv("PUSH_VAPID_SUBJECT", "mailto:operator@example.test")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PushVAPIDPublicKey != publicKey || cfg.PushVAPIDPrivateKey != privateKey {
+		t.Fatal("VAPID keys were not loaded exactly")
+	}
+}
+
+func TestLoadRejectsPartialOrMalformedVAPIDConfiguration(t *testing.T) {
+	privateKey, publicKey, err := webpush.GenerateVAPIDKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPublicKey, err := webpush.GenerateVAPIDKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		public  string
+		private string
+		subject string
+	}{
+		{name: "partial", public: "only-one-value"},
+		{name: "malformed keys", public: "not-base64", private: "not-base64", subject: "mailto:operator@example.test"},
+		{name: "mismatched key pair", public: otherPublicKey, private: privateKey, subject: "mailto:operator@example.test"},
+		{name: "unsafe subject", public: publicKey, private: privateKey, subject: "javascript:alert(1)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENAI_API_KEY", "test-key")
+			t.Setenv("DATABASE_URL", "postgres://test:***@localhost/test")
+			t.Setenv("PUSH_VAPID_PUBLIC_KEY", tc.public)
+			t.Setenv("PUSH_VAPID_PRIVATE_KEY", tc.private)
+			t.Setenv("PUSH_VAPID_SUBJECT", tc.subject)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "PUSH_VAPID") {
+				t.Fatalf("Load() error = %v, want PUSH_VAPID validation error", err)
+			}
+		})
 	}
 }

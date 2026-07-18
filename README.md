@@ -61,6 +61,47 @@ The production UI is same-origin by default. For Vite development, set
 `ALLOWED_ORIGINS=localhost:5173` (or a similarly narrow explicit origin) in
 `.env`; cross-origin WebSockets and SDP offers are rejected otherwise.
 
+### Installable PWA and Web Push
+
+The production UI includes a manifest and a notification-only service worker, so
+it can be installed as a standalone PWA over HTTPS. Web Push is optional and
+fail-closed: leave all `PUSH_VAPID_*` variables empty to disable it, or configure
+one persistent VAPID pair and contact URI together. Generate a pair once and
+append it to the untracked deployment environment without printing the private
+key to the terminal:
+
+```sh
+umask 077
+go run ./cmd/vapid-keygen -subject mailto:operator@example.com >> .env
+```
+
+Do not regenerate the pair on each deploy: existing browser subscriptions are
+bound to its public key. The public key is intentionally exposed by
+`GET /api/push/config`; the private key remains server-side and must not be
+committed or logged. Startup rejects malformed, partial, or mismatched key
+configuration.
+
+After deployment, open Thornhill over HTTPS and select **Enable alerts**. On
+iPhone/iPad, install the PWA to the Home Screen first; notification permission is
+available only to installed web apps. Subscription endpoints are bearer
+capabilities: Thornhill accepts them only through same-origin browser writes,
+never returns or logs them, rejects non-public destinations, and deletes them on
+explicit unsubscribe. Provider requests bypass environment proxies, do not
+follow redirects, and re-check resolved addresses before dialing. A provider
+`404`/`410` disables the endpoint automatically.
+
+Notifications are deliberately sparse and generic on the lock screen: job
+completion, failure, input, approval, and parked-approval transitions only. Job
+names, prompts, commands, errors, and result text remain inside Thornhill. While
+a live voice session is attached, OS push delivery is suppressed and the durable
+attention item is spoken at the next safe lull. When parked or absent, delivery
+uses a PostgreSQL outbox. Network failures, provider `429`, and `5xx` responses
+retry with bounded backoff for at most six attempts; other permanent responses
+are recorded without retry. A call becoming live cancels an in-flight Push
+attempt and releases the lease. Push is a best-effort attention channel only: it
+never changes job state or grants authority, and unacknowledged
+items remain available for the next spoken resume briefing.
+
 ### CI-proven live revision
 
 Production images embed the full Git commit and expose it at `GET /api/status`.
@@ -165,8 +206,14 @@ Guards include a 2-minute grace
 after a job question is voiced. Mute alone is announce-only mode (the
 desk can still speak); mute+hidden or 10 minutes of mute parks. The
 57-minute rollover (60-minute API cap) parks and auto-redials —
-invisible in practice. A rolling "since you left" digest is folded
-continuously by a cheap model, so resume seeding is one Postgres read.
+invisible in practice. A rolling digest still supplies conversational context,
+but noteworthy transitions also enter an immutable PostgreSQL attention outbox.
+On resume, one Desk instance leases pending items, injects their quoted data as
+untrusted context, and asks the model to brief the operator proactively. Rows are
+acknowledged only after the exact correlated Realtime response reports
+`completed` and its matching output-audio buffer reports started then fully
+stopped. Cleared, interrupted, text-only, failed, stale, and disconnected
+responses leave the durable briefing pending for a later session.
 
 ## Realtime tool protocol
 
@@ -178,8 +225,11 @@ tool continuations are queued until the active response and output audio are
 idle, so only one `response.create` is in flight. Output-audio started/stopped
 events are tracked separately from response completion for interruption and
 parking observability. Response admission and Park are serialized, and every
-`response.create` carries a unique `event_id`; only an error correlated to that
-ID can reconcile the provisional in-flight state.
+`response.create` carries a unique `event_id` echoed into response metadata;
+only an error correlated to that ID can reconcile the provisional in-flight
+state. Output-audio events are additionally fenced by their exact
+`response_id`, preventing stale callbacks from acknowledging a newer spoken
+briefing.
 
 Function calls execute only when both their containing response and output item
 are `completed`; streamed partial arguments never cause side effects. Multiple
@@ -280,9 +330,10 @@ internal/openairt    realtime sideband client (GA event names)
 internal/dispatch    job lifecycle, River queue, stub runner
 internal/bridge      Hermes Runs API + approval broker + hooks receiver
 internal/summarize   rolling debrief
+internal/notify      durable Web Push outbox delivery
 internal/audio       TTS prebake + dynamic speech
 internal/events      in-process bus with replay
-internal/store       Postgres: jobs, event log, summaries, usage
+internal/store       Postgres: jobs, attention, push subscriptions, events
 web/                 Vite + React UI (state ring, board, ticker, earcons)
 docs/vendor/         the exact API docs this code was written against
 ```

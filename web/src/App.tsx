@@ -7,6 +7,13 @@ import {
   type SessionState,
   upsertJobHistory,
 } from "./protocol";
+import {
+  getPushStatus,
+  type PushStatus,
+  pushStatusLabel,
+  subscribePush,
+  unsubscribePush,
+} from "./push";
 
 interface TranscriptLine {
   id: string;
@@ -27,6 +34,8 @@ export default function App() {
   const [ticker, setTicker] = useState<TranscriptLine[]>([]);
   const [notice, setNotice] = useState("");
   const [text, setText] = useState("");
+  const [pushStatus, setPushStatus] = useState<PushStatus>("checking");
+  const [pushBusy, setPushBusy] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const micRef = useRef<MediaStream | null>(null);
@@ -294,6 +303,33 @@ export default function App() {
     };
   }, [handleEvent, pushState, teardownCall]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void getPushStatus(controller.signal)
+      .then(setPushStatus)
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          console.warn("notification status failed", error);
+          setPushStatus("unavailable");
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  const togglePush = useCallback(async () => {
+    if (pushBusy) return;
+    setPushBusy(true);
+    setNotice("");
+    try {
+      setPushStatus(pushStatus === "subscribed" ? await unsubscribePush() : await subscribePush());
+    } catch (error) {
+      console.warn("notification enrollment failed", error);
+      setNotice("Notification enrollment failed. Durable results remain available when you resume.");
+    } finally {
+      setPushBusy(false);
+    }
+  }, [pushBusy, pushStatus]);
+
   const toggleMute = useCallback(() => {
     setMuted((m) => {
       const next = !m;
@@ -382,6 +418,16 @@ export default function App() {
         </button>
         <button type="button" onClick={park} disabled={session === "PARKED" || session === "PARKING"}>
           {session === "PARKING" ? "Parking…" : "Park"}
+        </button>
+        <button
+          type="button"
+          className={pushStatus === "subscribed" ? "alerts-on" : ""}
+          onClick={() => void togglePush()}
+          disabled={pushBusy || pushStatus === "checking" || pushStatus === "unavailable" || pushStatus === "disabled" || pushStatus === "denied"}
+          aria-pressed={pushStatus === "subscribed"}
+          title={pushStatus === "denied" ? "Enable notifications in browser settings" : "Receive privacy-safe alerts while voice is parked"}
+        >
+          {pushBusy ? "Alerts…" : pushStatusLabel(pushStatus)}
         </button>
       </div>
 

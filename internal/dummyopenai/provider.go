@@ -114,8 +114,11 @@ func (p *Provider) sideband(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var head struct {
-			Type    string `json:"type"`
-			EventID string `json:"event_id"`
+			Type     string `json:"type"`
+			EventID  string `json:"event_id"`
+			Response struct {
+				Metadata map[string]string `json:"metadata"`
+			} `json:"response"`
 		}
 		if json.Unmarshal(raw, &head) != nil {
 			_ = writeJSON(ctx, conn, map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "code": "invalid_json", "message": "invalid JSON"}})
@@ -140,13 +143,22 @@ func (p *Provider) sideband(w http.ResponseWriter, r *http.Request) {
 			if idErr != nil {
 				return
 			}
-			if writeJSON(ctx, conn, map[string]any{"type": "response.created", "response": map[string]any{"id": responseID}}) != nil {
+			response := map[string]any{"id": responseID, "metadata": head.Response.Metadata}
+			if writeJSON(ctx, conn, map[string]any{"type": "response.created", "response": response}) != nil {
+				return
+			}
+			if writeJSON(ctx, conn, map[string]any{"type": "output_audio_buffer.started", "response_id": responseID}) != nil {
 				return
 			}
 			if writeJSON(ctx, conn, map[string]any{"type": "response.output_audio_transcript.done", "transcript": "deterministic dummy response"}) != nil {
 				return
 			}
-			_ = writeJSON(ctx, conn, map[string]any{"type": "response.done", "response": map[string]any{"id": responseID, "status": "completed", "usage": map[string]int{"input_tokens": 1, "output_tokens": 1}}})
+			response["status"] = "completed"
+			response["usage"] = map[string]int{"input_tokens": 1, "output_tokens": 1}
+			if writeJSON(ctx, conn, map[string]any{"type": "response.done", "response": response}) != nil {
+				return
+			}
+			_ = writeJSON(ctx, conn, map[string]any{"type": "output_audio_buffer.stopped", "response_id": responseID})
 		case "response.cancel":
 			_ = writeJSON(ctx, conn, map[string]any{"type": "response.done", "response": map[string]any{"status": "cancelled"}})
 		case "conversation.item.create":
