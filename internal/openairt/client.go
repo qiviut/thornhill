@@ -38,6 +38,8 @@ const (
 	EvError                = "error"
 )
 
+const requestMetadataKey = "thornhill_request_id"
+
 // ServerEvent is the loosely-typed envelope; specific fields are pulled out
 // lazily because the GA schema is wide and we only need a corner of it.
 type ServerEvent struct {
@@ -216,6 +218,9 @@ func (c *Client) CreateResponse(ctx context.Context, eventID string) error {
 	return c.send(ctx, map[string]any{
 		"event_id": eventID,
 		"type":     "response.create",
+		"response": map[string]any{
+			"metadata": map[string]string{requestMetadataKey: eventID},
+		},
 	})
 }
 
@@ -238,6 +243,38 @@ func (c *Client) CancelResponse(ctx context.Context) error {
 }
 
 // --- server event field extraction ---
+
+type ResponseRef struct {
+	ID        string
+	RequestID string
+}
+
+// ExtractResponseRef binds response lifecycle events to the client request
+// metadata placed on response.create. Response IDs alone identify subsequent
+// audio events; the metadata prevents a stale response.created event from
+// claiming a newer Thornhill response intent.
+func ExtractResponseRef(raw json.RawMessage) ResponseRef {
+	var body struct {
+		Response struct {
+			ID       string            `json:"id"`
+			Metadata map[string]string `json:"metadata"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return ResponseRef{}
+	}
+	return ResponseRef{ID: body.Response.ID, RequestID: body.Response.Metadata[requestMetadataKey]}
+}
+
+func ExtractAudioResponseID(raw json.RawMessage) string {
+	var body struct {
+		ResponseID string `json:"response_id"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return ""
+	}
+	return body.ResponseID
+}
 
 // ExtractFuncCalls pulls completed function calls out of a response.done
 // event (items of type function_call in response.output), which per

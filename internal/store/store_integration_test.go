@@ -52,7 +52,7 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 	if err := st.Pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&currentSchema); err != nil || currentSchema != expectedSchema {
 		t.Fatalf("current schema=%q want=%q err=%v", currentSchema, expectedSchema, err)
 	}
-	for _, table := range []string{"jobs", "approval_allows", "approval_denials", "deployment_control", "event_log", "summaries", "usage_ledger"} {
+	for _, table := range []string{"jobs", "approval_allows", "approval_denials", "deployment_control", "event_log", "summaries", "usage_ledger", "attention_events", "push_subscriptions", "push_deliveries"} {
 		var exists bool
 		if err := st.Pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil || !exists {
 			t.Fatalf("table %s exists=%v err=%v", table, exists, err)
@@ -230,5 +230,187 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 	}
 	if match, _ := st.MatchesPermanentAllow(ctx, patterns[:1]); match != "" {
 		t.Fatalf("subset unexpectedly matched allow policy: %q", match)
+	}
+}
+
+func TestPostgresAttentionClaimAckAndPushOutbox(t *testing.T) {
+	databaseURL := os.Getenv("THORNHILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THORNHILL_TEST_DATABASE_URL is required")
+	}
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := Open(ctx, databaseURL, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Pool.Close()
+	// Other integration cases intentionally create terminal jobs. Isolate this
+	// state-machine check from their pending operator-attention rows.
+	if _, err := st.Pool.Exec(ctx, `UPDATE attention_events SET spoken_at=now(), claim_token='', claim_until=NULL WHERE spoken_at IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+
+	job, err := st.CreateJob(ctx, randomTestValue(t, "attention_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = st.UpdateJob(ctx, job.ID, func(j *Job) { j.Status = StatusRunning })
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = st.UpdateJob(ctx, job.ID, func(j *Job) {
+		j.Status = StatusDone
+		j.ResultDigest = "sensitive integration result"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.StateVersion != 2 {
+		t.Fatalf("state version=%d want=2", job.StateVersion)
+	}
+	var attentionCount int
+	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FROM attention_events WHERE job_id=$1`, job.ID).Scan(&attentionCount); err != nil || attentionCount != 1 {
+		t.Fatalf("attention count=%d err=%v", attentionCount, err)
+	}
+
+	first, err := st.ClaimPendingAttention(ctx, "desk-one", 20, time.Minute)
+	if err != nil || len(first) != 1 || first[0].JobID != job.ID {
+		t.Fatalf("first claim=%+v err=%v", first, err)
+	}
+	second, err := st.ClaimPendingAttention(ctx, "desk-two", 20, time.Minute)
+	if err != nil || len(second) != 0 {
+		t.Fatalf("competing claim=%+v err=%v", second, err)
+	}
+	if marked, err := st.MarkAttentionSpoken(ctx, "desk-two", []int64{first[0].ID}); err != nil || marked != 0 {
+		t.Fatalf("stale ack marked=%d err=%v", marked, err)
+	}
+	if err := st.ReleaseAttentionClaim(ctx, "desk-one"); err != nil {
+		t.Fatal(err)
+	}
+	second, err = st.ClaimPendingAttention(ctx, "desk-two", 20, time.Minute)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("released retry claim=%+v err=%v", second, err)
+	}
+	if marked, err := st.MarkAttentionSpoken(ctx, "desk-two", []int64{second[0].ID}); err != nil || marked != 1 {
+		t.Fatalf("audible ack marked=%d err=%v", marked, err)
+	}
+
+	subscription := PushSubscription{
+		Endpoint: "https://push.example.test/" + randomTestValue(t, "cap_", 24),
+		P256DH:   randomTestValue(t, "key_", 32), Auth: randomTestValue(t, "auth_", 16),
+	}
+	if err := st.UpsertPushSubscription(ctx, subscription); err != nil {
+		t.Fatal(err)
+	}
+	pushJob, err := st.CreateJob(ctx, randomTestValue(t, "push_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateJob(ctx, pushJob.ID, func(j *Job) { j.Status = StatusFailed }); err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := st.ClaimPushDeliveries(ctx, "push-one", 20, time.Minute)
+	if err != nil || len(deliveries) != 1 || deliveries[0].Endpoint != subscription.Endpoint {
+		t.Fatalf("push claim=%+v err=%v", deliveries, err)
+	}
+	if duplicate, err := st.ClaimPushDeliveries(ctx, "push-two", 20, time.Minute); err != nil || len(duplicate) != 0 {
+		t.Fatalf("duplicate push claim=%+v err=%v", duplicate, err)
+	}
+	retryAt := time.Now().UTC().Add(time.Minute)
+	if err := st.MarkPushFailed(ctx, "push-one", deliveries[0].ID, retryAt, "transient"); err != nil {
+		t.Fatal(err)
+	}
+	if retry, err := st.ClaimPushDeliveries(ctx, "push-two", 20, time.Minute); err != nil || len(retry) != 0 {
+		t.Fatalf("premature retry=%+v err=%v", retry, err)
+	}
+	if _, err := st.Pool.Exec(ctx, `UPDATE push_deliveries SET next_attempt_at=now() WHERE id=$1`, deliveries[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := st.ClaimPushDeliveries(ctx, "push-two", 20, time.Minute)
+	if err != nil || len(retry) != 1 || retry[0].Attempts < 2 {
+		t.Fatalf("retry claim=%+v err=%v", retry, err)
+	}
+	if err := st.MarkPushDelivered(ctx, "push-two", retry[0].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	abandonedJob, err := st.CreateJob(ctx, randomTestValue(t, "abandoned_push_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateJob(ctx, abandonedJob.ID, func(j *Job) { j.Status = StatusFailed }); err != nil {
+		t.Fatal(err)
+	}
+	abandoned, err := st.ClaimPushDeliveries(ctx, "push-abandoned", 20, time.Minute)
+	if err != nil || len(abandoned) != 1 {
+		t.Fatalf("abandoned push claim=%+v err=%v", abandoned, err)
+	}
+	if err := st.MarkPushAbandoned(ctx, "push-abandoned", abandoned[0].ID, "permanent rejection"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `UPDATE push_deliveries SET next_attempt_at=now() WHERE id=$1`, abandoned[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if replay, err := st.ClaimPushDeliveries(ctx, "push-after-abandon", 20, time.Minute); err != nil || len(replay) != 0 {
+		t.Fatalf("abandoned delivery replay=%+v err=%v", replay, err)
+	}
+	var terminalFailure bool
+	if err := st.Pool.QueryRow(ctx, `SELECT failed_at IS NOT NULL AND last_error <> '' FROM push_deliveries WHERE id=$1`, abandoned[0].ID).Scan(&terminalFailure); err != nil || !terminalFailure {
+		t.Fatalf("terminal push failure recorded=%v err=%v", terminalFailure, err)
+	}
+
+	if err := st.DeletePushSubscription(ctx, subscription.Endpoint); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FROM push_subscriptions WHERE endpoint=$1`, subscription.Endpoint).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("unsubscribed rows=%d err=%v", remaining, err)
+	}
+
+	// Endpoint revocation reported by the push provider keeps a disabled audit
+	// row, unlike an explicit operator unsubscribe.
+	if err := st.UpsertPushSubscription(ctx, subscription); err != nil {
+		t.Fatal(err)
+	}
+	var subscriptionID int64
+	if err := st.Pool.QueryRow(ctx, `SELECT id FROM push_subscriptions WHERE endpoint=$1`, subscription.Endpoint).Scan(&subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DisablePushSubscription(ctx, subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	var disabled bool
+	if err := st.Pool.QueryRow(ctx, `SELECT disabled_at IS NOT NULL FROM push_subscriptions WHERE id=$1`, subscriptionID).Scan(&disabled); err != nil || !disabled {
+		t.Fatalf("subscription disabled=%v err=%v", disabled, err)
+	}
+
+	// A revoked endpoint can have an unsent delivery from just before the
+	// provider response. Re-enrollment starts a fresh epoch and must not replay it.
+	if err := st.UpsertPushSubscription(ctx, subscription); err != nil {
+		t.Fatal(err)
+	}
+	staleJob, err := st.CreateJob(ctx, randomTestValue(t, "stale_push_", 24), randomTestValue(t, "task_", 48))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateJob(ctx, staleJob.ID, func(j *Job) { j.Status = StatusFailed }); err != nil {
+		t.Fatal(err)
+	}
+	staleDeliveries, err := st.ClaimPushDeliveries(ctx, "push-stale", 20, time.Minute)
+	if err != nil || len(staleDeliveries) != 1 {
+		t.Fatalf("stale delivery materialization=%+v err=%v", staleDeliveries, err)
+	}
+	if err := st.ReleasePushClaim(ctx, "push-stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DisablePushSubscription(ctx, subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPushSubscription(ctx, subscription); err != nil {
+		t.Fatal(err)
+	}
+	if replay, err := st.ClaimPushDeliveries(ctx, "push-reactivated", 20, time.Minute); err != nil || len(replay) != 0 {
+		t.Fatalf("reactivation replay=%+v err=%v", replay, err)
 	}
 }

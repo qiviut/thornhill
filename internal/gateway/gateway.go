@@ -7,12 +7,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ecdh"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -27,6 +30,8 @@ import (
 	"thornhill/internal/config"
 	"thornhill/internal/desk"
 	"thornhill/internal/events"
+	"thornhill/internal/notify"
+	"thornhill/internal/store"
 )
 
 // Store is the slice of the persistence layer the gateway (and the desks
@@ -34,6 +39,11 @@ import (
 type Store interface {
 	desk.Summaries
 	UsageTodayUSD(ctx context.Context) (float64, error)
+}
+
+type pushStore interface {
+	UpsertPushSubscription(ctx context.Context, sub store.PushSubscription) error
+	DeletePushSubscription(ctx context.Context, endpoint string) error
 }
 
 type Gateway struct {
@@ -96,6 +106,9 @@ func (g *Gateway) originAllowed(r *http.Request) bool {
 func (g *Gateway) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", g.handleStatus)
+	mux.HandleFunc("GET /api/push/config", g.handlePushConfig)
+	mux.HandleFunc("POST /api/push/subscriptions", g.handlePushSubscription)
+	mux.HandleFunc("DELETE /api/push/subscriptions", g.handlePushSubscription)
 	mux.HandleFunc("POST /offer", g.handleOffer)
 	mux.HandleFunc("GET /ws", g.handleWS)
 	mux.HandleFunc("GET /events", g.handleSSE)
@@ -222,6 +235,117 @@ func (g *Gateway) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}); err != nil {
 		g.Log.Error("write status", "err", err)
 	}
+}
+
+type pushSubscriptionRequest struct {
+	Endpoint string `json:"endpoint"`
+	Keys     struct {
+		P256DH string `json:"p256dh"`
+		Auth   string `json:"auth"`
+	} `json:"keys"`
+}
+
+func (g *Gateway) handlePushConfig(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	enabled := g.Cfg != nil && g.Cfg.PushVAPIDPublicKey != "" && g.Cfg.PushVAPIDPrivateKey != ""
+	publicKey := ""
+	if enabled {
+		publicKey = g.Cfg.PushVAPIDPublicKey
+	}
+	if err := json.NewEncoder(w).Encode(map[string]any{"enabled": enabled, "public_key": publicKey}); err != nil {
+		g.Log.Error("write push config", "err", err)
+	}
+}
+
+func (g *Gateway) handlePushSubscription(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") == "" || !g.originAllowed(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+	st, ok := g.Store.(pushStore)
+	if !ok {
+		http.Error(w, "push storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method != http.MethodDelete && (g.Cfg == nil || g.Cfg.PushVAPIDPublicKey == "" || g.Cfg.PushVAPIDPrivateKey == "") {
+		http.Error(w, "push notifications are disabled", http.StatusServiceUnavailable)
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input pushSubscriptionRequest
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid push subscription", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid push subscription", http.StatusBadRequest)
+		return
+	}
+	if err := validatePushEndpoint(input.Endpoint); err != nil {
+		http.Error(w, "invalid push subscription endpoint", http.StatusBadRequest)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if err := st.DeletePushSubscription(r.Context(), input.Endpoint); err != nil {
+			g.Log.Warn("push subscription delete failed", "err", err)
+			http.Error(w, "subscription storage failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := validatePushKeys(input.Keys.P256DH, input.Keys.Auth); err != nil {
+		http.Error(w, "invalid push subscription keys", http.StatusBadRequest)
+		return
+	}
+	if err := st.UpsertPushSubscription(r.Context(), store.PushSubscription{
+		Endpoint: input.Endpoint, P256DH: input.Keys.P256DH, Auth: input.Keys.Auth,
+	}); err != nil {
+		g.Log.Warn("push subscription store failed", "err", err)
+		http.Error(w, "subscription storage failed", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func validatePushEndpoint(raw string) error {
+	if len(raw) == 0 || len(raw) > 4096 {
+		return errors.New("endpoint length")
+	}
+	endpoint, err := url.Parse(raw)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.Fragment != "" {
+		return errors.New("endpoint must be an absolute HTTPS URL without userinfo or fragment")
+	}
+	host := strings.TrimSuffix(strings.ToLower(endpoint.Hostname()), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return errors.New("endpoint host must be public")
+	}
+	if ip := net.ParseIP(host); ip != nil && !notify.IsPublicPushIP(ip) {
+		return errors.New("endpoint address must be public")
+	}
+	return nil
+}
+
+func validatePushKeys(p256dh, auth string) error {
+	public, err := base64.RawURLEncoding.DecodeString(p256dh)
+	if err != nil {
+		return err
+	}
+	if _, err := ecdh.P256().NewPublicKey(public); err != nil {
+		return err
+	}
+	authSecret, err := base64.RawURLEncoding.DecodeString(auth)
+	if err != nil {
+		return err
+	}
+	if len(authSecret) != 16 {
+		return errors.New("auth secret must be 16 bytes")
+	}
+	return nil
 }
 
 func withLogging(next http.Handler, log *slog.Logger) http.Handler {

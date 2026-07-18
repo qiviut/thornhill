@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Thornhill">
+  <rect width="512" height="512" rx="96" fill="#10151d"/>
+  <circle cx="256" cy="256" r="164" fill="#161d28" stroke="#e0a458" stroke-width="18"/>
+  <path d="M151 173h210M256 173v184" fill="none" stroke="#e8e4da" stroke-width="36" stroke-linecap="round"/>
+  <circle cx="256" cy="357" r="18" fill="#e0a458"/>
+</svg>

@@ -21,6 +21,7 @@ import (
 	"thornhill/internal/dispatch"
 	"thornhill/internal/events"
 	"thornhill/internal/gateway"
+	"thornhill/internal/notify"
 	"thornhill/internal/store"
 	"thornhill/internal/summarize"
 )
@@ -108,6 +109,28 @@ func main() {
 
 	summ := summarize.New(cfg.OpenAIKey, cfg.OpenAIBaseURL, cfg.SummaryModel, st, bus, log.With("comp", "summarize"))
 	go summ.Run(ctx)
+
+	if cfg.PushVAPIDPublicKey != "" {
+		pushSender := &notify.WebPushSender{
+			PublicKey: cfg.PushVAPIDPublicKey, PrivateKey: cfg.PushVAPIDPrivateKey, Subject: cfg.PushVAPIDSubject,
+		}
+		pushWorker := notify.New(st, bus, pushSender, log.With("comp", "push"))
+		pushCtx, stopPush := context.WithCancel(ctx)
+		pushDone := make(chan struct{})
+		go func() {
+			defer close(pushDone)
+			pushWorker.Run(pushCtx)
+		}()
+		defer func() {
+			stopPush()
+			select {
+			case <-pushDone:
+			case <-time.After(3 * time.Second):
+				log.Warn("push worker shutdown timed out")
+			}
+		}()
+		log.Info("web push active")
+	}
 
 	tts := audio.New(cfg.OpenAIKey, cfg.OpenAIBaseURL, cfg.TTSModel, cfg.TTSVoice, cfg.PrebakeDir, log.With("comp", "tts"))
 	go tts.Prebake(ctx)

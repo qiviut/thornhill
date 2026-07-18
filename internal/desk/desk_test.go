@@ -137,6 +137,38 @@ func (r *recordingRealtime) CreateResponse(_ context.Context, eventID string) er
 }
 func (r *recordingRealtime) CancelResponse(context.Context) error { return nil }
 
+type attentionTestStore struct {
+	claimed      []store.Attention
+	acknowledged []int64
+	released     bool
+	summary      string
+	summarySaved int
+}
+
+func (s *attentionTestStore) GetSummary(context.Context, string) (string, time.Time, error) {
+	return s.summary, time.Unix(1_700_000_000, 0), nil
+}
+func (s *attentionTestStore) SaveSummary(context.Context, string, string) error {
+	s.summarySaved++
+	return nil
+}
+func (*attentionTestStore) AddUsage(context.Context, string, int64, int64, float64) error {
+	return nil
+}
+func (s *attentionTestStore) ClaimPendingAttention(context.Context, string, int, time.Duration) ([]store.Attention, error) {
+	items := s.claimed
+	s.claimed = nil
+	return items, nil
+}
+func (s *attentionTestStore) ReleaseAttentionClaim(context.Context, string) error {
+	s.released = true
+	return nil
+}
+func (s *attentionTestStore) MarkAttentionSpoken(_ context.Context, _ string, ids []int64) (int64, error) {
+	s.acknowledged = append(s.acknowledged, ids...)
+	return int64(len(ids)), nil
+}
+
 func testDesk(t *testing.T, client realtimeClient) *Desk {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -149,6 +181,131 @@ func testDesk(t *testing.T, client realtimeClient) *Desk {
 	d.fsm.CallStarted(time.Now())
 	return d
 }
+
+func TestDurableAttentionAcknowledgesOnlyAfterCompletedOutputAudio(t *testing.T) {
+	client := &recordingRealtime{}
+	d := testDesk(t, client)
+	st := &attentionTestStore{}
+	d.Store = st
+	inj, ok := d.attentionBriefing([]store.Attention{{ID: 7, SpeechText: "Job quoted-data finished."}})
+	if !ok || !inj.respond || !reflect.DeepEqual(inj.attention, []int64{7}) ||
+		!strings.Contains(inj.text, "untrusted job data") {
+		t.Fatalf("briefing injection = %+v, ok=%v", inj, ok)
+	}
+	if err := d.doInject(context.Background(), inj); err != nil {
+		t.Fatal(err)
+	}
+	pendingQuestion := false
+	requestID := client.createEventIDs[0]
+	created := json.RawMessage(fmt.Sprintf(`{"type":"response.created","response":{"id":"resp-brief","metadata":{"thornhill_request_id":%q}}}`, requestID))
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: created}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	audio := json.RawMessage(`{"response_id":"resp-brief"}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: audio}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	done := json.RawMessage(`{"type":"response.done","response":{"id":"resp-brief","status":"completed","output":[]}}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.acknowledged) != 0 {
+		t.Fatalf("response completion acknowledged before output drain: %v", st.acknowledged)
+	}
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStopped, Raw: audio}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(st.acknowledged, []int64{7}) || len(d.responseAttention) != 0 {
+		t.Fatalf("acknowledged=%v pending=%v", st.acknowledged, d.responseAttention)
+	}
+}
+
+func TestStaleResponseCallbacksCannotAcknowledgeAttention(t *testing.T) {
+	client := &recordingRealtime{}
+	d := testDesk(t, client)
+	st := &attentionTestStore{}
+	d.Store = st
+	inj, _ := d.attentionBriefing([]store.Attention{{ID: 8, SpeechText: "pending"}})
+	if err := d.doInject(context.Background(), inj); err != nil {
+		t.Fatal(err)
+	}
+	pendingQuestion := false
+	created := json.RawMessage(fmt.Sprintf(`{"response":{"id":"resp-current","metadata":{"thornhill_request_id":%q}}}`, client.createEventIDs[0]))
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: created}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	staleAudio := json.RawMessage(`{"response_id":"resp-stale"}`)
+	staleDone := json.RawMessage(`{"response":{"id":"resp-stale","status":"completed"}}`)
+	for _, event := range []openairt.ServerEvent{
+		{Type: openairt.EvOutputAudioStarted, Raw: staleAudio},
+		{Type: openairt.EvResponseDone, Raw: staleDone},
+		{Type: openairt.EvOutputAudioStopped, Raw: staleAudio},
+	} {
+		if err := d.handleServer(context.Background(), event, &pendingQuestion); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(st.acknowledged) != 0 {
+		t.Fatalf("stale response acknowledged attention: %v", st.acknowledged)
+	}
+}
+
+func TestClearedOrTextOnlyAttentionRemainsPending(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cleared bool
+	}{
+		{name: "cleared audio", cleared: true},
+		{name: "text only"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &recordingRealtime{}
+			d := testDesk(t, client)
+			st := &attentionTestStore{}
+			d.Store = st
+			inj, _ := d.attentionBriefing([]store.Attention{{ID: 9, SpeechText: "pending"}})
+			if err := d.doInject(context.Background(), inj); err != nil {
+				t.Fatal(err)
+			}
+			pendingQuestion := false
+			created := json.RawMessage(fmt.Sprintf(`{"response":{"id":"resp-pending","metadata":{"thornhill_request_id":%q}}}`, client.createEventIDs[0]))
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: created}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if tc.cleared {
+				audio := json.RawMessage(`{"response_id":"resp-pending"}`)
+				if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: audio}, &pendingQuestion); err != nil {
+					t.Fatal(err)
+				}
+				if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioCleared, Raw: audio}, &pendingQuestion); err != nil {
+					t.Fatal(err)
+				}
+			}
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if len(st.acknowledged) != 0 {
+				t.Fatalf("inaudible briefing acknowledged: %v", st.acknowledged)
+			}
+		})
+	}
+}
+
+func TestBuildingInstructionsDoesNotConsumeDebrief(t *testing.T) {
+	d := testDesk(t, &recordingRealtime{})
+	st := &attentionTestStore{summary: "a durable completion"}
+	d.Store = st
+	d.Dispatcher = &emptyDispatcher{}
+	instructions := d.buildInstructions(context.Background())
+	if !strings.Contains(instructions, "a durable completion") || st.summarySaved != 0 {
+		t.Fatalf("instructions=%q summary saves=%d", instructions, st.summarySaved)
+	}
+}
+
+type emptyDispatcher struct{ Dispatcher }
+
+func (*emptyDispatcher) Active(context.Context) ([]store.Job, error) { return nil, nil }
 
 func TestResponseDoneBatchesToolOutputsBeforeSingleContinuation(t *testing.T) {
 	t.Parallel()

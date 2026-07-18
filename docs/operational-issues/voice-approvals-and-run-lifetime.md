@@ -208,6 +208,33 @@ outcome. If queue submission fails, a parked job rolls back to
 `parked_approval` with its evidence intact rather than becoming an opaque failed
 job.
 
+## Durable attention across parked sessions
+
+The rolling summary is context, not an acknowledgment ledger. Every transition
+to `done`, `failed`, `needs_input`, `needs_approval`, or `parked_approval` inserts
+an immutable attention row in the same PostgreSQL transaction as the job update.
+A unique `(job_id, state_version, kind)` key makes replay idempotent.
+
+On call start, one Desk instance leases unspoken rows with `SKIP LOCKED`, injects
+their text under an explicit quoted/untrusted-data envelope, and asks the model
+to brief the operator. The `response.create` client event ID is copied into
+Realtime response metadata. A row becomes spoken only when that exact response
+is `completed` and its exact `response_id` has both started and fully drained
+audio. Interruption, buffer clear, text-only output, disconnect, error, or stale
+callbacks preserve the row for a later call.
+
+Optional Web Push consumes the same attention rows through a separate durable
+outbox. Delivery is suppressed while the voice desk is live; a transition to
+live cancels an in-flight provider request and releases its database lease.
+Parked/absent sessions retry network failures, `429`, and `5xx` responses with
+bounded backoff for at most six attempts. Other permanent responses are recorded
+as terminal failures. Push titles and bodies are generic, subscription endpoints
+are write-only bearer capabilities, and notification egress resolves and dials
+only public addresses without proxies or redirects. Notifications never grant
+authority or mutate jobs. Explicit unsubscribe deletes the endpoint before
+removing the browser capability; provider `404`/`410` revocation retains only a
+disabled audit row.
+
 ## Known limits
 
 - There is no byte-for-byte media continuation after WebRTC teardown.
@@ -220,6 +247,9 @@ job.
   acceptance prove otherwise.
 - UI component expiry is platform behavior, not consent expiry; operators may
   need to use a text command after a button is disabled.
+- Web Push delivery is platform/provider best effort, not a completion receipt.
+  iOS/iPadOS requires a Home Screen-installed PWA before permission can be
+  requested; voice resume remains the durable fallback.
 
 ## Validation procedure
 
