@@ -49,10 +49,12 @@ Thornhill's Desk is the only component that emits `response.create`.
   Each `response.create` carries a unique client `event_id`. Only an asynchronous
   error naming that exact ID reconciles its provisional in-flight state, so an
   unrelated rejected session or conversation event cannot cause a duplicate
-  response; correlated rejection cannot wedge the session or Park lifecycle.
-  The returned response ID then gates `response.done` and output-audio lifecycle
-  changes; stale or unrelated callbacks cannot clear the active turn, admit a
-  competing response, or acknowledge durable attention.
+  response. A matching rejection clears only that provisional request and
+  preserves the exact durable-attention retry; an uncorrelated duplicate-active
+  error is ignored instead of inventing an untrackable busy response. The returned
+  response ID then gates `response.done` and output-audio lifecycle changes; stale
+  or unrelated callbacks cannot clear the active turn, admit a competing response,
+  or acknowledge durable attention.
 - Function calls execute only when the containing response and the individual
   function-call item are both `completed`. Streamed or cancelled partial calls
   cannot cause side effects. Completed batches execute concurrently off the

@@ -124,13 +124,11 @@ func canonicalBrowserOrigin(origin string) (string, string, bool) {
 }
 
 func canonicalRequestOrigin(r *http.Request) (string, bool) {
-	scheme := strings.ToLower(r.URL.Scheme)
+	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	} else if forwarded := trustedForwardedProto(r); forwarded != "" {
 		scheme = forwarded
-	} else if scheme == "" {
-		scheme = "http"
 	}
 	return canonicalHTTPOrigin(scheme, r.Host)
 }

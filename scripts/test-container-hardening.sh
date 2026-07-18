@@ -176,6 +176,7 @@ db_logs=$(docker logs "$db" 2>&1)
 # root-owned tini shim cannot forward signals with all capabilities dropped, so
 # the deployer must invoke pg_ctl as PostgreSQL's UID before recreation.
 docker run --init --detach --name "$legacy_db" --network "$network" \
+  --restart unless-stopped \
   --env POSTGRES_USER=thornhill \
   --env POSTGRES_PASSWORD=thornhill-test-only \
   --env POSTGRES_DB=thornhill \
@@ -200,10 +201,18 @@ for _ in {1..60}; do
 done
 legacy_postgres_ready || fail_with_logs 'Legacy init-shim PostgreSQL did not become ready'
 [[ "$(docker exec "$legacy_db" stat -c %u /proc/1)" == 0 ]] || fail_with_logs 'Legacy qualification container did not run a root-owned init shim'
+[[ "$(docker inspect "$legacy_db" --format '{{.HostConfig.RestartPolicy.Name}}')" == unless-stopped ]] || \
+  fail_with_logs 'Legacy qualification container did not carry the persisted restart policy'
+docker update --restart=no "$legacy_db" >/dev/null
 docker exec --detach --user 70:70 "$legacy_db" sh -ec \
   'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
 legacy_exit=$(timeout 35s docker wait "$legacy_db")
 [[ "$legacy_exit" == 0 ]] || fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not exit cleanly'
+[[ "$(docker inspect "$legacy_db" --format '{{.State.Running}}')" == false &&
+  "$(docker inspect "$legacy_db" --format '{{.State.Restarting}}')" == false &&
+  "$(docker inspect "$legacy_db" --format '{{.State.ExitCode}}')" == 0 &&
+  "$(docker inspect "$legacy_db" --format '{{.HostConfig.RestartPolicy.Name}}')" == no ]] || \
+  fail_with_logs 'Legacy PostgreSQL restarted or did not remain cleanly stopped'
 legacy_logs=$(docker logs "$legacy_db" 2>&1)
 [[ "$legacy_logs" == *'database system is shut down'* && "$legacy_logs" != *'database system was not properly shut down'* ]] || \
   fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not checkpoint cleanly'

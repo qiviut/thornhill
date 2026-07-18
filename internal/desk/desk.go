@@ -598,17 +598,24 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		msg := openairt.ExtractError(ev.Raw)
 		errorEventID := openairt.ExtractErrorEventID(ev.Raw)
 		matchesPendingCreate := d.responseCreateEventID != "" && errorEventID == d.responseCreateEventID
-		if matchesPendingCreate && errorEventID == d.attentionRequestID {
+		rejectedAttention := matchesPendingCreate && errorEventID == d.attentionRequestID
+		if rejectedAttention {
 			d.requeueResponseAttention()
 		}
 		if openairt.ExtractErrorCode(ev.Raw) == "conversation_already_has_active_response" {
-			// Preserve the active turn and avoid an audible error loop, which
-			// would itself attempt another response.create.
-			if matchesPendingCreate {
-				d.responseCreateEventID = ""
+			if !matchesPendingCreate {
+				d.Log.Debug("stale duplicate-active realtime error ignored", "err", msg)
+				return nil
 			}
-			d.fsm.ResponseStarted(now)
-			d.Log.Warn("duplicate realtime response request suppressed", "err", msg)
+			// This create was rejected, so no correlated response ID can follow.
+			// Clear only its provisional state; attention was requeued above and
+			// will be retried at the next safe lull.
+			d.responseCreateEventID = ""
+			d.fsm.ResponseDone(now)
+			if !rejectedAttention {
+				d.pendingContinuation = true
+			}
+			d.Log.Warn("duplicate realtime response request rejected", "err", msg)
 			d.Bus.Publish(events.KindErrorVoice, "", map[string]string{"message": msg, "status": "suppressed"})
 			return nil
 		}
@@ -618,7 +625,9 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 			// provisional busy state; unrelated asynchronous errors cannot.
 			d.responseCreateEventID = ""
 			d.fsm.ResponseDone(now)
-			d.pendingContinuation = true
+			if !rejectedAttention {
+				d.pendingContinuation = true
+			}
 		}
 		d.Log.Warn("realtime error event", "err", msg)
 		d.Bus.Publish(events.KindErrorVoice, "", map[string]string{"message": msg})

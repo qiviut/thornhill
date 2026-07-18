@@ -180,7 +180,9 @@ stop_database_cleanly() {
     [[ $(docker inspect "${container}" --format '{{.State.Running}}') != true ]]; then
     return 0
   fi
-  pid1_uid=$(docker exec "${container}" stat -c %u /proc/1)
+  if ! pid1_uid=$(docker exec "${container}" stat -c %u /proc/1); then
+    return 1
+  fi
   if [[ "${pid1_uid}" == 70 ]]; then
     "${compose[@]}" stop --timeout 30 db
     return
@@ -190,10 +192,23 @@ stop_database_cleanly() {
   # capabilities dropped, that shim cannot signal UID-70 PostgreSQL. Ask
   # PostgreSQL itself to checkpoint and stop as its owning user instead.
   echo "Stopping legacy PostgreSQL PID 1 (uid=${pid1_uid}) through pg_ctl"
-  docker exec --detach --user 70:70 "${container}" \
-    sh -ec 'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
-  exit_code=$(timeout 35s docker wait "${container}")
-  [[ "${exit_code}" == 0 ]]
+  # The persisted legacy service used unless-stopped. Disable automatic restart
+  # before pg_ctl so docker wait cannot observe a transient clean exit followed
+  # by the same unsafe root-init container restarting behind the deployer.
+  if ! docker update --restart=no "${container}" >/dev/null; then
+    return 1
+  fi
+  if ! docker exec --detach --user 70:70 "${container}" \
+    sh -ec 'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'; then
+    return 1
+  fi
+  if ! exit_code=$(timeout 35s docker wait "${container}"); then
+    return 1
+  fi
+  [[ "${exit_code}" == 0 &&
+    $(docker inspect "${container}" --format '{{.State.Running}}') == false &&
+    $(docker inspect "${container}" --format '{{.State.Restarting}}') == false &&
+    $(docker inspect "${container}" --format '{{.State.ExitCode}}') == 0 ]]
 }
 
 cleanup_worktrees() {
@@ -208,14 +223,22 @@ cleanup_worktrees() {
 }
 
 rollback() {
-  local rollback_ok=false deadline
+  local rollback_ok=false database_stopped=false deadline
   if [[ "${deployed}" == true && -n "${previous_image}" && -n "${previous_db_image}" && ${#previous_compose[@]} -gt 0 ]]; then
     echo "${stage} failed; rolling back to ${previous_revision} (${previous_image}, ${previous_db_image})" >&2
     # Stop the application before PostgreSQL so the database can checkpoint and
     # exit cleanly even when the failed stack still owns pooled connections.
-    "${compose[@]}" stop --timeout 30 app >/dev/null 2>&1 || true
-    stop_database_cleanly >/dev/null 2>&1 || true
-    if THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
+    if "${compose[@]}" stop --timeout 30 app >/dev/null 2>&1; then
+      if stop_database_cleanly >/dev/null 2>&1; then
+        database_stopped=true
+      else
+        echo "CRITICAL: refusing rollback recreation after unverified database shutdown" >&2
+      fi
+    else
+      echo "CRITICAL: refusing rollback recreation because the application did not stop cleanly" >&2
+    fi
+    if [[ "${database_stopped}" == true ]] && \
+      THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
       "${previous_compose[@]}" up -d --no-build --force-recreate db app >/dev/null; then
       deadline=$((SECONDS + TIMEOUT_SECONDS))
       while (( SECONDS < deadline )); do

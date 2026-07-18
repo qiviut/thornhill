@@ -85,10 +85,11 @@ After deployment, open Thornhill over HTTPS and select **Enable alerts**. On
 iPhone/iPad, install the PWA to the Home Screen first; notification permission is
 available only to installed web apps. Subscription endpoints are bearer
 capabilities: Thornhill accepts them only through browser writes whose canonical
-scheme and host exactly match the trusted external request origin; proxy scheme
-metadata is honored only from the loopback Tailscale Serve hop. Thornhill never
-returns or logs the capability, rejects non-public destinations, and deletes it
-on explicit unsubscribe. Provider requests bypass environment proxies, do not
+scheme and host exactly match the trusted external request origin; the transport
+scheme comes only from TLS or the loopback Tailscale Serve hop, never a client's
+absolute-form URL or remote proxy header. Thornhill never returns or logs the
+capability, rejects non-public destinations, and deletes it on explicit
+unsubscribe. Provider requests bypass environment proxies, do not
 follow redirects, and re-check resolved addresses before dialing. A provider
 `404`/`410` disables the endpoint automatically.
 
@@ -129,8 +130,10 @@ services. PostgreSQL receives its fast clean-shutdown signal (`SIGINT`) with a
 connections cannot turn a routine replacement into crash recovery. PostgreSQL
 runs directly as PID 1 so the signal reaches its UID-70 process without granting
 `CAP_KILL` to a root-owned init shim. On the one-time upgrade from the former
-shim model, the controller first asks PostgreSQL to checkpoint and stop through
-`pg_ctl` running as UID 70. The controller then verifies the local and Tailnet
+shim model, the controller disables its persisted automatic-restart policy,
+asks PostgreSQL to checkpoint and stop through `pg_ctl` running as UID 70, and
+verifies that it remains cleanly stopped before recreation. Rollback also refuses
+to recreate PostgreSQL unless clean shutdown was verified. The controller then
 UI, status endpoint, OCI label, binary revision, and database runtime. Failed
 verification restores the prior revision's image **and Compose model**; the bad
 SHA is quarantined instead of being retried. During active development the timer

@@ -515,7 +515,7 @@ func TestSpeechEventsRemainObservableWhileToolBatchRuns(t *testing.T) {
 	}
 }
 
-func TestDuplicateActiveResponseErrorDoesNotQueueAudibleLoop(t *testing.T) {
+func TestUncorrelatedDuplicateActiveResponseErrorCannotMutateLifecycle(t *testing.T) {
 	t.Parallel()
 	client := &recordingRealtime{}
 	d := testDesk(t, client)
@@ -527,8 +527,35 @@ func TestDuplicateActiveResponseErrorDoesNotQueueAudibleLoop(t *testing.T) {
 	if len(d.inject) != 0 {
 		t.Fatal("duplicate-active error must not queue another spoken response")
 	}
-	if !d.fsm.Busy() {
-		t.Fatal("known active response must remain represented as busy")
+	if d.fsm.Busy() || d.activeResponseID != "" || d.responseCreateEventID != "" {
+		t.Fatalf("uncorrelated error mutated lifecycle: busy=%v active=%q request=%q", d.fsm.Busy(), d.activeResponseID, d.responseCreateEventID)
+	}
+}
+
+func TestCorrelatedDuplicateActiveAttentionErrorRequeuesAndReleasesAdmission(t *testing.T) {
+	t.Parallel()
+	client := &recordingRealtime{}
+	d := testDesk(t, client)
+	inj, _ := d.attentionBriefing([]store.Attention{{ID: 11, SpeechText: "pending"}})
+	if err := d.doInject(context.Background(), inj); err != nil {
+		t.Fatal(err)
+	}
+	requestID := client.createEventIDs[0]
+	pendingQuestion := false
+	raw := json.RawMessage(fmt.Sprintf(`{"type":"error","error":{"type":"invalid_request_error","code":"conversation_already_has_active_response","event_id":%q,"message":"already active"}}`, requestID))
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvError, Raw: raw}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if d.fsm.Busy() || d.activeResponseID != "" || d.responseCreateEventID != "" || d.pendingContinuation {
+		t.Fatalf("correlated rejection stranded lifecycle: busy=%v active=%q request=%q continuation=%v", d.fsm.Busy(), d.activeResponseID, d.responseCreateEventID, d.pendingContinuation)
+	}
+	staleDone := json.RawMessage(`{"response":{"id":"resp-never-created","status":"completed"}}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: staleDone}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	retry, ok := d.nextInjection()
+	if !ok || retry.text != inj.text || !reflect.DeepEqual(retry.attention, []int64{11}) {
+		t.Fatalf("retry=%+v ok=%v", retry, ok)
 	}
 }
 
