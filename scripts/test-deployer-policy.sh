@@ -8,9 +8,10 @@ controller=$(<"${root}/scripts/deploy-passed-main.sh")
   printf 'Deployer signal traps must route INT/TERM through a nonzero EXIT rollback\n' >&2
   exit 1
 }
+pg_ctl_pattern="pg_ctl -D \"\$PGDATA\" -m fast -w -t 30 stop"
 [[ "${controller}" == *"stop_database_cleanly()"* && \
   "${controller}" == *"docker exec --detach --user 70:70"* && \
-  "${controller}" == *'pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'* && \
+  "${controller}" == *"${pg_ctl_pattern}"* && \
   "${controller}" == *$'stop_database_cleanly\nstage=deploy'* ]] || {
   printf 'Deployer must checkpoint a legacy root-init PostgreSQL before recreation\n' >&2
   exit 1
