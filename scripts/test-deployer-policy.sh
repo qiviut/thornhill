@@ -18,12 +18,19 @@ pg_ctl_pattern="pg_ctl -D \"\$PGDATA\" -m fast -w -t 30 stop"
   printf 'Deployer must disable restart and checkpoint a legacy root-init PostgreSQL before recreation\n' >&2
   exit 1
 }
-database_stopped_gate="[[ \"\${database_stopped}\" == true ]]"
-[[ "${controller}" == *"database_stopped=false"* && \
-  "${controller}" == *"${database_stopped_gate}"* && \
+containers_stopped_gate="[[ \"\${application_stopped}\" == true && \"\${database_stopped}\" == true ]]"
+state_pattern='{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}'
+[[ "${controller}" == *"verify_clean_stopped_container()"* && \
+  "${controller}" == *"${state_pattern}"* && \
+  "${controller}" == *"for _ in 1 2"* && \
+  "${controller}" == *"stop_application_cleanly()"* && \
+  "${controller}" == *"application_stopped=false"* && \
+  "${controller}" == *"database_stopped=false"* && \
+  "${controller}" == *"${containers_stopped_gate}"* && \
   "${controller}" == *"refusing rollback recreation after unverified database shutdown"* && \
-  "${controller}" != *"stop_database_cleanly >/dev/null 2>&1 || true"* ]] || {
-  printf 'Rollback must not recreate PostgreSQL after an unverified database shutdown\n' >&2
+  "${controller}" != *"stop_database_cleanly >/dev/null 2>&1 || true"* && \
+  "${controller}" == *$'stop_application_cleanly\nstop_database_cleanly\nstage=deploy'* ]] || {
+  printf 'Deploy and rollback must verify stable exit-zero app/database stops before recreation\n' >&2
   exit 1
 }
 state_dir=$(mktemp -d)

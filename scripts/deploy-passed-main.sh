@@ -174,17 +174,47 @@ verify_live_revision() {
   verify_running_revision "${expected}"
 }
 
+verify_clean_stopped_container() {
+  local container=$1 state
+  # Sample twice so an automatic restart cannot masquerade as a stable clean
+  # stop between docker wait and recreation.
+  for _ in 1 2; do
+    if ! state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}'); then
+      return 1
+    fi
+    [[ "${state}" == "false false 0" ]] || return 1
+    sleep 0.2
+  done
+}
+
+stop_application_cleanly() {
+  local container="${PROJECT_NAME}-app-1" running
+  if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
+    return 1
+  fi
+  if [[ "${running}" == true ]] && ! "${compose[@]}" stop --timeout 30 app; then
+    return 1
+  fi
+  verify_clean_stopped_container "${container}"
+}
+
 stop_database_cleanly() {
-  local container="${PROJECT_NAME}-db-1" pid1_uid exit_code
-  if ! docker container inspect "${container}" >/dev/null 2>&1 || \
-    [[ $(docker inspect "${container}" --format '{{.State.Running}}') != true ]]; then
-    return 0
+  local container="${PROJECT_NAME}-db-1" pid1_uid exit_code running
+  if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
+    return 1
+  fi
+  if [[ "${running}" != true ]]; then
+    verify_clean_stopped_container "${container}"
+    return
   fi
   if ! pid1_uid=$(docker exec "${container}" stat -c %u /proc/1); then
     return 1
   fi
   if [[ "${pid1_uid}" == 70 ]]; then
-    "${compose[@]}" stop --timeout 30 db
+    if ! "${compose[@]}" stop --timeout 30 db; then
+      return 1
+    fi
+    verify_clean_stopped_container "${container}"
     return
   fi
 
@@ -205,10 +235,7 @@ stop_database_cleanly() {
   if ! exit_code=$(timeout 35s docker wait "${container}"); then
     return 1
   fi
-  [[ "${exit_code}" == 0 &&
-    $(docker inspect "${container}" --format '{{.State.Running}}') == false &&
-    $(docker inspect "${container}" --format '{{.State.Restarting}}') == false &&
-    $(docker inspect "${container}" --format '{{.State.ExitCode}}') == 0 ]]
+  [[ "${exit_code}" == 0 ]] && verify_clean_stopped_container "${container}"
 }
 
 cleanup_worktrees() {
@@ -223,12 +250,13 @@ cleanup_worktrees() {
 }
 
 rollback() {
-  local rollback_ok=false database_stopped=false deadline
+  local rollback_ok=false application_stopped=false database_stopped=false deadline
   if [[ "${deployed}" == true && -n "${previous_image}" && -n "${previous_db_image}" && ${#previous_compose[@]} -gt 0 ]]; then
     echo "${stage} failed; rolling back to ${previous_revision} (${previous_image}, ${previous_db_image})" >&2
     # Stop the application before PostgreSQL so the database can checkpoint and
     # exit cleanly even when the failed stack still owns pooled connections.
-    if "${compose[@]}" stop --timeout 30 app >/dev/null 2>&1; then
+    if stop_application_cleanly >/dev/null 2>&1; then
+      application_stopped=true
       if stop_database_cleanly >/dev/null 2>&1; then
         database_stopped=true
       else
@@ -237,7 +265,7 @@ rollback() {
     else
       echo "CRITICAL: refusing rollback recreation because the application did not stop cleanly" >&2
     fi
-    if [[ "${database_stopped}" == true ]] && \
+    if [[ "${application_stopped}" == true && "${database_stopped}" == true ]] && \
       THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
       "${previous_compose[@]}" up -d --no-build --force-recreate db app >/dev/null; then
       deadline=$((SECONDS + TIMEOUT_SECONDS))
@@ -396,7 +424,7 @@ deployed=true
 stage=stop
 # Compose replacement can otherwise stop the dependency before its client. Stop
 # the app first, then give PostgreSQL its full clean-shutdown grace period.
-"${compose[@]}" stop --timeout 30 app
+stop_application_cleanly
 stop_database_cleanly
 stage=deploy
 THORNHILL_APP_IMAGE="${image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \

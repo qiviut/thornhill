@@ -9,6 +9,7 @@ suffix="${GITHUB_RUN_ID:-local}-$$"
 network="thornhill-hardening-${suffix}"
 db="thornhill-hardening-db-${suffix}"
 legacy_db="thornhill-hardening-legacy-db-${suffix}"
+failed_db="thornhill-hardening-failed-db-${suffix}"
 app="thornhill-hardening-app-${suffix}"
 db_url="postgres://thornhill:thornhill-test-only@${db}:5432/thornhill?sslmode=disable"
 
@@ -31,7 +32,7 @@ jq -e '
 }
 
 cleanup() {
-  docker rm --force "$app" "$db" "$legacy_db" >/dev/null 2>&1 || true
+  docker rm --force "$app" "$db" "$legacy_db" "$failed_db" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -63,6 +64,15 @@ legacy_postgres_ready() {
   logs=$(docker logs "$legacy_db" 2>&1)
   [[ "$logs" == *'PostgreSQL init process complete; ready for start up.'* ]] &&
     docker exec "$legacy_db" pg_isready --username thornhill --dbname thornhill >/dev/null 2>&1
+}
+
+cleanly_stopped() {
+  local container=$1 state
+  for _ in 1 2; do
+    state=$(docker inspect "$container" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}') || return 1
+    [[ "$state" == 'false false 0' ]] || return 1
+    sleep 0.2
+  done
 }
 
 revision=$(docker image inspect "$app_image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
@@ -127,7 +137,7 @@ done
 [[ "$db_stop_signal" == SIGINT ]]
 [[ "$db_stop_timeout" == 30 ]]
 
-docker run --detach --name "$app" --network "$network" \
+docker run --init --detach --name "$app" --network "$network" \
   --publish 127.0.0.1::8787 \
   --env OPENAI_API_KEY=test-only-not-a-secret \
   --env "DATABASE_URL=${db_url}" \
@@ -167,7 +177,7 @@ versioned=$(jq -r '.versioned // false' <<<"$status")
 [[ "$actual_revision" == "$revision" && "$versioned" == true ]]
 
 docker stop "$db" >/dev/null
-[[ "$(docker inspect "$db" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'PostgreSQL did not stop cleanly on SIGINT'
+cleanly_stopped "$db" || fail_with_logs 'PostgreSQL did not remain cleanly stopped on SIGINT'
 db_logs=$(docker logs "$db" 2>&1)
 [[ "$db_logs" == *'database system is shut down'* && "$db_logs" != *'database system was not properly shut down'* ]] || \
   fail_with_logs 'PostgreSQL fast shutdown did not produce a clean checkpointed exit'
@@ -208,17 +218,22 @@ docker exec --detach --user 70:70 "$legacy_db" sh -ec \
   'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
 legacy_exit=$(timeout 35s docker wait "$legacy_db")
 [[ "$legacy_exit" == 0 ]] || fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not exit cleanly'
-[[ "$(docker inspect "$legacy_db" --format '{{.State.Running}}')" == false &&
-  "$(docker inspect "$legacy_db" --format '{{.State.Restarting}}')" == false &&
-  "$(docker inspect "$legacy_db" --format '{{.State.ExitCode}}')" == 0 &&
-  "$(docker inspect "$legacy_db" --format '{{.HostConfig.RestartPolicy.Name}}')" == no ]] || \
-  fail_with_logs 'Legacy PostgreSQL restarted or did not remain cleanly stopped'
+cleanly_stopped "$legacy_db" || fail_with_logs 'Legacy PostgreSQL restarted or did not remain cleanly stopped'
+[[ "$(docker inspect "$legacy_db" --format '{{.HostConfig.RestartPolicy.Name}}')" == no ]] || \
+  fail_with_logs 'Legacy PostgreSQL restart policy was not disabled before shutdown'
 legacy_logs=$(docker logs "$legacy_db" 2>&1)
 [[ "$legacy_logs" == *'database system is shut down'* && "$legacy_logs" != *'database system was not properly shut down'* ]] || \
   fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not checkpoint cleanly'
 
+if docker run --name "$failed_db" "$db_image" sh -c 'exit 7' >/dev/null 2>&1; then
+  fail_with_logs 'Failed-stop qualification container unexpectedly exited zero'
+fi
+if cleanly_stopped "$failed_db" >/dev/null 2>&1 || cleanly_stopped "${failed_db}-missing" >/dev/null 2>&1; then
+  fail_with_logs 'Clean-stop verification accepted a nonzero or missing container'
+fi
+
 docker stop --time 10 "$app" >/dev/null
-[[ "$(docker inspect "$app" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'Application did not stop cleanly on SIGTERM'
+cleanly_stopped "$app" || fail_with_logs 'Application did not remain cleanly stopped on SIGTERM'
 
 printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL app_pids=256 db_user=%s db_read_only=true db_cap_drop=ALL db_pids=256 db_stop=SIGINT/30s\n' \
   "$revision" "$runtime_user" "$db_uid"
