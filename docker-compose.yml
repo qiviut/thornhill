@@ -13,9 +13,10 @@ services:
       # PostgreSQL 18+ stores versioned clusters below /var/lib/postgresql.
       # Mount the parent so pg_upgrade --link can cross major versions safely.
       - dbdata:/var/lib/postgresql
-    # The official entrypoint starts with only the capabilities needed to
-    # initialize/chown a fresh volume, then drops to UID/GID 70 for postgres.
-    init: true
+    # The official entrypoint execs postgres as PID 1 after initialization. Do
+    # not insert a root-owned tini: with all capabilities dropped it cannot
+    # forward signals to the UID-70 server without adding CAP_KILL.
+    init: false
     read_only: true
     cap_drop:
       - ALL
@@ -31,6 +32,10 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
+    # PostgreSQL treats SIGTERM as a smart shutdown and waits for the old app's
+    # connection during Compose replacement. SIGINT is its fast, clean shutdown:
+    # terminate clients, checkpoint, and exit within the bounded grace period.
+    stop_signal: SIGINT
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U thornhill"]

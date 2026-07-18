@@ -115,6 +115,8 @@ type recordingRealtime struct {
 	outputBodies   []string
 	createEventIDs []string
 	creates        int
+	injectErr      error
+	createErr      error
 }
 
 func (*recordingRealtime) Close() {}
@@ -124,7 +126,9 @@ func (*recordingRealtime) Read(context.Context) (openairt.ServerEvent, error) {
 func (*recordingRealtime) SessionUpdate(context.Context, string, []openairt.Tool, string) error {
 	return nil
 }
-func (*recordingRealtime) InjectMessage(context.Context, string, string) error { return nil }
+func (r *recordingRealtime) InjectMessage(context.Context, string, string) error {
+	return r.injectErr
+}
 func (r *recordingRealtime) FunctionOutput(_ context.Context, callID, output string) error {
 	r.outputCallIDs = append(r.outputCallIDs, callID)
 	r.outputBodies = append(r.outputBodies, output)
@@ -133,7 +137,7 @@ func (r *recordingRealtime) FunctionOutput(_ context.Context, callID, output str
 func (r *recordingRealtime) CreateResponse(_ context.Context, eventID string) error {
 	r.creates++
 	r.createEventIDs = append(r.createEventIDs, eventID)
-	return nil
+	return r.createErr
 }
 func (r *recordingRealtime) CancelResponse(context.Context) error { return nil }
 
@@ -220,7 +224,31 @@ func TestDurableAttentionAcknowledgesOnlyAfterCompletedOutputAudio(t *testing.T)
 	}
 }
 
-func TestStaleResponseCallbacksCannotAcknowledgeAttention(t *testing.T) {
+func TestAttentionTransportFailuresRequeueBriefing(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		injectErr error
+		createErr error
+	}{
+		{name: "message injection", injectErr: fmt.Errorf("inject failed")},
+		{name: "response creation", createErr: fmt.Errorf("create failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &recordingRealtime{injectErr: tc.injectErr, createErr: tc.createErr}
+			d := testDesk(t, client)
+			inj, _ := d.attentionBriefing([]store.Attention{{ID: 10, SpeechText: "pending"}})
+			if err := d.doInject(context.Background(), inj); err == nil {
+				t.Fatal("transport failure unexpectedly succeeded")
+			}
+			retry, ok := d.nextInjection()
+			if !ok || retry.text != inj.text || !reflect.DeepEqual(retry.attention, []int64{10}) {
+				t.Fatalf("retry=%+v ok=%v", retry, ok)
+			}
+		})
+	}
+}
+
+func TestStaleResponseCallbacksCannotMutateActiveAttentionLifecycle(t *testing.T) {
 	client := &recordingRealtime{}
 	d := testDesk(t, client)
 	st := &attentionTestStore{}
@@ -230,7 +258,16 @@ func TestStaleResponseCallbacksCannotAcknowledgeAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	pendingQuestion := false
-	created := json.RawMessage(fmt.Sprintf(`{"response":{"id":"resp-current","metadata":{"thornhill_request_id":%q}}}`, client.createEventIDs[0]))
+	requestID := client.createEventIDs[0]
+	staleCreated := json.RawMessage(`{"response":{"id":"resp-stale","metadata":{"thornhill_request_id":"stale-request"}}}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: staleCreated}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if d.responseCreateEventID != requestID || d.activeResponseID != "" || !d.fsm.Busy() {
+		t.Fatalf("stale created mutated lifecycle: request=%q active=%q busy=%v", d.responseCreateEventID, d.activeResponseID, d.fsm.Busy())
+	}
+
+	created := json.RawMessage(fmt.Sprintf(`{"response":{"id":"resp-current","metadata":{"thornhill_request_id":%q}}}`, requestID))
 	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: created}, &pendingQuestion); err != nil {
 		t.Fatal(err)
 	}
@@ -245,18 +282,63 @@ func TestStaleResponseCallbacksCannotAcknowledgeAttention(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(st.acknowledged) != 0 {
-		t.Fatalf("stale response acknowledged attention: %v", st.acknowledged)
+	if len(st.acknowledged) != 0 || d.activeResponseID != "resp-current" || !d.fsm.Busy() ||
+		!reflect.DeepEqual(d.responseAttention, []int64{8}) {
+		t.Fatalf("stale callbacks mutated attention: ack=%v active=%q busy=%v pending=%v", st.acknowledged, d.activeResponseID, d.fsm.Busy(), d.responseAttention)
+	}
+	if err := d.requestResponse(context.Background()); err == nil || client.creates != 1 {
+		t.Fatalf("stale done admitted a competing response: err=%v creates=%d", err, client.creates)
+	}
+
+	currentAudio := json.RawMessage(`{"response_id":"resp-current"}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: currentAudio}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	currentDone := json.RawMessage(`{"response":{"id":"resp-current","status":"completed","output":[]}}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: currentDone}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if d.activeResponseID != "resp-current" || len(st.acknowledged) != 0 {
+		t.Fatalf("response drained before audio stop: active=%q ack=%v", d.activeResponseID, st.acknowledged)
+	}
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStopped, Raw: currentAudio}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(st.acknowledged, []int64{8}) || d.activeResponseID != "" {
+		t.Fatalf("current response failed to acknowledge after drain: ack=%v active=%q", st.acknowledged, d.activeResponseID)
 	}
 }
 
-func TestClearedOrTextOnlyAttentionRemainsPending(t *testing.T) {
+func TestInterruptedOrInaudibleAttentionRequeuesUntilHeard(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		cleared bool
+		name   string
+		finish func(*testing.T, *Desk, *bool)
 	}{
-		{name: "cleared audio", cleared: true},
-		{name: "text only"},
+		{name: "cleared audio", finish: func(t *testing.T, d *Desk, pendingQuestion *bool) {
+			audio := json.RawMessage(`{"response_id":"resp-pending"}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: audio}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioCleared, Raw: audio}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "text only", finish: func(t *testing.T, d *Desk, pendingQuestion *bool) {
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "interrupted", finish: func(t *testing.T, d *Desk, pendingQuestion *bool) {
+			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"cancelled","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &recordingRealtime{}
@@ -272,21 +354,36 @@ func TestClearedOrTextOnlyAttentionRemainsPending(t *testing.T) {
 			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: created}, &pendingQuestion); err != nil {
 				t.Fatal(err)
 			}
-			if tc.cleared {
-				audio := json.RawMessage(`{"response_id":"resp-pending"}`)
-				if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: audio}, &pendingQuestion); err != nil {
-					t.Fatal(err)
-				}
-				if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioCleared, Raw: audio}, &pendingQuestion); err != nil {
-					t.Fatal(err)
-				}
-			}
-			done := json.RawMessage(`{"response":{"id":"resp-pending","status":"completed","output":[]}}`)
-			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: done}, &pendingQuestion); err != nil {
-				t.Fatal(err)
-			}
+			tc.finish(t, d, &pendingQuestion)
 			if len(st.acknowledged) != 0 {
 				t.Fatalf("inaudible briefing acknowledged: %v", st.acknowledged)
+			}
+
+			retry, ok := d.nextInjection()
+			if !ok || retry.text != inj.text || !reflect.DeepEqual(retry.attention, []int64{9}) {
+				t.Fatalf("retry=%+v ok=%v", retry, ok)
+			}
+			if err := d.doInject(context.Background(), retry); err != nil {
+				t.Fatal(err)
+			}
+			retryRequestID := client.createEventIDs[len(client.createEventIDs)-1]
+			retryCreated := json.RawMessage(fmt.Sprintf(`{"response":{"id":"resp-retry","metadata":{"thornhill_request_id":%q}}}`, retryRequestID))
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseCreated, Raw: retryCreated}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			retryAudio := json.RawMessage(`{"response_id":"resp-retry"}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStarted, Raw: retryAudio}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			retryDone := json.RawMessage(`{"response":{"id":"resp-retry","status":"completed","output":[]}}`)
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: retryDone}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvOutputAudioStopped, Raw: retryAudio}, &pendingQuestion); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(st.acknowledged, []int64{9}) || len(d.responseAttention) != 0 {
+				t.Fatalf("acknowledged=%v pending=%v", st.acknowledged, d.responseAttention)
 			}
 		})
 	}
@@ -312,7 +409,8 @@ func TestResponseDoneBatchesToolOutputsBeforeSingleContinuation(t *testing.T) {
 	client := &recordingRealtime{}
 	d := testDesk(t, client)
 	pendingQuestion := false
-	raw := json.RawMessage(`{"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call-1","name":"unknown_a","arguments":"{}"},{"type":"function_call","status":"completed","call_id":"call-2","name":"unknown_b","arguments":"{}"}]}}`)
+	d.activeResponseID = "resp-tools"
+	raw := json.RawMessage(`{"type":"response.done","response":{"id":"resp-tools","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call-1","name":"unknown_a","arguments":"{}"},{"type":"function_call","status":"completed","call_id":"call-2","name":"unknown_b","arguments":"{}"}]}}`)
 	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: raw}, &pendingQuestion); err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +473,8 @@ func TestSpeechEventsRemainObservableWhileToolBatchRuns(t *testing.T) {
 	blocker := &blockingDispatcher{started: make(chan struct{}), release: make(chan struct{})}
 	d.Dispatcher = blocker
 	pendingQuestion := false
-	raw := json.RawMessage(`{"type":"response.done","response":{"status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call-status","name":"job_status","arguments":"{}"}]}}`)
+	d.activeResponseID = "resp-blocking-tool"
+	raw := json.RawMessage(`{"type":"response.done","response":{"id":"resp-blocking-tool","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call-status","name":"job_status","arguments":"{}"}]}}`)
 	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: raw}, &pendingQuestion); err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +515,7 @@ func TestSpeechEventsRemainObservableWhileToolBatchRuns(t *testing.T) {
 	}
 }
 
-func TestDuplicateActiveResponseErrorDoesNotQueueAudibleLoop(t *testing.T) {
+func TestUncorrelatedDuplicateActiveResponseErrorCannotMutateLifecycle(t *testing.T) {
 	t.Parallel()
 	client := &recordingRealtime{}
 	d := testDesk(t, client)
@@ -428,8 +527,35 @@ func TestDuplicateActiveResponseErrorDoesNotQueueAudibleLoop(t *testing.T) {
 	if len(d.inject) != 0 {
 		t.Fatal("duplicate-active error must not queue another spoken response")
 	}
-	if !d.fsm.Busy() {
-		t.Fatal("known active response must remain represented as busy")
+	if d.fsm.Busy() || d.activeResponseID != "" || d.responseCreateEventID != "" {
+		t.Fatalf("uncorrelated error mutated lifecycle: busy=%v active=%q request=%q", d.fsm.Busy(), d.activeResponseID, d.responseCreateEventID)
+	}
+}
+
+func TestCorrelatedDuplicateActiveAttentionErrorRequeuesAndReleasesAdmission(t *testing.T) {
+	t.Parallel()
+	client := &recordingRealtime{}
+	d := testDesk(t, client)
+	inj, _ := d.attentionBriefing([]store.Attention{{ID: 11, SpeechText: "pending"}})
+	if err := d.doInject(context.Background(), inj); err != nil {
+		t.Fatal(err)
+	}
+	requestID := client.createEventIDs[0]
+	pendingQuestion := false
+	raw := json.RawMessage(fmt.Sprintf(`{"type":"error","error":{"type":"invalid_request_error","code":"conversation_already_has_active_response","event_id":%q,"message":"already active"}}`, requestID))
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvError, Raw: raw}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	if d.fsm.Busy() || d.activeResponseID != "" || d.responseCreateEventID != "" || d.pendingContinuation {
+		t.Fatalf("correlated rejection stranded lifecycle: busy=%v active=%q request=%q continuation=%v", d.fsm.Busy(), d.activeResponseID, d.responseCreateEventID, d.pendingContinuation)
+	}
+	staleDone := json.RawMessage(`{"response":{"id":"resp-never-created","status":"completed"}}`)
+	if err := d.handleServer(context.Background(), openairt.ServerEvent{Type: openairt.EvResponseDone, Raw: staleDone}, &pendingQuestion); err != nil {
+		t.Fatal(err)
+	}
+	retry, ok := d.nextInjection()
+	if !ok || retry.text != inj.text || !reflect.DeepEqual(retry.attention, []int64{11}) {
+		t.Fatalf("retry=%+v ok=%v", retry, ok)
 	}
 }
 

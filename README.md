@@ -84,9 +84,12 @@ configuration.
 After deployment, open Thornhill over HTTPS and select **Enable alerts**. On
 iPhone/iPad, install the PWA to the Home Screen first; notification permission is
 available only to installed web apps. Subscription endpoints are bearer
-capabilities: Thornhill accepts them only through same-origin browser writes,
-never returns or logs them, rejects non-public destinations, and deletes them on
-explicit unsubscribe. Provider requests bypass environment proxies, do not
+capabilities: Thornhill accepts them only through browser writes whose canonical
+scheme and host exactly match the trusted external request origin; the transport
+scheme comes only from TLS or the loopback Tailscale Serve hop, never a client's
+absolute-form URL or remote proxy header. Thornhill never returns or logs the
+capability, rejects non-public destinations, and deletes it on explicit
+unsubscribe. Provider requests bypass environment proxies, do not
 follow redirects, and re-check resolved addresses before dialing. A provider
 `404`/`410` disables the endpoint automatically.
 
@@ -99,8 +102,9 @@ uses a PostgreSQL outbox. Network failures, provider `429`, and `5xx` responses
 retry with bounded backoff for at most six attempts; other permanent responses
 are recorded without retry. A call becoming live cancels an in-flight Push
 attempt and releases the lease. Push is a best-effort attention channel only: it
-never changes job state or grants authority, and unacknowledged
-items remain available for the next spoken resume briefing.
+never changes job state or grants authority. Interrupted or inaudible briefings
+are retried while the call survives; unacknowledged items remain available for
+the next spoken resume briefing after disconnect.
 
 ### CI-proven live revision
 
@@ -120,8 +124,19 @@ The timer polls GitHub every 15 minutes for the newest successful
 **push-to-main** CI run and builds
 that exact commit from a detached temporary worktree. Immediately before
 replacement it atomically pauses new dispatches in PostgreSQL and rechecks that
-no work is active. It then recreates only the app service and verifies the local
-and Tailnet UI, status endpoint, OCI label, and binary revision. Failed
+no work is active. It then recreates the revision-pinned app and PostgreSQL
+services. PostgreSQL receives its fast clean-shutdown signal (`SIGINT`) with a
+30-second grace period after the old application is stopped, so lingering
+connections cannot turn a routine replacement into crash recovery. PostgreSQL
+runs directly as PID 1 so the signal reaches its UID-70 process without granting
+`CAP_KILL` to a root-owned init shim. On the one-time upgrade from the former
+shim model, the controller disables its persisted automatic-restart policy,
+asks PostgreSQL to checkpoint and stop through `pg_ctl` running as UID 70, and
+verifies that it remains cleanly stopped before recreation. Every deployment and
+rollback samples both app and database state after stop and requires a stable
+`Running=false`, `Restarting=false`, exit-zero result; missing, forced, or
+ambiguous stops fail closed before recreation. The controller then verifies the
+UI, status endpoint, OCI label, binary revision, and database runtime. Failed
 verification restores the prior revision's image **and Compose model**; the bad
 SHA is quarantined instead of being retried. During active development the timer
 may be stopped. Polls against a modified or revision-mismatched deployment

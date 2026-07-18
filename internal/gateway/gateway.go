@@ -75,7 +75,7 @@ func (g *Gateway) upstream() string {
 	return "https://api.openai.com"
 }
 
-// originAllowed admits non-browser clients (no Origin header), same-origin
+// originAllowed admits non-browser clients (no Origin header), exact same-origin
 // browser requests, and explicitly configured development origins. The normal
 // production UI is same-origin, so its secure default is no extra configuration.
 func (g *Gateway) originAllowed(r *http.Request) bool {
@@ -83,24 +83,97 @@ func (g *Gateway) originAllowed(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	candidateOrigin, candidateHost, ok := canonicalBrowserOrigin(origin)
+	if !ok {
 		return false
 	}
-	if strings.EqualFold(u.Host, r.Host) {
+	requestOrigin, ok := canonicalRequestOrigin(r)
+	if ok && candidateOrigin == requestOrigin {
 		return true
 	}
 	for _, pattern := range g.Cfg.AllowedOrigins {
 		pattern = strings.ToLower(pattern)
-		candidate := strings.ToLower(u.Host)
+		candidate := candidateHost
 		if strings.Contains(pattern, "://") {
-			candidate = strings.ToLower(origin)
+			candidate = candidateOrigin
 		}
 		if matched, err := path.Match(pattern, candidate); err == nil && matched {
 			return true
 		}
 	}
 	return false
+}
+
+func browserSameOrigin(r *http.Request) bool {
+	candidateOrigin, _, ok := canonicalBrowserOrigin(r.Header.Get("Origin"))
+	if !ok {
+		return false
+	}
+	requestOrigin, ok := canonicalRequestOrigin(r)
+	return ok && candidateOrigin == requestOrigin
+}
+
+func canonicalBrowserOrigin(origin string) (string, string, bool) {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || u.User != nil || u.Opaque != "" ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", false
+	}
+	canonical, ok := canonicalHTTPOrigin(u.Scheme, u.Host)
+	return canonical, strings.ToLower(u.Host), ok
+}
+
+func canonicalRequestOrigin(r *http.Request) (string, bool) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if forwarded := trustedForwardedProto(r); forwarded != "" {
+		scheme = forwarded
+	}
+	return canonicalHTTPOrigin(scheme, r.Host)
+}
+
+// trustedForwardedProto honors proxy metadata only on the documented local
+// Tailscale Serve hop. A direct remote peer cannot redefine its request origin.
+func trustedForwardedProto(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return ""
+	}
+	forwarded := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]))
+	if forwarded != "http" && forwarded != "https" {
+		return ""
+	}
+	return forwarded
+}
+
+func canonicalHTTPOrigin(scheme, hostport string) (string, bool) {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	u, err := url.Parse(scheme + "://" + hostport)
+	if err != nil || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if host == "" {
+		return "", false
+	}
+	port := u.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host, true
 }
 
 func (g *Gateway) Routes() http.Handler {
@@ -259,7 +332,7 @@ func (g *Gateway) handlePushConfig(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (g *Gateway) handlePushSubscription(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Origin") == "" || !g.originAllowed(r) {
+	if !browserSameOrigin(r) {
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return
 	}

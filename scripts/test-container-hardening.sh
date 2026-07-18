@@ -8,6 +8,8 @@ db_image=${2:-thornhill-postgres:ci}
 suffix="${GITHUB_RUN_ID:-local}-$$"
 network="thornhill-hardening-${suffix}"
 db="thornhill-hardening-db-${suffix}"
+legacy_db="thornhill-hardening-legacy-db-${suffix}"
+failed_db="thornhill-hardening-failed-db-${suffix}"
 app="thornhill-hardening-app-${suffix}"
 db_url="postgres://thornhill:thornhill-test-only@${db}:5432/thornhill?sslmode=disable"
 
@@ -18,10 +20,11 @@ jq -e '
   (.services.app | .init == true and .read_only == true and .pids_limit == 256 and
     .cap_drop == ["ALL"] and (.security_opt | index("no-new-privileges:true")) != null and
     (.tmpfs | index("/tmp:rw,noexec,nosuid,size=64m")) != null) and
-  (.services.db | .init == true and .read_only == true and .pids_limit == 256 and
+  (.services.db | .init == false and .read_only == true and .pids_limit == 256 and
     .cap_drop == ["ALL"] and
     (.cap_add | sort) == (["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"] | sort) and
     (.security_opt | index("no-new-privileges:true")) != null and
+    .stop_signal == "SIGINT" and .stop_grace_period == "30s" and
     any(.tmpfs[]; startswith("/run/postgresql:rw,noexec,nosuid,size=16m")))
 ' <<<"${compose_model}" >/dev/null || {
   printf 'Checked-in Compose hardening model does not match the qualified runtime policy\n' >&2
@@ -29,30 +32,47 @@ jq -e '
 }
 
 cleanup() {
-  docker rm --force "$app" "$db" >/dev/null 2>&1 || true
+  docker rm --force "$app" "$db" "$legacy_db" "$failed_db" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 fail_with_logs() {
   printf '%s\n' "$1" >&2
-  if docker container inspect "$app" >/dev/null 2>&1; then
-    docker logs "$app" >&2 || true
-  fi
-  if docker container inspect "$db" >/dev/null 2>&1; then
-    docker logs "$db" >&2 || true
-  fi
+  local container
+  for container in "$app" "$db" "$legacy_db"; do
+    if docker container inspect "$container" >/dev/null 2>&1; then
+      docker logs "$container" >&2 || true
+    fi
+  done
   exit 1
 }
 
 postgres_ready() {
+  local container=${1:-$db} pid1_comm=${2:-postgres}
   # The official image briefly starts a temporary PostgreSQL server during
-  # initialization, then stops it before exec'ing the final server as the sole
-  # direct child of Docker's init. Requiring that process shape prevents a
-  # transient pg_isready success from racing the intentional shutdown.
-  docker exec "$db" sh -c \
-    'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1 && test "$(cat "/proc/$1/comm")" = postgres && pg_isready --username thornhill --dbname thornhill' \
+  # initialization, then stops it before exec'ing the final server as PID 1.
+  # Requiring the expected process shape prevents a transient pg_isready success
+  # from racing the intentional shutdown.
+  docker exec "$container" sh -c \
+    'test "$(cat /proc/1/comm)" = "$1" && pg_isready --username thornhill --dbname thornhill' sh "$pid1_comm" \
     >/dev/null 2>&1
+}
+
+legacy_postgres_ready() {
+  local logs
+  logs=$(docker logs "$legacy_db" 2>&1)
+  [[ "$logs" == *'PostgreSQL init process complete; ready for start up.'* ]] &&
+    docker exec "$legacy_db" pg_isready --username thornhill --dbname thornhill >/dev/null 2>&1
+}
+
+cleanly_stopped() {
+  local container=$1 state
+  for _ in 1 2; do
+    state=$(docker inspect "$container" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}') || return 1
+    [[ "$state" == 'false false 0' ]] || return 1
+    sleep 0.2
+  done
 }
 
 revision=$(docker image inspect "$app_image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
@@ -74,7 +94,6 @@ docker run --detach --name "$db" --network "$network" \
   --env POSTGRES_USER=thornhill \
   --env POSTGRES_PASSWORD=thornhill-test-only \
   --env POSTGRES_DB=thornhill \
-  --init \
   --read-only \
   --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \
   --tmpfs /run/postgresql:rw,noexec,nosuid,size=16m,uid=70,gid=70,mode=2775 \
@@ -87,6 +106,8 @@ docker run --detach --name "$db" --network "$network" \
   --cap-add SETUID \
   --security-opt no-new-privileges:true \
   --pids-limit 256 \
+  --stop-signal SIGINT \
+  --stop-timeout 30 \
   "$db_image" >/dev/null
 
 for _ in {1..60}; do
@@ -97,12 +118,14 @@ for _ in {1..60}; do
 done
 postgres_ready || fail_with_logs 'PostgreSQL did not become ready'
 
-db_uid=$(docker exec "$db" sh -c 'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1; stat -c %u "/proc/$1"')
+db_uid=$(docker exec "$db" stat -c %u /proc/1)
 db_readonly=$(docker inspect "$db" --format '{{.HostConfig.ReadonlyRootfs}}')
 db_cap_drop=$(docker inspect "$db" --format '{{json .HostConfig.CapDrop}}')
 db_cap_add=$(docker inspect "$db" --format '{{json .HostConfig.CapAdd}}')
 db_security_opt=$(docker inspect "$db" --format '{{json .HostConfig.SecurityOpt}}')
 db_pids_limit=$(docker inspect "$db" --format '{{.HostConfig.PidsLimit}}')
+db_stop_signal=$(docker inspect "$db" --format '{{.Config.StopSignal}}')
+db_stop_timeout=$(docker inspect "$db" --format '{{.Config.StopTimeout}}')
 [[ "$db_uid" == 70 ]]
 [[ "$db_readonly" == true ]]
 [[ "$db_cap_drop" == *'ALL'* ]]
@@ -111,8 +134,10 @@ for capability in CHOWN DAC_OVERRIDE FOWNER SETGID SETUID; do
 done
 [[ "$db_security_opt" == *'no-new-privileges'* ]]
 [[ "$db_pids_limit" == 256 ]]
+[[ "$db_stop_signal" == SIGINT ]]
+[[ "$db_stop_timeout" == 30 ]]
 
-docker run --detach --name "$app" --network "$network" \
+docker run --init --detach --name "$app" --network "$network" \
   --publish 127.0.0.1::8787 \
   --env OPENAI_API_KEY=test-only-not-a-secret \
   --env "DATABASE_URL=${db_url}" \
@@ -151,8 +176,64 @@ actual_revision=$(jq -r '.source_commit // empty' <<<"$status")
 versioned=$(jq -r '.versioned // false' <<<"$status")
 [[ "$actual_revision" == "$revision" && "$versioned" == true ]]
 
-docker stop --time 10 "$app" >/dev/null
-[[ "$(docker inspect "$app" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'Application did not stop cleanly on SIGTERM'
+docker stop "$db" >/dev/null
+cleanly_stopped "$db" || fail_with_logs 'PostgreSQL did not remain cleanly stopped on SIGINT'
+db_logs=$(docker logs "$db" 2>&1)
+[[ "$db_logs" == *'database system is shut down'* && "$db_logs" != *'database system was not properly shut down'* ]] || \
+  fail_with_logs 'PostgreSQL fast shutdown did not produce a clean checkpointed exit'
 
-printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL app_pids=256 db_user=%s db_read_only=true db_cap_drop=ALL db_pids=256\n' \
+# Qualify the one-time deployment path from the former init:true model. The
+# root-owned tini shim cannot forward signals with all capabilities dropped, so
+# the deployer must invoke pg_ctl as PostgreSQL's UID before recreation.
+docker run --init --detach --name "$legacy_db" --network "$network" \
+  --restart unless-stopped \
+  --env POSTGRES_USER=thornhill \
+  --env POSTGRES_PASSWORD=thornhill-test-only \
+  --env POSTGRES_DB=thornhill \
+  --read-only \
+  --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \
+  --tmpfs /run/postgresql:rw,noexec,nosuid,size=16m,uid=70,gid=70,mode=2775 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE \
+  --cap-add FOWNER \
+  --cap-add SETGID \
+  --cap-add SETUID \
+  --security-opt no-new-privileges:true \
+  --pids-limit 256 \
+  "$db_image" >/dev/null
+for _ in {1..60}; do
+  if legacy_postgres_ready; then
+    break
+  fi
+  sleep 1
+done
+legacy_postgres_ready || fail_with_logs 'Legacy init-shim PostgreSQL did not become ready'
+[[ "$(docker exec "$legacy_db" stat -c %u /proc/1)" == 0 ]] || fail_with_logs 'Legacy qualification container did not run a root-owned init shim'
+[[ "$(docker inspect "$legacy_db" --format '{{.HostConfig.RestartPolicy.Name}}')" == unless-stopped ]] || \
+  fail_with_logs 'Legacy qualification container did not carry the persisted restart policy'
+docker update --restart=no "$legacy_db" >/dev/null
+docker exec --detach --user 70:70 "$legacy_db" sh -ec \
+  'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
+legacy_exit=$(timeout 35s docker wait "$legacy_db")
+[[ "$legacy_exit" == 0 ]] || fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not exit cleanly'
+cleanly_stopped "$legacy_db" || fail_with_logs 'Legacy PostgreSQL restarted or did not remain cleanly stopped'
+[[ "$(docker inspect "$legacy_db" --format '{{.HostConfig.RestartPolicy.Name}}')" == no ]] || \
+  fail_with_logs 'Legacy PostgreSQL restart policy was not disabled before shutdown'
+legacy_logs=$(docker logs "$legacy_db" 2>&1)
+[[ "$legacy_logs" == *'database system is shut down'* && "$legacy_logs" != *'database system was not properly shut down'* ]] || \
+  fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not checkpoint cleanly'
+
+if docker run --name "$failed_db" "$db_image" sh -c 'exit 7' >/dev/null 2>&1; then
+  fail_with_logs 'Failed-stop qualification container unexpectedly exited zero'
+fi
+if cleanly_stopped "$failed_db" >/dev/null 2>&1 || cleanly_stopped "${failed_db}-missing" >/dev/null 2>&1; then
+  fail_with_logs 'Clean-stop verification accepted a nonzero or missing container'
+fi
+
+docker stop --time 10 "$app" >/dev/null
+cleanly_stopped "$app" || fail_with_logs 'Application did not remain cleanly stopped on SIGTERM'
+
+printf 'Container hardening passed: revision=%s app_user=%s app_read_only=true app_cap_drop=ALL app_pids=256 db_user=%s db_read_only=true db_cap_drop=ALL db_pids=256 db_stop=SIGINT/30s\n' \
   "$revision" "$runtime_user" "$db_uid"

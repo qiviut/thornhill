@@ -158,8 +158,7 @@ verify_running_db() {
   cap_drop=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.CapDrop}}')
   security_opt=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.SecurityOpt}}')
   pids_limit=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.PidsLimit}}')
-  runtime_uid=$(docker exec "${PROJECT_NAME}-db-1" sh -c \
-    'set -- $(cat /proc/1/task/1/children); test "$#" -eq 1; stat -c %u "/proc/$1"')
+  runtime_uid=$(docker exec "${PROJECT_NAME}-db-1" stat -c %u /proc/1)
   [[ "${actual_image}" == "${expected_image}" && "${health}" == healthy && "${read_only}" == true && \
     "${cap_drop}" == *ALL* && "${security_opt}" == *no-new-privileges* && \
     "${pids_limit}" == 256 && "${runtime_uid}" == 70 ]]
@@ -175,6 +174,70 @@ verify_live_revision() {
   verify_running_revision "${expected}"
 }
 
+verify_clean_stopped_container() {
+  local container=$1 state
+  # Sample twice so an automatic restart cannot masquerade as a stable clean
+  # stop between docker wait and recreation.
+  for _ in 1 2; do
+    if ! state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}'); then
+      return 1
+    fi
+    [[ "${state}" == "false false 0" ]] || return 1
+    sleep 0.2
+  done
+}
+
+stop_application_cleanly() {
+  local container="${PROJECT_NAME}-app-1" running
+  if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
+    return 1
+  fi
+  if [[ "${running}" == true ]] && ! "${compose[@]}" stop --timeout 30 app; then
+    return 1
+  fi
+  verify_clean_stopped_container "${container}"
+}
+
+stop_database_cleanly() {
+  local container="${PROJECT_NAME}-db-1" pid1_uid exit_code running
+  if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
+    return 1
+  fi
+  if [[ "${running}" != true ]]; then
+    verify_clean_stopped_container "${container}"
+    return
+  fi
+  if ! pid1_uid=$(docker exec "${container}" stat -c %u /proc/1); then
+    return 1
+  fi
+  if [[ "${pid1_uid}" == 70 ]]; then
+    if ! "${compose[@]}" stop --timeout 30 db; then
+      return 1
+    fi
+    verify_clean_stopped_container "${container}"
+    return
+  fi
+
+  # One-time upgrade path from the former root-owned tini shim. With all
+  # capabilities dropped, that shim cannot signal UID-70 PostgreSQL. Ask
+  # PostgreSQL itself to checkpoint and stop as its owning user instead.
+  echo "Stopping legacy PostgreSQL PID 1 (uid=${pid1_uid}) through pg_ctl"
+  # The persisted legacy service used unless-stopped. Disable automatic restart
+  # before pg_ctl so docker wait cannot observe a transient clean exit followed
+  # by the same unsafe root-init container restarting behind the deployer.
+  if ! docker update --restart=no "${container}" >/dev/null; then
+    return 1
+  fi
+  if ! docker exec --detach --user 70:70 "${container}" \
+    sh -ec 'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'; then
+    return 1
+  fi
+  if ! exit_code=$(timeout 35s docker wait "${container}"); then
+    return 1
+  fi
+  [[ "${exit_code}" == 0 ]] && verify_clean_stopped_container "${container}"
+}
+
 cleanup_worktrees() {
   local directory
   for directory in "${source_dir}" "${previous_source_dir}"; do
@@ -187,10 +250,23 @@ cleanup_worktrees() {
 }
 
 rollback() {
-  local rollback_ok=false deadline
+  local rollback_ok=false application_stopped=false database_stopped=false deadline
   if [[ "${deployed}" == true && -n "${previous_image}" && -n "${previous_db_image}" && ${#previous_compose[@]} -gt 0 ]]; then
     echo "${stage} failed; rolling back to ${previous_revision} (${previous_image}, ${previous_db_image})" >&2
-    if THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
+    # Stop the application before PostgreSQL so the database can checkpoint and
+    # exit cleanly even when the failed stack still owns pooled connections.
+    if stop_application_cleanly >/dev/null 2>&1; then
+      application_stopped=true
+      if stop_database_cleanly >/dev/null 2>&1; then
+        database_stopped=true
+      else
+        echo "CRITICAL: refusing rollback recreation after unverified database shutdown" >&2
+      fi
+    else
+      echo "CRITICAL: refusing rollback recreation because the application did not stop cleanly" >&2
+    fi
+    if [[ "${application_stopped}" == true && "${database_stopped}" == true ]] && \
+      THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
       "${previous_compose[@]}" up -d --no-build --force-recreate db app >/dev/null; then
       deadline=$((SECONDS + TIMEOUT_SECONDS))
       while (( SECONDS < deadline )); do
@@ -223,7 +299,9 @@ on_exit() {
   cleanup_worktrees
   exit "${rc}"
 }
-trap on_exit EXIT INT TERM
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "${ROOT}"
 timeout 60s git fetch --quiet --prune origin main
@@ -342,8 +420,13 @@ if [[ "${active}" != 0 ]]; then
   exit 0
 fi
 
-stage=deploy
 deployed=true
+stage=stop
+# Compose replacement can otherwise stop the dependency before its client. Stop
+# the app first, then give PostgreSQL its full clean-shutdown grace period.
+stop_application_cleanly
+stop_database_cleanly
+stage=deploy
 THORNHILL_APP_IMAGE="${image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
   "${compose[@]}" up -d --no-build --force-recreate db app
 stage=verify

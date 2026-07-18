@@ -49,7 +49,12 @@ Thornhill's Desk is the only component that emits `response.create`.
   Each `response.create` carries a unique client `event_id`. Only an asynchronous
   error naming that exact ID reconciles its provisional in-flight state, so an
   unrelated rejected session or conversation event cannot cause a duplicate
-  response; correlated rejection cannot wedge the session or Park lifecycle.
+  response. A matching rejection clears only that provisional request and
+  preserves the exact durable-attention retry; an uncorrelated duplicate-active
+  error is ignored instead of inventing an untrackable busy response. The returned
+  response ID then gates `response.done` and output-audio lifecycle changes; stale
+  or unrelated callbacks cannot clear the active turn, admit a competing response,
+  or acknowledge durable attention.
 - Function calls execute only when the containing response and the individual
   function-call item are both `completed`. Streamed or cancelled partial calls
   cannot cause side effects. Completed batches execute concurrently off the
@@ -221,7 +226,9 @@ to brief the operator. The `response.create` client event ID is copied into
 Realtime response metadata. A row becomes spoken only when that exact response
 is `completed` and its exact `response_id` has both started and fully drained
 audio. Interruption, buffer clear, text-only output, disconnect, error, or stale
-callbacks preserve the row for a later call.
+callbacks never acknowledge the row. While the call survives, the exact bounded
+briefing is requeued behind the active response; disconnect releases the claim so
+the next call can brief it again.
 
 Optional Web Push consumes the same attention rows through a separate durable
 outbox. Delivery is suppressed while the voice desk is live; a transition to

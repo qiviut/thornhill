@@ -86,23 +86,28 @@ type realtimeClient interface {
 // Desk is one materialized session. Create per call; throw away on park.
 type Desk struct {
 	Deps
-	fsm                   *FSM
-	inject                chan injection
-	urgent                chan injection
-	client                realtimeClient
-	pendingUserTurn       bool
-	pendingContinuation   bool
-	responseMu            sync.Mutex
-	responseCreateEventID string
-	responseSeq           uint64
-	toolResults           chan toolBatch
-	attentionClaimToken   string
-	responseAttention     []int64
-	attentionRequestID    string
-	attentionResponseID   string
-	attentionResponseDone bool
-	attentionAudioStarted bool
-	attentionAudioStopped bool
+	fsm                       *FSM
+	inject                    chan injection
+	urgent                    chan injection
+	client                    realtimeClient
+	pendingUserTurn           bool
+	pendingContinuation       bool
+	responseMu                sync.Mutex
+	responseCreateEventID     string
+	responseSeq               uint64
+	activeResponseID          string
+	activeResponseDone        bool
+	activeResponseAudio       bool
+	toolResults               chan toolBatch
+	attentionClaimToken       string
+	responseAttention         []int64
+	attentionRequestID        string
+	attentionResponseID       string
+	attentionResponseDone     bool
+	attentionAudioStarted     bool
+	attentionAudioStopped     bool
+	responseAttentionBriefing injection
+	attentionRetry            *injection
 }
 
 func New(d Deps) *Desk {
@@ -258,6 +263,11 @@ func (d *Desk) Run(ctx context.Context, callID string) (reason ParkReason, err e
 }
 
 func (d *Desk) nextInjection() (injection, bool) {
+	if d.attentionRetry != nil {
+		inj := cloneInjection(*d.attentionRetry)
+		d.attentionRetry = nil
+		return inj, true
+	}
 	select {
 	case inj := <-d.urgent:
 		return inj, true
@@ -307,10 +317,15 @@ func (d *Desk) pendingApprovalOnResume(ctx context.Context) (injection, bool) {
 
 func (d *Desk) doInject(ctx context.Context, inj injection) error {
 	if err := d.client.InjectMessage(ctx, inj.role, inj.text); err != nil {
+		d.queueAttentionRetry(inj)
 		return err
 	}
 	if inj.respond {
-		return d.requestResponseFor(ctx, inj.attention)
+		err := d.requestResponseFor(ctx, inj.attention, inj)
+		if err != nil {
+			d.queueAttentionRetry(inj)
+		}
+		return err
 	}
 	return nil
 }
@@ -319,10 +334,10 @@ func (d *Desk) doInject(ctx context.Context, inj injection) error {
 // request in-flight before OpenAI asynchronously acknowledges response.created,
 // closing the race between user turns, tool continuations, and announcements.
 func (d *Desk) requestResponse(ctx context.Context) error {
-	return d.requestResponseFor(ctx, nil)
+	return d.requestResponseFor(ctx, nil, injection{})
 }
 
-func (d *Desk) requestResponseFor(ctx context.Context, attention []int64) error {
+func (d *Desk) requestResponseFor(ctx context.Context, attention []int64, briefing injection) error {
 	// Serialize the actual client event with RequestPark. If response admission
 	// wins, the event is written before PARKING; if Park wins, admission fails.
 	d.responseMu.Lock()
@@ -334,12 +349,8 @@ func (d *Desk) requestResponseFor(ctx context.Context, attention []int64) error 
 	d.responseSeq++
 	eventID := fmt.Sprintf("thornhill_response_create_%d_%d", now.UnixNano(), d.responseSeq)
 	d.responseCreateEventID = eventID
-	if err := d.client.CreateResponse(ctx, eventID); err != nil {
-		d.responseCreateEventID = ""
-		d.fsm.ResponseDone(time.Now())
-		return err
-	}
 	d.responseAttention = append(d.responseAttention[:0], attention...)
+	d.responseAttentionBriefing = cloneInjection(briefing)
 	d.attentionRequestID = ""
 	if len(attention) > 0 {
 		d.attentionRequestID = eventID
@@ -348,6 +359,12 @@ func (d *Desk) requestResponseFor(ctx context.Context, attention []int64) error 
 	d.attentionResponseDone = false
 	d.attentionAudioStarted = false
 	d.attentionAudioStopped = false
+	if err := d.client.CreateResponse(ctx, eventID); err != nil {
+		d.responseCreateEventID = ""
+		d.fsm.ResponseDone(time.Now())
+		d.requeueResponseAttention()
+		return err
+	}
 	return nil
 }
 
@@ -471,48 +488,82 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		}
 
 	case openairt.EvResponseCreated:
-		d.responseCreateEventID = ""
-		d.fsm.ResponseStarted(now)
 		ref := openairt.ExtractResponseRef(ev.Raw)
-		if len(d.responseAttention) > 0 && ref.ID != "" && ref.RequestID == d.attentionRequestID {
+		if ref.ID == "" || ref.RequestID == "" || ref.RequestID != d.responseCreateEventID {
+			d.Log.Debug("stale realtime response.created ignored", "response_id", ref.ID)
+			return nil
+		}
+		d.responseCreateEventID = ""
+		d.activeResponseID = ref.ID
+		d.activeResponseDone = false
+		d.activeResponseAudio = false
+		d.fsm.ResponseStarted(now)
+		if len(d.responseAttention) > 0 && ref.RequestID == d.attentionRequestID {
 			d.attentionResponseID = ref.ID
 		}
 
 	case openairt.EvOutputAudioStarted:
+		responseID := openairt.ExtractAudioResponseID(ev.Raw)
+		if !d.matchesActiveResponse(responseID) {
+			d.Log.Debug("stale realtime audio start ignored", "response_id", responseID)
+			return nil
+		}
+		d.activeResponseAudio = true
 		d.fsm.AudioStarted(now)
-		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
+		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(responseID) {
 			d.attentionAudioStarted = true
 		}
 
 	case openairt.EvOutputAudioStopped:
+		responseID := openairt.ExtractAudioResponseID(ev.Raw)
+		if !d.matchesActiveResponse(responseID) {
+			d.Log.Debug("stale realtime audio stop ignored", "response_id", responseID)
+			return nil
+		}
+		d.activeResponseAudio = false
 		d.fsm.AudioStopped(now)
-		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
+		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(responseID) {
 			d.attentionAudioStopped = true
 			d.maybeAcknowledgeAttention(ctx)
 		}
+		d.finishActiveResponseIfDrained()
 		return d.maybeCreateResponse(ctx)
 
 	case openairt.EvOutputAudioCleared:
+		responseID := openairt.ExtractAudioResponseID(ev.Raw)
+		if !d.matchesActiveResponse(responseID) {
+			d.Log.Debug("stale realtime audio clear ignored", "response_id", responseID)
+			return nil
+		}
+		d.activeResponseAudio = false
 		d.fsm.AudioStopped(now)
 		// Cleared audio was not fully presented to the operator. Preserve the
-		// durable obligation for a later call rather than acknowledging it.
-		if d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
-			d.resetResponseAttention()
+		// durable obligation and retry the same bounded briefing at the next lull.
+		if d.matchesAttentionResponse(responseID) {
+			d.requeueResponseAttention()
 		}
+		d.finishActiveResponseIfDrained()
 		return d.maybeCreateResponse(ctx)
 
 	case openairt.EvResponseDone:
+		ref := openairt.ExtractResponseRef(ev.Raw)
+		if !d.matchesActiveResponse(ref.ID) {
+			d.Log.Debug("stale realtime response.done ignored", "response_id", ref.ID)
+			return nil
+		}
 		d.responseCreateEventID = ""
+		d.activeResponseDone = true
 		d.fsm.ResponseDone(now)
 		status := openairt.ExtractResponseStatus(ev.Raw)
-		ref := openairt.ExtractResponseRef(ev.Raw)
-		if len(d.responseAttention) > 0 && ref.ID != "" && ref.ID == d.attentionResponseID {
-			d.attentionResponseDone = status == "completed"
-			d.maybeAcknowledgeAttention(ctx)
-			if !d.attentionAudioStarted {
+		if len(d.responseAttention) > 0 && ref.ID == d.attentionResponseID {
+			if status == "completed" {
+				d.attentionResponseDone = true
+				d.maybeAcknowledgeAttention(ctx)
+			}
+			if len(d.responseAttention) > 0 && (status != "completed" || !d.attentionAudioStarted) {
 				// A completed text-only or rejected response is not evidence that
-				// the operator heard the briefing. Leave durable rows pending.
-				d.resetResponseAttention()
+				// the operator heard the briefing. Retry the exact bounded briefing.
+				d.requeueResponseAttention()
 			}
 		}
 		if status != "" && status != "completed" {
@@ -536,8 +587,10 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		}
 		calls := openairt.ExtractFuncCalls(ev.Raw)
 		if len(calls) == 0 {
+			d.finishActiveResponseIfDrained()
 			return d.maybeCreateResponse(ctx)
 		}
+		d.finishActiveResponseIfDrained()
 		d.startToolBatch(ctx, calls)
 		return nil
 
@@ -545,17 +598,24 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		msg := openairt.ExtractError(ev.Raw)
 		errorEventID := openairt.ExtractErrorEventID(ev.Raw)
 		matchesPendingCreate := d.responseCreateEventID != "" && errorEventID == d.responseCreateEventID
-		if matchesPendingCreate && errorEventID == d.attentionRequestID {
-			d.resetResponseAttention()
+		rejectedAttention := matchesPendingCreate && errorEventID == d.attentionRequestID
+		if rejectedAttention {
+			d.requeueResponseAttention()
 		}
 		if openairt.ExtractErrorCode(ev.Raw) == "conversation_already_has_active_response" {
-			// Preserve the active turn and avoid an audible error loop, which
-			// would itself attempt another response.create.
-			if matchesPendingCreate {
-				d.responseCreateEventID = ""
+			if !matchesPendingCreate {
+				d.Log.Debug("stale duplicate-active realtime error ignored", "err", msg)
+				return nil
 			}
-			d.fsm.ResponseStarted(now)
-			d.Log.Warn("duplicate realtime response request suppressed", "err", msg)
+			// This create was rejected, so no correlated response ID can follow.
+			// Clear only its provisional state; attention was requeued above and
+			// will be retried at the next safe lull.
+			d.responseCreateEventID = ""
+			d.fsm.ResponseDone(now)
+			if !rejectedAttention {
+				d.pendingContinuation = true
+			}
+			d.Log.Warn("duplicate realtime response request rejected", "err", msg)
 			d.Bus.Publish(events.KindErrorVoice, "", map[string]string{"message": msg, "status": "suppressed"})
 			return nil
 		}
@@ -565,7 +625,9 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 			// provisional busy state; unrelated asynchronous errors cannot.
 			d.responseCreateEventID = ""
 			d.fsm.ResponseDone(now)
-			d.pendingContinuation = true
+			if !rejectedAttention {
+				d.pendingContinuation = true
+			}
 		}
 		d.Log.Warn("realtime error event", "err", msg)
 		d.Bus.Publish(events.KindErrorVoice, "", map[string]string{"message": msg})
@@ -623,6 +685,17 @@ func (d *Desk) attentionBriefing(items []store.Attention) (injection, bool) {
 	return injection{role: "system", text: text.String(), respond: true, attention: ids}, true
 }
 
+func (d *Desk) matchesActiveResponse(responseID string) bool {
+	return d.activeResponseID != "" && responseID == d.activeResponseID
+}
+
+func (d *Desk) finishActiveResponseIfDrained() {
+	if d.activeResponseDone && !d.activeResponseAudio {
+		d.activeResponseID = ""
+		d.activeResponseDone = false
+	}
+}
+
 func (d *Desk) matchesAttentionResponse(responseID string) bool {
 	return d.attentionResponseID != "" && responseID == d.attentionResponseID
 }
@@ -650,11 +723,35 @@ func (d *Desk) maybeAcknowledgeAttention(ctx context.Context) {
 
 func (d *Desk) resetResponseAttention() {
 	d.responseAttention = nil
+	d.responseAttentionBriefing = injection{}
 	d.attentionRequestID = ""
 	d.attentionResponseID = ""
 	d.attentionResponseDone = false
 	d.attentionAudioStarted = false
 	d.attentionAudioStopped = false
+}
+
+func (d *Desk) requeueResponseAttention() {
+	if len(d.responseAttention) == 0 {
+		return
+	}
+	briefing := cloneInjection(d.responseAttentionBriefing)
+	briefing.attention = append(briefing.attention[:0], d.responseAttention...)
+	d.resetResponseAttention()
+	d.queueAttentionRetry(briefing)
+}
+
+func (d *Desk) queueAttentionRetry(inj injection) {
+	if len(inj.attention) == 0 {
+		return
+	}
+	retry := cloneInjection(inj)
+	d.attentionRetry = &retry
+}
+
+func cloneInjection(inj injection) injection {
+	inj.attention = append([]int64(nil), inj.attention...)
+	return inj
 }
 
 // announcementFor turns a job event into a system-message injection the
