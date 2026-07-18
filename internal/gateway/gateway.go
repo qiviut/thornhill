@@ -127,12 +127,30 @@ func canonicalRequestOrigin(r *http.Request) (string, bool) {
 	scheme := strings.ToLower(r.URL.Scheme)
 	if r.TLS != nil {
 		scheme = "https"
-	} else if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwarded != "" {
-		scheme = strings.ToLower(forwarded)
+	} else if forwarded := trustedForwardedProto(r); forwarded != "" {
+		scheme = forwarded
 	} else if scheme == "" {
 		scheme = "http"
 	}
 	return canonicalHTTPOrigin(scheme, r.Host)
+}
+
+// trustedForwardedProto honors proxy metadata only on the documented local
+// Tailscale Serve hop. A direct remote peer cannot redefine its request origin.
+func trustedForwardedProto(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return ""
+	}
+	forwarded := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]))
+	if forwarded != "http" && forwarded != "https" {
+		return ""
+	}
+	return forwarded
 }
 
 func canonicalHTTPOrigin(scheme, hostport string) (string, bool) {

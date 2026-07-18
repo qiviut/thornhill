@@ -89,6 +89,7 @@ func TestPushSubscriptionRequiresSameOriginAndValidKeys(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		requestURL     string
+		remoteAddr     string
 		forwardedProto string
 		allowedOrigins []string
 		origin         string
@@ -96,7 +97,8 @@ func TestPushSubscriptionRequiresSameOriginAndValidKeys(t *testing.T) {
 		want           int
 	}{
 		{name: "same origin", origin: "https://thornhill.example", body: body, want: http.StatusNoContent},
-		{name: "same origin behind HTTPS proxy", requestURL: "http://thornhill.example/api/push/subscriptions", forwardedProto: "https", origin: "https://thornhill.example", body: body, want: http.StatusNoContent},
+		{name: "same origin behind trusted HTTPS proxy", requestURL: "http://thornhill.example/api/push/subscriptions", remoteAddr: "127.0.0.1:12345", forwardedProto: "https", origin: "https://thornhill.example", body: body, want: http.StatusNoContent},
+		{name: "untrusted peer cannot spoof HTTPS proxy", requestURL: "http://thornhill.example/api/push/subscriptions", remoteAddr: "198.51.100.23:12345", forwardedProto: "https", origin: "https://thornhill.example", body: body, want: http.StatusForbidden},
 		{name: "HTTP to HTTPS cross scheme", origin: "http://thornhill.example", body: body, want: http.StatusForbidden},
 		{name: "configured host cannot bypass scheme", allowedOrigins: []string{"thornhill.example"}, origin: "http://thornhill.example", body: body, want: http.StatusForbidden},
 		{name: "configured cross origin cannot enroll", allowedOrigins: []string{"evil.example"}, origin: "https://evil.example", body: body, want: http.StatusForbidden},
@@ -122,6 +124,9 @@ func TestPushSubscriptionRequiresSameOriginAndValidKeys(t *testing.T) {
 			}
 			req := httptest.NewRequest(http.MethodPost, requestURL, strings.NewReader(tc.body))
 			req.Host = "thornhill.example"
+			if tc.remoteAddr != "" {
+				req.RemoteAddr = tc.remoteAddr
+			}
 			if tc.forwardedProto != "" {
 				req.Header.Set("X-Forwarded-Proto", tc.forwardedProto)
 			}

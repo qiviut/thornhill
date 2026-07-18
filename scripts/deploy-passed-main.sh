@@ -174,6 +174,28 @@ verify_live_revision() {
   verify_running_revision "${expected}"
 }
 
+stop_database_cleanly() {
+  local container="${PROJECT_NAME}-db-1" pid1_uid exit_code
+  if ! docker container inspect "${container}" >/dev/null 2>&1 || \
+    [[ $(docker inspect "${container}" --format '{{.State.Running}}') != true ]]; then
+    return 0
+  fi
+  pid1_uid=$(docker exec "${container}" stat -c %u /proc/1)
+  if [[ "${pid1_uid}" == 70 ]]; then
+    "${compose[@]}" stop --timeout 30 db
+    return
+  fi
+
+  # One-time upgrade path from the former root-owned tini shim. With all
+  # capabilities dropped, that shim cannot signal UID-70 PostgreSQL. Ask
+  # PostgreSQL itself to checkpoint and stop as its owning user instead.
+  echo "Stopping legacy PostgreSQL PID 1 (uid=${pid1_uid}) through pg_ctl"
+  docker exec --detach --user 70:70 "${container}" \
+    sh -ec 'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
+  exit_code=$(timeout 35s docker wait "${container}")
+  [[ "${exit_code}" == 0 ]]
+}
+
 cleanup_worktrees() {
   local directory
   for directory in "${source_dir}" "${previous_source_dir}"; do
@@ -192,7 +214,7 @@ rollback() {
     # Stop the application before PostgreSQL so the database can checkpoint and
     # exit cleanly even when the failed stack still owns pooled connections.
     "${compose[@]}" stop --timeout 30 app >/dev/null 2>&1 || true
-    "${compose[@]}" stop --timeout 30 db >/dev/null 2>&1 || true
+    stop_database_cleanly >/dev/null 2>&1 || true
     if THORNHILL_APP_IMAGE="${previous_image}" THORNHILL_POSTGRES_IMAGE="${previous_db_image}" \
       "${previous_compose[@]}" up -d --no-build --force-recreate db app >/dev/null; then
       deadline=$((SECONDS + TIMEOUT_SECONDS))
@@ -352,7 +374,7 @@ stage=stop
 # Compose replacement can otherwise stop the dependency before its client. Stop
 # the app first, then give PostgreSQL its full clean-shutdown grace period.
 "${compose[@]}" stop --timeout 30 app
-"${compose[@]}" stop --timeout 30 db
+stop_database_cleanly
 stage=deploy
 THORNHILL_APP_IMAGE="${image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
   "${compose[@]}" up -d --no-build --force-recreate db app

@@ -8,6 +8,7 @@ db_image=${2:-thornhill-postgres:ci}
 suffix="${GITHUB_RUN_ID:-local}-$$"
 network="thornhill-hardening-${suffix}"
 db="thornhill-hardening-db-${suffix}"
+legacy_db="thornhill-hardening-legacy-db-${suffix}"
 app="thornhill-hardening-app-${suffix}"
 db_url="postgres://thornhill:thornhill-test-only@${db}:5432/thornhill?sslmode=disable"
 
@@ -30,30 +31,38 @@ jq -e '
 }
 
 cleanup() {
-  docker rm --force "$app" "$db" >/dev/null 2>&1 || true
+  docker rm --force "$app" "$db" "$legacy_db" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 fail_with_logs() {
   printf '%s\n' "$1" >&2
-  if docker container inspect "$app" >/dev/null 2>&1; then
-    docker logs "$app" >&2 || true
-  fi
-  if docker container inspect "$db" >/dev/null 2>&1; then
-    docker logs "$db" >&2 || true
-  fi
+  local container
+  for container in "$app" "$db" "$legacy_db"; do
+    if docker container inspect "$container" >/dev/null 2>&1; then
+      docker logs "$container" >&2 || true
+    fi
+  done
   exit 1
 }
 
 postgres_ready() {
+  local container=${1:-$db} pid1_comm=${2:-postgres}
   # The official image briefly starts a temporary PostgreSQL server during
   # initialization, then stops it before exec'ing the final server as PID 1.
-  # Requiring that process shape prevents a transient pg_isready success from
-  # racing the intentional shutdown.
-  docker exec "$db" sh -c \
-    'test "$(cat /proc/1/comm)" = postgres && pg_isready --username thornhill --dbname thornhill' \
+  # Requiring the expected process shape prevents a transient pg_isready success
+  # from racing the intentional shutdown.
+  docker exec "$container" sh -c \
+    'test "$(cat /proc/1/comm)" = "$1" && pg_isready --username thornhill --dbname thornhill' sh "$pid1_comm" \
     >/dev/null 2>&1
+}
+
+legacy_postgres_ready() {
+  local logs
+  logs=$(docker logs "$legacy_db" 2>&1)
+  [[ "$logs" == *'PostgreSQL init process complete; ready for start up.'* ]] &&
+    docker exec "$legacy_db" pg_isready --username thornhill --dbname thornhill >/dev/null 2>&1
 }
 
 revision=$(docker image inspect "$app_image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
@@ -162,6 +171,42 @@ docker stop "$db" >/dev/null
 db_logs=$(docker logs "$db" 2>&1)
 [[ "$db_logs" == *'database system is shut down'* && "$db_logs" != *'database system was not properly shut down'* ]] || \
   fail_with_logs 'PostgreSQL fast shutdown did not produce a clean checkpointed exit'
+
+# Qualify the one-time deployment path from the former init:true model. The
+# root-owned tini shim cannot forward signals with all capabilities dropped, so
+# the deployer must invoke pg_ctl as PostgreSQL's UID before recreation.
+docker run --init --detach --name "$legacy_db" --network "$network" \
+  --env POSTGRES_USER=thornhill \
+  --env POSTGRES_PASSWORD=thornhill-test-only \
+  --env POSTGRES_DB=thornhill \
+  --read-only \
+  --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \
+  --tmpfs /run/postgresql:rw,noexec,nosuid,size=16m,uid=70,gid=70,mode=2775 \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE \
+  --cap-add FOWNER \
+  --cap-add SETGID \
+  --cap-add SETUID \
+  --security-opt no-new-privileges:true \
+  --pids-limit 256 \
+  "$db_image" >/dev/null
+for _ in {1..60}; do
+  if legacy_postgres_ready; then
+    break
+  fi
+  sleep 1
+done
+legacy_postgres_ready || fail_with_logs 'Legacy init-shim PostgreSQL did not become ready'
+[[ "$(docker exec "$legacy_db" stat -c %u /proc/1)" == 0 ]] || fail_with_logs 'Legacy qualification container did not run a root-owned init shim'
+docker exec --detach --user 70:70 "$legacy_db" sh -ec \
+  'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
+legacy_exit=$(timeout 35s docker wait "$legacy_db")
+[[ "$legacy_exit" == 0 ]] || fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not exit cleanly'
+legacy_logs=$(docker logs "$legacy_db" 2>&1)
+[[ "$legacy_logs" == *'database system is shut down'* && "$legacy_logs" != *'database system was not properly shut down'* ]] || \
+  fail_with_logs 'Legacy PostgreSQL pg_ctl fallback did not checkpoint cleanly'
 
 docker stop --time 10 "$app" >/dev/null
 [[ "$(docker inspect "$app" --format '{{.State.ExitCode}}')" == 0 ]] || fail_with_logs 'Application did not stop cleanly on SIGTERM'

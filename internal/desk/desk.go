@@ -95,6 +95,9 @@ type Desk struct {
 	responseMu                sync.Mutex
 	responseCreateEventID     string
 	responseSeq               uint64
+	activeResponseID          string
+	activeResponseDone        bool
+	activeResponseAudio       bool
 	toolResults               chan toolBatch
 	attentionClaimToken       string
 	responseAttention         []int64
@@ -485,42 +488,74 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		}
 
 	case openairt.EvResponseCreated:
-		d.responseCreateEventID = ""
-		d.fsm.ResponseStarted(now)
 		ref := openairt.ExtractResponseRef(ev.Raw)
-		if len(d.responseAttention) > 0 && ref.ID != "" && ref.RequestID == d.attentionRequestID {
+		if ref.ID == "" || ref.RequestID == "" || ref.RequestID != d.responseCreateEventID {
+			d.Log.Debug("stale realtime response.created ignored", "response_id", ref.ID)
+			return nil
+		}
+		d.responseCreateEventID = ""
+		d.activeResponseID = ref.ID
+		d.activeResponseDone = false
+		d.activeResponseAudio = false
+		d.fsm.ResponseStarted(now)
+		if len(d.responseAttention) > 0 && ref.RequestID == d.attentionRequestID {
 			d.attentionResponseID = ref.ID
 		}
 
 	case openairt.EvOutputAudioStarted:
+		responseID := openairt.ExtractAudioResponseID(ev.Raw)
+		if !d.matchesActiveResponse(responseID) {
+			d.Log.Debug("stale realtime audio start ignored", "response_id", responseID)
+			return nil
+		}
+		d.activeResponseAudio = true
 		d.fsm.AudioStarted(now)
-		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
+		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(responseID) {
 			d.attentionAudioStarted = true
 		}
 
 	case openairt.EvOutputAudioStopped:
+		responseID := openairt.ExtractAudioResponseID(ev.Raw)
+		if !d.matchesActiveResponse(responseID) {
+			d.Log.Debug("stale realtime audio stop ignored", "response_id", responseID)
+			return nil
+		}
+		d.activeResponseAudio = false
 		d.fsm.AudioStopped(now)
-		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
+		if len(d.responseAttention) > 0 && d.matchesAttentionResponse(responseID) {
 			d.attentionAudioStopped = true
 			d.maybeAcknowledgeAttention(ctx)
 		}
+		d.finishActiveResponseIfDrained()
 		return d.maybeCreateResponse(ctx)
 
 	case openairt.EvOutputAudioCleared:
+		responseID := openairt.ExtractAudioResponseID(ev.Raw)
+		if !d.matchesActiveResponse(responseID) {
+			d.Log.Debug("stale realtime audio clear ignored", "response_id", responseID)
+			return nil
+		}
+		d.activeResponseAudio = false
 		d.fsm.AudioStopped(now)
 		// Cleared audio was not fully presented to the operator. Preserve the
 		// durable obligation and retry the same bounded briefing at the next lull.
-		if d.matchesAttentionResponse(openairt.ExtractAudioResponseID(ev.Raw)) {
+		if d.matchesAttentionResponse(responseID) {
 			d.requeueResponseAttention()
 		}
+		d.finishActiveResponseIfDrained()
 		return d.maybeCreateResponse(ctx)
 
 	case openairt.EvResponseDone:
+		ref := openairt.ExtractResponseRef(ev.Raw)
+		if !d.matchesActiveResponse(ref.ID) {
+			d.Log.Debug("stale realtime response.done ignored", "response_id", ref.ID)
+			return nil
+		}
 		d.responseCreateEventID = ""
+		d.activeResponseDone = true
 		d.fsm.ResponseDone(now)
 		status := openairt.ExtractResponseStatus(ev.Raw)
-		ref := openairt.ExtractResponseRef(ev.Raw)
-		if len(d.responseAttention) > 0 && ref.ID != "" && ref.ID == d.attentionResponseID {
+		if len(d.responseAttention) > 0 && ref.ID == d.attentionResponseID {
 			if status == "completed" {
 				d.attentionResponseDone = true
 				d.maybeAcknowledgeAttention(ctx)
@@ -552,8 +587,10 @@ func (d *Desk) handleServer(ctx context.Context, ev openairt.ServerEvent, pendin
 		}
 		calls := openairt.ExtractFuncCalls(ev.Raw)
 		if len(calls) == 0 {
+			d.finishActiveResponseIfDrained()
 			return d.maybeCreateResponse(ctx)
 		}
+		d.finishActiveResponseIfDrained()
 		d.startToolBatch(ctx, calls)
 		return nil
 
@@ -637,6 +674,17 @@ func (d *Desk) attentionBriefing(items []store.Attention) (injection, bool) {
 		ids = append(ids, item.ID)
 	}
 	return injection{role: "system", text: text.String(), respond: true, attention: ids}, true
+}
+
+func (d *Desk) matchesActiveResponse(responseID string) bool {
+	return d.activeResponseID != "" && responseID == d.activeResponseID
+}
+
+func (d *Desk) finishActiveResponseIfDrained() {
+	if d.activeResponseDone && !d.activeResponseAudio {
+		d.activeResponseID = ""
+		d.activeResponseDone = false
+	}
 }
 
 func (d *Desk) matchesAttentionResponse(responseID string) bool {
