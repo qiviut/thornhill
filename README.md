@@ -28,12 +28,43 @@ in the browser. Audio flows browser↔OpenAI directly.
 ## Run it
 
 ```sh
-cp .env.example .env   # set OPENAI_API_KEY
+umask 077
+{
+  printf 'THORNHILL_DB_PASSWORD=%s\n' "$(openssl rand -hex 32)"
+  grep -v '^THORNHILL_DB_PASSWORD=' .env.example
+} > .env
+chmod 600 .env
+# Set OPENAI_API_KEY in .env. Keep the generated database password stable.
 # Default host exposure is loopback. For an intentional tailnet deployment:
 # THORNHILL_BIND_ADDR=100.x.y.z docker compose up --build -d
 docker compose up --build -d
 # open http://127.0.0.1:8787 — tap the ring
 ```
+
+`THORNHILL_DB_PASSWORD` must be exactly 64 lowercase hexadecimal characters so
+it is safe in the PostgreSQL URL without a second encoding layer. It is a
+per-deployment secret: do not commit, print, or regenerate it on routine deploys.
+The CI-gated deployer rotates the persisted PostgreSQL role to this value only
+after the old application stops, journals every destructive phase for restart
+recovery, and uses the same credential override if it must roll back to the prior
+image. It refuses environment files readable by group/other.
+
+If this host already has a `thornhill-db-1` volume initialized by a release that
+predates `THORNHILL_DB_PASSWORD`, rotate that existing role once before using
+`docker compose up` directly (the CI-gated deployer performs this automatically):
+
+```sh
+docker start thornhill-db-1
+while IFS='=' read -r key value; do
+  [ "$key" = THORNHILL_DB_PASSWORD ] && printf '%s\n' "$value"
+done < .env | scripts/rotate-postgres-role-password.sh thornhill-db-1
+docker compose up --build -d
+```
+
+The database entrypoint validates the credential before initializing a fresh volume,
+and the application validates it again at startup. A shape-valid password that has
+not been rotated into an existing volume still fails authentication rather than
+falling back to the former repository-known value.
 
 With `HERMES_BASE_URL` unset, a stub worker fakes a 90-second job
 (including one clarifying question halfway) so the entire voice loop —

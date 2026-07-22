@@ -229,6 +229,7 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 		"go tool govulncheck",
 		"go test -race ./...",
 		"scripts/test-deployer-policy.sh",
+		"scripts/test-deployer-transition-recovery.sh",
 		"scripts/test-fuzz.sh",
 		"TestProviderProcessConformance",
 		"npm run lint",

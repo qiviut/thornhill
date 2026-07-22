@@ -6,7 +6,7 @@ if [[ "${ROOT}" == *[' ']* ]]; then
   echo "Repository path with spaces is not supported: ${ROOT@Q}" >&2
   exit 1
 fi
-for command in git gh jq docker curl flock timeout python3 systemctl; do
+for command in git gh jq docker curl flock timeout python3 systemctl stat id; do
   command -v "${command}" >/dev/null || { echo "Missing required command: ${command}" >&2; exit 1; }
 done
 docker buildx version >/dev/null || {
@@ -15,6 +15,12 @@ docker buildx version >/dev/null || {
 }
 if [[ ! -f "${ROOT}/.env" ]]; then
   echo "Missing host-local ${ROOT}/.env" >&2
+  exit 1
+fi
+env_owner=$(stat -c %u "${ROOT}/.env")
+env_mode=$(stat -c %a "${ROOT}/.env")
+if [[ "${env_owner}" != "$(id -u)" ]] || (( (8#${env_mode} & 077) != 0 )); then
+  echo "${ROOT}/.env must be owned by the deployment user and inaccessible to group/other (chmod 600)" >&2
   exit 1
 fi
 : "${PUBLIC_APP_URL:?set the externally reachable Thornhill URL}"

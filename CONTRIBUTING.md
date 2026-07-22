@@ -28,7 +28,8 @@ go test -tags=integration -count=1 -run '^TestProviderProcessConformance$' ./int
   npm run build
   npm audit --audit-level=high
 )
-THORNHILL_ENV_FILE=.env.example docker compose config --quiet
+THORNHILL_DB_PASSWORD="$(printf '%064d' 0)" \
+  THORNHILL_ENV_FILE=.env.example docker compose config --quiet
 ```
 
 Container and PostgreSQL integration checks also run in GitHub Actions. See [`docs/ci-security.md`](docs/ci-security.md) for the trust model.

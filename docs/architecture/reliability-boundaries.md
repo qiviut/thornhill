@@ -63,5 +63,34 @@ type assertion, and do not leave validated application state broadly typed.
   Automatic promotion accepts additive backward-compatible changes only;
   incompatible migrations require an operator-controlled forward/restore plan.
 - Production database credentials belong in the untracked deployment environment,
-  not the Compose files. Credential rotation must update the persisted PostgreSQL
-  role and the environment as one maintenance operation.
+  not the Compose files. The environment file is deployment-user-owned and denies
+  group/other access; the application independently validates the 64-character
+  lowercase-hex transport form at startup.
+- Existing-volume credential rotation is a durable maintenance transaction. Before
+  stopping either service, the deployer atomically journals the old/new revisions,
+  images, CI run, phase, and a password fingerprint (never the password), fsyncs
+  the file, renames it, and fsyncs the state directory. Every destructive phase
+  advances that journal. A later run reconciles it before the ordinary
+  already-current fast path, conservatively treating the role as possibly rotated
+  and converging forward or using the retained rollback artifacts. A changed
+  secret, malformed phase, or missing artifact fails closed.
+- Dispatch is unpaused only after the target or rollback public/local endpoints,
+  application revision, database image, and configured database authentication all
+  verify. Endpoint and container checks propagate each failure explicitly even when
+  called from conditional retry loops. Recovery first verifies the durable dispatch
+  pause and zero active jobs, then stops the application. A missing application
+  container or stable exited candidate is an idempotent stop success; PostgreSQL
+  retains the stricter stable exit-zero checkpoint requirement.
+- Target completion durably removes the journal while dispatch is still paused; a
+  crash in the final gap therefore leaves the latest healthy revision safely paused
+  for the ordinary already-current path to heal. Rollback instead persists a
+  `rollback_verified` marker with the previous/journaled credential model, unpauses,
+  and only then removes the marker. A crash in that gap re-verifies the previous
+  runtime, durably restores the failed-target quarantine, and consumes the marker
+  without retrying the quarantined target. An unverified rollback deliberately
+  leaves dispatch paused for operator recovery rather than reopening admission into
+  an unknown runtime state.
+- Before `ALTER ROLE`, the credential helper proves that the same disposable
+  PostgreSQL client image can launch, resolve, and reach the database network.
+  Runtime completion also compares the running application's password fingerprint
+  with the host environment and independently authenticates from that client.

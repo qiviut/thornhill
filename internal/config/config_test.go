@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -30,6 +31,34 @@ func TestLoadParsesAllowedOrigins(t *testing.T) {
 	}
 	if cfg.ApprovalParkAfter != 45*time.Second {
 		t.Fatalf("ApprovalParkAfter = %s, want 45s", cfg.ApprovalParkAfter)
+	}
+}
+
+func TestLoadRejectsMalformedDatabasePassword(t *testing.T) {
+	for _, value := range []string{
+		"",
+		"abc",
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF",
+		"g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	} {
+		t.Run(fmt.Sprintf("length-%d", len(value)), func(t *testing.T) {
+			t.Setenv("OPENAI_API_KEY", "test-key")
+			t.Setenv("DATABASE_URL", "postgres://test:***@localhost/test")
+			t.Setenv("THORNHILL_DB_PASSWORD", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "THORNHILL_DB_PASSWORD") {
+				t.Fatalf("Load() error = %v, want database password validation error", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsDeploymentDatabasePassword(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("DATABASE_URL", "postgres://test:***@localhost/test")
+	t.Setenv("THORNHILL_DB_PASSWORD", strings.Repeat("a", 64))
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
 	}
 }
 

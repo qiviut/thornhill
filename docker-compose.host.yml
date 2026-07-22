@@ -10,5 +10,5 @@ services:
     network_mode: host
     ports: !reset []
     environment:
-      DATABASE_URL: postgres://thornhill:thornhill@127.0.0.1:55432/thornhill?sslmode=disable
+      DATABASE_URL: postgres://thornhill:${THORNHILL_DB_PASSWORD:?set a 64-character lowercase hex THORNHILL_DB_PASSWORD in .env}@127.0.0.1:55432/thornhill?sslmode=disable
       LISTEN_ADDR: 127.0.0.1:8787

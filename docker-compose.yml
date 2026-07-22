@@ -4,10 +4,27 @@ services:
       context: .
       dockerfile: Dockerfile.postgres
     image: ${THORNHILL_POSTGRES_IMAGE:-thornhill-postgres}
+    # Validate before the official entrypoint can initialize a persistent volume.
+    # Compose itself only enforces non-empty interpolation, so this protects the
+    # direct `docker compose up` path as well as the controlled deployer.
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        case "$${POSTGRES_PASSWORD}" in
+          ''|*[!0-9a-f]*) echo 'POSTGRES_PASSWORD must be 64 lowercase hexadecimal characters' >&2; exit 64 ;;
+        esac
+        [ "$${#POSTGRES_PASSWORD}" -eq 64 ] || {
+          echo 'POSTGRES_PASSWORD must be 64 lowercase hexadecimal characters' >&2
+          exit 64
+        }
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - --
+    command: ["postgres"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: thornhill
-      POSTGRES_PASSWORD: thornhill
+      POSTGRES_PASSWORD: ${THORNHILL_DB_PASSWORD:?set a 64-character lowercase hex THORNHILL_DB_PASSWORD in .env}
       POSTGRES_DB: thornhill
     volumes:
       # PostgreSQL 18+ stores versioned clusters below /var/lib/postgresql.
@@ -51,7 +68,8 @@ services:
     image: ${THORNHILL_APP_IMAGE:-thornhill-app}
     env_file: ${THORNHILL_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgres://thornhill:thornhill@db:5432/thornhill?sslmode=disable
+      THORNHILL_DB_PASSWORD: ${THORNHILL_DB_PASSWORD:?set a 64-character lowercase hex THORNHILL_DB_PASSWORD in .env}
+      DATABASE_URL: postgres://thornhill:${THORNHILL_DB_PASSWORD:?set a 64-character lowercase hex THORNHILL_DB_PASSWORD in .env}@db:5432/thornhill?sslmode=disable
     ports:
       # Safe by default: local-only. Set THORNHILL_BIND_ADDR to the host's
       # Tailscale address for an intentional tailnet-only deployment.
