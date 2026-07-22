@@ -11,16 +11,24 @@ db="thornhill-hardening-db-${suffix}"
 legacy_db="thornhill-hardening-legacy-db-${suffix}"
 failed_db="thornhill-hardening-failed-db-${suffix}"
 app="thornhill-hardening-app-${suffix}"
-db_url="postgres://thornhill:thornhill-test-only@${db}:5432/thornhill?sslmode=disable"
+malformed_project="thornhill-malformed-${suffix}"
+bootstrap_project="thornhill-bootstrap-${suffix}"
+compose_password=$(openssl rand -hex 32)
+initial_password=${compose_password}
+db_url="postgres://thornhill:${compose_password}@${db}:5432/thornhill?sslmode=disable"
 
-compose_model=$(THORNHILL_ENV_FILE="${root}/.env.example" \
+compose_model=$(THORNHILL_DB_PASSWORD="${compose_password}" THORNHILL_ENV_FILE="${root}/.env.example" \
   THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
   docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" config --format json)
-jq -e '
+jq -e --arg password "${compose_password}" '
   (.services.app | .init == true and .read_only == true and .pids_limit == 256 and
     .cap_drop == ["ALL"] and (.security_opt | index("no-new-privileges:true")) != null and
-    (.tmpfs | index("/tmp:rw,noexec,nosuid,size=64m")) != null) and
+    (.tmpfs | index("/tmp:rw,noexec,nosuid,size=64m")) != null and
+    .environment.DATABASE_URL == ("postgres://thornhill:" + $password + "@db:5432/thornhill?sslmode=disable")) and
   (.services.db | .init == false and .read_only == true and .pids_limit == 256 and
+    .environment.POSTGRES_PASSWORD == $password and
+    .command == ["postgres"] and
+    (.entrypoint[2] | contains("POSTGRES_PASSWORD must be 64 lowercase hexadecimal characters")) and
     .cap_drop == ["ALL"] and
     (.cap_add | sort) == (["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"] | sort) and
     (.security_opt | index("no-new-privileges:true")) != null and
@@ -34,6 +42,14 @@ jq -e '
 cleanup() {
   docker rm --force "$app" "$db" "$legacy_db" "$failed_db" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
+  THORNHILL_DB_PASSWORD=abc THORNHILL_ENV_FILE="${root}/.env.example" \
+    THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+    docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" \
+    --project-name "${malformed_project}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  THORNHILL_DB_PASSWORD="${initial_password}" THORNHILL_ENV_FILE="${root}/.env.example" \
+    THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+    docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" \
+    --project-name "${bootstrap_project}" down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -89,10 +105,50 @@ uid=${runtime_user%%:*}
 }
 [[ "$(docker run --rm "$app_image" --version)" == "thornhill ${revision}" ]]
 
+# Compose accepts any non-empty interpolation value. The database entrypoint
+# must reject a malformed credential before the official initializer touches a
+# fresh persistent volume.
+set +e
+malformed_output=$(
+  THORNHILL_DB_PASSWORD=abc THORNHILL_ENV_FILE="${root}/.env.example" \
+    THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+    timeout 30s docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" \
+    --project-name "${malformed_project}" run --rm --no-deps db 2>&1
+)
+malformed_status=$?
+set -e
+if [[ "${malformed_status}" != 64 || "${malformed_output}" != *'POSTGRES_PASSWORD must be 64 lowercase hexadecimal characters'* ]]; then
+  printf 'Malformed Compose bootstrap was not rejected before PostgreSQL initialization (status=%s)\n' \
+    "${malformed_status}" >&2
+  exit 1
+fi
+
+# The same wrapper must delegate a valid value to the upstream entrypoint and
+# reach the normal healthy UID-70 PostgreSQL runtime.
+THORNHILL_DB_PASSWORD="${initial_password}" THORNHILL_ENV_FILE="${root}/.env.example" \
+  THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+  docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" \
+  --project-name "${bootstrap_project}" up -d --no-build db >/dev/null
+bootstrap_db="${bootstrap_project}-db-1"
+for _ in {1..60}; do
+  [[ $(docker inspect "${bootstrap_db}" --format '{{.State.Health.Status}}' 2>/dev/null || true) == healthy ]] && break
+  sleep 1
+done
+if [[ $(docker inspect "${bootstrap_db}" --format '{{.State.Health.Status}}' 2>/dev/null || true) != healthy ]] || \
+  [[ $(docker exec "${bootstrap_db}" stat -c %u /proc/1) != 70 ]]; then
+  docker logs "${bootstrap_db}" >&2 || true
+  printf 'Valid Compose bootstrap did not reach healthy UID-70 PostgreSQL\n' >&2
+  exit 1
+fi
+THORNHILL_DB_PASSWORD="${initial_password}" THORNHILL_ENV_FILE="${root}/.env.example" \
+  THORNHILL_APP_IMAGE="${app_image}" THORNHILL_POSTGRES_IMAGE="${db_image}" \
+  docker compose --project-directory "${root}" --file "${root}/docker-compose.yml" \
+  --project-name "${bootstrap_project}" down --volumes --remove-orphans >/dev/null
+
 docker network create "$network" >/dev/null
 docker run --detach --name "$db" --network "$network" \
   --env POSTGRES_USER=thornhill \
-  --env POSTGRES_PASSWORD=thornhill-test-only \
+  --env "POSTGRES_PASSWORD=${compose_password}" \
   --env POSTGRES_DB=thornhill \
   --read-only \
   --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \
@@ -117,6 +173,15 @@ for _ in {1..60}; do
   sleep 1
 done
 postgres_ready || fail_with_logs 'PostgreSQL did not become ready'
+
+compose_password=$(openssl rand -hex 32)
+printf '%s\n' "${compose_password}" | "${root}/scripts/rotate-postgres-role-password.sh" "${db}"
+if PGPASSWORD="${initial_password}" timeout 20s docker run --rm --network "${network}" \
+  --env PGPASSWORD --entrypoint psql "${db_image}" -v ON_ERROR_STOP=1 -h "${db}" \
+  -U thornhill -d thornhill -Atq -c 'SELECT 1' >/dev/null 2>&1; then
+  fail_with_logs 'PostgreSQL accepted the superseded deployment credential'
+fi
+db_url="postgres://thornhill:${compose_password}@${db}:5432/thornhill?sslmode=disable"
 
 db_uid=$(docker exec "$db" stat -c %u /proc/1)
 db_readonly=$(docker inspect "$db" --format '{{.HostConfig.ReadonlyRootfs}}')
@@ -188,7 +253,7 @@ db_logs=$(docker logs "$db" 2>&1)
 docker run --init --detach --name "$legacy_db" --network "$network" \
   --restart unless-stopped \
   --env POSTGRES_USER=thornhill \
-  --env POSTGRES_PASSWORD=thornhill-test-only \
+  --env "POSTGRES_PASSWORD=${compose_password}" \
   --env POSTGRES_DB=thornhill \
   --read-only \
   --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m,uid=70,gid=70,mode=1777 \

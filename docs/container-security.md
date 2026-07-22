@@ -17,6 +17,25 @@ Thornhill treats the container image as a tested release artifact, not merely a 
 
 PostgreSQL remains a separate container and the application persists no state in its root filesystem. PostgreSQL's root entrypoint is an initialization boundary rather than the database runtime identity: after preparing the persistent volume, the database process directly beneath Docker's init is verified to run as upstream UID `70`. Node and Go toolchains never enter the application runtime layer.
 
+The PostgreSQL password is a per-deployment, 256-bit hexadecimal value from the
+untracked `.env`; no usable database credential is committed. It protects
+against accidental access by other host/container processes but is not presented
+as isolation from a Docker administrator, who already has root-equivalent access.
+For existing volumes, the CI-gated deployer stops the application, rotates the
+role through PostgreSQL's local socket, then restarts both services. Its rollback
+Compose override supplies that same new credential to an older application image,
+so credential rotation cannot silently destroy the known-good rollback target.
+The transition is phase-journaled in the deployment state directory before service
+shutdown, including file and directory fsyncs for power-loss durability; restart
+recovery runs before the already-current shortcut, pauses dispatch and drains active
+jobs before stopping the app, and retains the database dispatch pause unless the
+exact target or rollback is fully verified.
+The journal stores only a password fingerprint. The deployment environment itself
+must be owned by the deployment user with no group/other access, and both the
+deployer and application reject a malformed credential. The Compose database
+entrypoint performs the same validation before the official PostgreSQL initializer,
+so a malformed direct-Compose bootstrap cannot poison a fresh persistent volume.
+
 ## Build and dependency discipline
 
 `Dockerfile` uses deterministic lockfile installs (`npm ci --ignore-scripts` and committed Go checksums) and an explicit multi-stage build. `.dockerignore` excludes Git metadata, local environment files, dependency trees, coverage, and developer artifacts from the build context. Build arguments are metadata only; credentials must never be passed through `ARG`, `ENV`, copied files, labels, or provenance-visible inputs.

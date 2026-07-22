@@ -177,6 +177,19 @@ func validatePushConfig(c *Config) error {
 	return nil
 }
 
+func validateDatabasePassword() error {
+	password, configured := os.LookupEnv("THORNHILL_DB_PASSWORD")
+	if !configured {
+		return nil // Bare go-run deployments may provide only DATABASE_URL.
+	}
+	if len(password) != 64 || strings.IndexFunc(password, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f'))
+	}) != -1 {
+		return fmt.Errorf("THORNHILL_DB_PASSWORD must be exactly 64 lowercase hexadecimal characters")
+	}
+	return nil
+}
+
 func Load() (*Config, error) {
 	c := &Config{
 		OpenAIKey:           os.Getenv("OPENAI_API_KEY"),
@@ -215,6 +228,9 @@ func Load() (*Config, error) {
 	}
 	if c.OpenAIRealtimeWSURL == "" {
 		c.OpenAIRealtimeWSURL = realtimeURL(c.OpenAIBaseURL)
+	}
+	if err := validateDatabasePassword(); err != nil {
+		return nil, err
 	}
 	if err := validateProviderURL("OPENAI_BASE_URL", c.OpenAIBaseURL, false); err != nil {
 		return nil, err

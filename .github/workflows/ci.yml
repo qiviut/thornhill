@@ -91,6 +91,9 @@ jobs:
       - name: Test fail-closed deployer policy
         run: scripts/test-deployer-policy.sh
 
+      - name: Test restart-safe credential transition recovery
+        run: scripts/test-deployer-transition-recovery.sh
+
       - name: Fuzz authority and protocol boundaries
         env:
           FUZZTIME: 5s
@@ -154,7 +157,9 @@ jobs:
 
       - name: Validate Compose model
         run: |
-          THORNHILL_ENV_FILE=.env.example docker compose config --quiet
+          compose_password=$(printf '%064d' 0)
+          THORNHILL_DB_PASSWORD="${compose_password}" \
+            THORNHILL_ENV_FILE=.env.example docker compose config --quiet
           SCANNER_UID=$(id -u) SCANNER_GID=$(id -g) \
             docker compose --file .github/scanners/compose.yml --project-directory . config --quiet
 
