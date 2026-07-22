@@ -28,6 +28,7 @@ const (
 	defaultApprovalControlTimeout = 30 * time.Second
 	defaultApprovalParkAfter      = 15 * time.Minute
 	defaultStreamIdleAfter        = 20 * time.Minute
+	defaultResponseHeaderTimeout  = 30 * time.Second
 )
 
 var (
@@ -107,7 +108,7 @@ func NewHermes(baseURL, apiKey, model string, st JobStore, bus *events.Bus, log 
 	return &Hermes{
 		BaseURL: strings.TrimRight(baseURL, "/"), APIKey: apiKey, Model: model,
 		Store: st, Bus: bus, Log: log,
-		HTTP:                   &http.Client{Timeout: 0}, // event stream; request context governs
+		HTTP:                   newHermesHTTPClient(defaultResponseHeaderTimeout),
 		ApprovalControlTimeout: defaultApprovalControlTimeout,
 		ApprovalParkAfter:      defaultApprovalParkAfter,
 		StreamIdleAfter:        defaultStreamIdleAfter,
@@ -118,6 +119,16 @@ func NewHermes(baseURL, apiKey, model string, st JobStore, bus *events.Bus, log 
 		sessionAllows:          map[string]map[string]struct{}{},
 		sessionDenials:         map[string]map[string]struct{}{},
 	}
+}
+
+// newHermesHTTPClient bounds only the transport phase before response headers.
+// Client.Timeout must remain zero because a healthy run event stream can remain
+// open while the operator asks questions before making an approval decision.
+// Once headers arrive, runTurn owns stream silence and cancellation explicitly.
+func newHermesHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: transport}
 }
 
 func approvalLockKey(jobID, runID string) string {

@@ -11,6 +11,11 @@ Thornhill is a tailnet-deployed, single-operator voice desk for Hermes Agent wor
 - Do not commit `.env`, API keys, generated web assets, `web/node_modules`, `prebaked`, or `.beads/beads.db*`.
 - The default Compose exposure is loopback. Set `THORNHILL_BIND_ADDR` only to an intentional Tailscale address; do not publish the service to the public internet.
 - Keep WebSocket origins same-origin by default. Add narrow `ALLOWED_ORIGINS` entries only for deliberate development hosts such as `localhost:5173`.
+- Before changing job/run concurrency, approval behavior, protocol boundary types,
+  SQL query bounds, or deployment sequencing, read
+  [`docs/architecture/reliability-boundaries.md`](docs/architecture/reliability-boundaries.md).
+  It records the invariants that preserve explicit consent, durable ownership,
+  complete operator visibility, and rollback safety.
 
 ## Verification
 

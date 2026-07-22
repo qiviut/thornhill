@@ -54,6 +54,53 @@ func TestApprovalLocksSerializePerRunWithoutBlockingOtherRuns(t *testing.T) {
 	}
 }
 
+func TestHermesHTTPClientBoundsHeaderWaitWithoutTimingOutStreamBody(t *testing.T) {
+	t.Run("headers are bounded", func(t *testing.T) {
+		release := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			<-release
+		}))
+		defer func() {
+			close(release)
+			srv.Close()
+		}()
+
+		client := newHermesHTTPClient(25 * time.Millisecond)
+		started := time.Now()
+		_, err := client.Get(srv.URL)
+		if err == nil || !strings.Contains(err.Error(), "timeout awaiting response headers") {
+			t.Fatalf("Get error = %v, want response-header timeout", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("response-header timeout took %s", elapsed)
+		}
+	})
+
+	t.Run("stream body is not globally timed out", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			time.Sleep(60 * time.Millisecond)
+			_, _ = io.WriteString(w, "event stream remains owned by run context")
+		}))
+		defer srv.Close()
+
+		client := newHermesHTTPClient(20 * time.Millisecond)
+		if client.Timeout != 0 {
+			t.Fatalf("Client.Timeout = %s, want no whole-stream timeout", client.Timeout)
+		}
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil || string(body) != "event stream remains owned by run context" {
+			t.Fatalf("body=%q err=%v", body, err)
+		}
+	})
+}
+
 type fakeStore struct {
 	mu        sync.Mutex
 	jobs      map[string]store.Job
