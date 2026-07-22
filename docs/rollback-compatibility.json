@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "1b04ac950744cf62cbad6a8b19fa3b687e895e4d2e285bef58d5ed5c8acc73b1",
+  "schema_sha256": "e33662ec9f5fcf1efb27781366bb3af25093ff310e53ae01747aecf7fe80bca1",
   "mode": "backward-compatible-additive",
-  "rationale": "The attention_events, push_subscriptions, and push_deliveries tables and their indexes are additive. Existing job and deployment columns retain their prior meanings, so the previous application and PostgreSQL image can continue operating after this schema is applied; they simply ignore the new notification state. Destructive or version-coupled migrations must use mode manual-forward-only and are ineligible for automatic rollback deployment."
+  "rationale": "The added jobs expression/partial indexes and usage_ledger timestamp index do not change table data or application semantics. Existing application and PostgreSQL images can continue operating after this schema is applied; they ignore the additional indexes. Destructive or version-coupled migrations must use mode manual-forward-only and are ineligible for automatic rollback deployment."
 }

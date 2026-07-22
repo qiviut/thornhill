@@ -46,6 +46,11 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS pending_input TEXT NOT NULL DEFAULT ''
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS approvals JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress JSONB;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS state_version BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS jobs_display_name_lower_created_idx
+    ON jobs (lower(display_name), created_at DESC);
+CREATE INDEX IF NOT EXISTS jobs_active_created_idx
+    ON jobs (created_at DESC)
+    WHERE status IN ('queued','running','needs_input','needs_approval','parked_approval');
 CREATE TABLE IF NOT EXISTS approval_denials (
     pattern_key   TEXT PRIMARY KEY,
     source_job_id TEXT NOT NULL,
@@ -146,6 +151,7 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
     output_tokens BIGINT NOT NULL DEFAULT 0,
     est_usd       DOUBLE PRECISION NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS usage_ledger_ts_idx ON usage_ledger (ts);
 `
 
 type Job struct {
@@ -522,7 +528,8 @@ func (s *Store) ResolveJob(ctx context.Context, ref string) (Job, error) {
 	if j, err := scanJob(s.Pool.QueryRow(ctx, selectJob+` WHERE id=$1`, ref)); err == nil {
 		return j, nil
 	}
-	rows, err := s.Pool.Query(ctx, selectJob+` WHERE lower(display_name)=lower($1) ORDER BY created_at DESC`, ref)
+	// Only two rows are needed to distinguish a unique match from ambiguity.
+	rows, err := s.Pool.Query(ctx, selectJob+` WHERE lower(display_name)=lower($1) ORDER BY created_at DESC LIMIT 2`, ref)
 	if err != nil {
 		return Job{}, err
 	}
@@ -538,7 +545,7 @@ func (s *Store) ResolveJob(ctx context.Context, ref string) (Job, error) {
 	}
 	rows, err = s.Pool.Query(ctx, selectJob+
 		` WHERE display_name ILIKE '%'||$1||'%' AND status IN ('queued','running','needs_input','needs_approval','parked_approval')
-		  ORDER BY created_at DESC`, ref)
+		  ORDER BY created_at DESC LIMIT 2`, ref)
 	if err != nil {
 		return Job{}, err
 	}
@@ -569,8 +576,9 @@ func collect(rows pgx.Rows) ([]Job, error) {
 	return out, rows.Err()
 }
 
-// ActiveJobs returns non-terminal jobs, newest first: this is the live job
-// table the desk model keeps in context.
+// ActiveJobs returns every non-terminal job, newest first. This is deliberately
+// unbounded: hiding queued or authority-bearing work would make the operator's
+// live board incomplete. The partial active-status index keeps the scan scoped.
 func (s *Store) ActiveJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.Pool.Query(ctx, selectJob+
 		` WHERE status IN ('queued','running','needs_input','needs_approval','parked_approval') ORDER BY created_at DESC`)

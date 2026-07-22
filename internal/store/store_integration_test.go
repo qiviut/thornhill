@@ -58,6 +58,12 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 			t.Fatalf("table %s exists=%v err=%v", table, exists, err)
 		}
 	}
+	for _, index := range []string{"jobs_display_name_lower_created_idx", "jobs_active_created_idx", "usage_ledger_ts_idx"} {
+		var exists bool
+		if err := st.Pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, index).Scan(&exists); err != nil || !exists {
+			t.Fatalf("index %s exists=%v err=%v", index, exists, err)
+		}
+	}
 	resumable, err := st.CreateJob(ctx, randomTestValue(t, "drain_resume_", 24), randomTestValue(t, "task_", 48))
 	if err != nil {
 		t.Fatal(err)
@@ -230,6 +236,33 @@ func TestPostgresMigrationAndAtomicApprovalClaim(t *testing.T) {
 	}
 	if match, _ := st.MatchesPermanentAllow(ctx, patterns[:1]); match != "" {
 		t.Fatalf("subset unexpectedly matched allow policy: %q", match)
+	}
+}
+
+func TestPostgresSpokenLookupPreservesAmbiguityWithManyMatches(t *testing.T) {
+	databaseURL := os.Getenv("THORNHILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THORNHILL_TEST_DATABASE_URL is required")
+	}
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := Open(ctx, databaseURL, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Pool.Close()
+
+	name := randomTestValue(t, "same_spoken_name_", 18)
+	for range 3 {
+		if _, err := st.CreateJob(ctx, name, randomTestValue(t, "task_", 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.ResolveJob(ctx, name); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("exact duplicate lookup err=%v, want ErrAmbiguous", err)
+	}
+	if _, err := st.ResolveJob(ctx, name[len("same_"):]); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("substring duplicate lookup err=%v, want ErrAmbiguous", err)
 	}
 }
 
