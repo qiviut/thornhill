@@ -54,7 +54,20 @@ export const earcons = {
   },
 };
 
-const prebakedCache = new Map<string, HTMLAudioElement>();
+interface PrebakedAudio {
+  element: HTMLAudioElement;
+  objectURL: string;
+}
+
+interface PendingPrebakedAudio {
+  controller: AbortController;
+  promise: Promise<PrebakedAudio>;
+}
+
+const prebakedCache = new Map<string, PrebakedAudio>();
+const pendingPrebaked = new Map<string, PendingPrebakedAudio>();
+let prebakedGeneration = 0;
+const prebakedFetchTimeoutMs = 10_000;
 
 const earconFallback: Record<string, () => void> = {
   voice_lost: earcons.linkLost,
@@ -65,19 +78,53 @@ const earconFallback: Record<string, () => void> = {
   budget_tripped: earcons.jobFail,
 };
 
+/** Load one prebaked phrase. Concurrent callers share one owned request. */
+async function loadPrebaked(key: string): Promise<PrebakedAudio> {
+  const cached = prebakedCache.get(key);
+  if (cached) return cached;
+  const pending = pendingPrebaked.get(key);
+  if (pending) return pending.promise;
+
+  const controller = new AbortController();
+  const generation = prebakedGeneration;
+  const promise = (async () => {
+    const resp = await fetch(`/audio/prebaked/${key}.mp3`, {
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(prebakedFetchTimeoutMs)]),
+    });
+    if (!resp.ok) throw new Error(`http ${resp.status}`);
+    const blob = await resp.blob();
+    if (controller.signal.aborted || generation !== prebakedGeneration) {
+      throw new Error("prebaked load disposed");
+    }
+    const objectURL = URL.createObjectURL(blob);
+    try {
+      const value = { element: new Audio(objectURL), objectURL };
+      prebakedCache.set(key, value);
+      return value;
+    } catch (error) {
+      URL.revokeObjectURL(objectURL);
+      throw error;
+    }
+  })();
+  const owned = { controller, promise };
+  pendingPrebaked.set(key, owned);
+  void promise.then(
+    () => {
+      if (pendingPrebaked.get(key) === owned) pendingPrebaked.delete(key);
+    },
+    () => {
+      if (pendingPrebaked.get(key) === owned) pendingPrebaked.delete(key);
+    },
+  );
+  return promise;
+}
+
 /** Play a prebaked TTS phrase by key; earcon fallback if unavailable. */
 export async function playPrebaked(key: string): Promise<void> {
   try {
-    let el = prebakedCache.get(key);
-    if (!el) {
-      const resp = await fetch(`/audio/prebaked/${key}.mp3`);
-      if (!resp.ok) throw new Error(`http ${resp.status}`);
-      const blob = await resp.blob();
-      el = new Audio(URL.createObjectURL(blob));
-      prebakedCache.set(key, el);
-    }
-    el.currentTime = 0;
-    await el.play();
+    const { element } = await loadPrebaked(key);
+    element.currentTime = 0;
+    await element.play();
   } catch (err) {
     console.debug("prebaked unavailable, earcon fallback", key, err);
     (earconFallback[key] ?? earcons.jobFail)();
@@ -86,14 +133,16 @@ export async function playPrebaked(key: string): Promise<void> {
 
 /** Warm the cache in the background after first gesture. */
 export function prefetchPrebaked(keys: string[]): void {
-  for (const key of keys) {
-    if (prebakedCache.has(key)) continue;
-    void fetch(`/audio/prebaked/${key}.mp3`)
-      .then(async (r) => {
-        if (!r.ok) return;
-        const blob = await r.blob();
-        prebakedCache.set(key, new Audio(URL.createObjectURL(blob)));
-      })
-      .catch(() => {});
+  for (const key of new Set(keys)) {
+    void loadPrebaked(key).catch(() => {});
   }
+}
+
+/** Abort owned requests and release every generated object URL. */
+export function disposePrebaked(): void {
+  prebakedGeneration += 1;
+  for (const { controller } of pendingPrebaked.values()) controller.abort();
+  pendingPrebaked.clear();
+  for (const { objectURL } of prebakedCache.values()) URL.revokeObjectURL(objectURL);
+  prebakedCache.clear();
 }
