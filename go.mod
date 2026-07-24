@@ -6,7 +6,7 @@ require (
 	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/coder/websocket v1.8.15
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/oklog/ulid/v2 v2.1.1
+	github.com/oklog/ulid/v2 v2.1.2
 	github.com/riverqueue/river v0.40.0
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.40.0
 	go.yaml.in/yaml/v3 v3.0.4
