@@ -145,11 +145,15 @@ func (c *Client) send(ctx context.Context, v any) error {
 	return c.conn.Write(wctx, websocket.MessageText, data)
 }
 
+// truncate bounds by runes, not bytes. The debug payload carries instructions and
+// task text verbatim, and Go does not escape non-ASCII when marshalling, so a byte
+// cut would emit replacement characters into the log.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }
 
 // SessionUpdate pushes instructions, tools, transcription and truncation
