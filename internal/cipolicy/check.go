@@ -352,6 +352,13 @@ func checkDependabotApproval(root string) error {
 		`repos/${REPOSITORY}/pulls/${pull_request}/reviews`,
 		"-f event=APPROVE",
 		`-f "commit_id=${head_sha}"`,
+		// Unattended merging must stay delegated to Dependabot's own credentials
+		// and stay bound to the CI-tested SHA. The workflow-level permission
+		// assertion above already denies this lane `contents: write`, so it can
+		// request a merge but can never write to the protected branch itself.
+		"@dependabot squash and merge",
+		`merge_marker="Requested squash merge for ${head_sha}."`,
+		`repos/${REPOSITORY}/issues/${pull_request}/comments`,
 	} {
 		if !strings.Contains(lane.String(), required) {
 			return fmt.Errorf("%s approval lane must include %q", relative, required)

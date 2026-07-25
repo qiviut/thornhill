@@ -134,6 +134,26 @@ func TestCheckRejectsUnsafeDependabotApproval(t *testing.T) {
 			new:     "",
 			contain: "approval lane must include",
 		},
+		{
+			name:    "merge is not delegated to Dependabot",
+			old:     "@dependabot squash and merge",
+			new:     "gh pr merge --auto --squash",
+			contain: "approval lane must include",
+		},
+		{
+			name:    "merge request is not bound to the tested revision",
+			old:     `merge_marker="Requested squash merge for ${head_sha}."`,
+			new:     `merge_marker="Requested squash merge."`,
+			contain: "approval lane must include",
+		},
+		{
+			name: "merge lane takes write access to the protected branch",
+			old:  "  contents: read\n",
+			new:  "  contents: write\n",
+			// Delegating the merge to Dependabot is what keeps this lane free of
+			// branch write access; escalating it must remain a policy failure.
+			contain: "permission contents must be read",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

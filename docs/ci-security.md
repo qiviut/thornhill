@@ -44,7 +44,22 @@ The required check exercises:
 
 ### 2. Promotion: branch protection decides trust
 
-Only the exact revision that passed the required check may merge to `main`. Dependabot pull requests use the same secretless qualification lane. After CI succeeds, a separate `workflow_run` job may approve only an open same-repository PR whose actor and author are `dependabot[bot]`, base is `main`, branch is `dependabot/*`, and head SHA exactly matches the successful CI run. It never checks out or executes PR code, does not merge, and has only read access plus `pull-requests: write`. Repository-wide workflow permissions remain read-only; only the narrowly required ability for Actions to submit PR reviews is enabled. This bot approval is an automation signal, not independent human review.
+Only the exact revision that passed the required check may merge to `main`. Dependabot pull requests use the same secretless qualification lane. After CI succeeds, a separate `workflow_run` job may act on only an open same-repository PR whose actor and author are `dependabot[bot]`, base is `main`, branch is `dependabot/*`, and head SHA exactly matches the successful CI run. It never checks out or executes PR code, and has only read access plus `pull-requests: write`. Repository-wide workflow permissions remain read-only; only the narrowly required ability for Actions to submit PR reviews and comments is enabled. This bot approval is an automation signal, not independent human review.
+
+That job also requests unattended promotion, so routine dependency currency does not depend on a human noticing a green PR. A stale queue of open Dependabot PRs is a breakage signal, not a maintenance backlog.
+
+The merge is deliberately **not** performed by the Actions token. The job posts `@dependabot squash and merge` naming the CI-tested SHA, and Dependabot merges under its own credentials. This preserves the property that no GitHub Actions lane in this repository holds `contents: write` on the protected branch: the lane can *request* promotion but cannot write to `main`, so compromising it cannot land code. `cipolicy` asserts both halves — the absent `contents: write` and the delegated, SHA-bound merge request — and `TestCheckRejectsUnsafeDependabotApproval` fails if either is replaced with a direct `gh pr merge`.
+
+Auto-merge does not relax the promotion invariant, because the bot approval was never the gate. `required_approving_review_count` is `0`, so `required_status_checks.strict` on `Go, web, and image build` is what decides; a queued merge request simply waits for it. `required_linear_history` means the request must be a squash — a plain merge commit would be rejected. If Dependabot force-pushes a rebase, the new SHA earns its own CI run, approval, and merge request; the marker comment is SHA-bound so a queued command cannot carry over to untested code.
+
+Because promotion is unattended, two settings outside this repository become load-bearing and must stay enabled:
+
+- **Dependabot security updates** and **Dependabot alerts**. `dependabot.yml` configures *version* updates only. Without the security-update toggle, a published advisory produces no pull request until a routine version bump happens to carry the fix — which is how `postcss` sat on GHSA-r28c-9q8g-f849 while the `npm audit` gate went red.
+- **Allow squash merging**, so the delegated merge has a permitted method under linear history.
+
+There is deliberately no cooldown on version updates: the operator's stated preference is fastest possible patching, with supply-chain risk absorbed by the secretless qualification lane, `--ignore-scripts` installs, digest-pinned bases, and the image/vulnerability gates rather than by delaying releases. Updates are grouped per ecosystem because `strict` invalidates every other open branch on each merge, so batching converges in far fewer full CI cycles.
+
+If Dependabot does not honour a command authored by `github-actions[bot]`, the failure mode is inert: PRs stay open and approved. The documented fallback is a separate `workflow_run` job holding `contents: write` plus `pull-requests: write` that runs `gh pr merge --auto --squash`, with `cipolicy` extended to pin that job's permissions in isolation. Prefer the delegated form; adopt the fallback only after confirming the delegated form does not work.
 
 ### 3. Secret-bearing canaries or deployment: trusted revision only
 

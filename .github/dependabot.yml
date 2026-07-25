@@ -4,48 +4,61 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: daily }
-    open-pull-requests-limit: 20
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
   # Runtime modules plus Go tool/rule engines declared by `tool` in go.mod.
   - package-ecosystem: gomod
     directory: /
     schedule: { interval: daily }
-    open-pull-requests-limit: 20
+    open-pull-requests-limit: 5
     groups:
-      go-static-analysis:
+      # One PR per ecosystem per day. `required_status_checks.strict` makes every
+      # merge invalidate the remaining open branches, so batching converges in
+      # far fewer full CI cycles than several single-dependency pull requests.
+      gomod:
         patterns:
-          - github.com/rhysd/actionlint
-          - golang.org/x/vuln
-          - honnef.co/go/tools
+          - "*"
 
   # Web runtime dependencies and Biome's versioned built-in ruleset.
   - package-ecosystem: npm
     directory: /web
     schedule: { interval: daily }
-    open-pull-requests-limit: 20
+    open-pull-requests-limit: 5
     groups:
-      web-static-analysis:
+      web:
         patterns:
-          - "@biomejs/biome"
+          - "*"
 
   # Dockerfile base tags and immutable manifest digests.
   - package-ecosystem: docker
     directory: /
     schedule: { interval: daily }
-    open-pull-requests-limit: 20
+    open-pull-requests-limit: 5
+    groups:
+      docker:
+        patterns:
+          - "*"
 
   # Production Compose image references (and future additions).
   - package-ecosystem: docker-compose
     directory: /
     schedule: { interval: daily }
-    open-pull-requests-limit: 20
+    open-pull-requests-limit: 5
+    groups:
+      compose:
+        patterns:
+          - "*"
 
   # Hadolint, ShellCheck, and Trivy embed their maintained rules/checks in
   # pinned images; this entry updates both image tags and manifest digests.
   - package-ecosystem: docker-compose
     directory: /.github/scanners
     schedule: { interval: daily }
-    open-pull-requests-limit: 20
+    open-pull-requests-limit: 5
     groups:
       container-scanners-and-rules:
         patterns:

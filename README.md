@@ -218,10 +218,15 @@ pull request. Its Go and Node setup versions are derived from the Dockerfile, so
 Docker updates are tested with the same toolchains they change. A weekly workflow
 gives every fuzz target a longer campaign and preserves minimized failures.
 Dependabot checks Go tools/modules, npm packages and Biome rules, Dockerfiles,
-production and scanner Compose images/rule engines, and GitHub Actions daily. A
-privileged `workflow_run` lane may approve only an open, same-repository
-`dependabot[bot]` PR to `main` at the exact SHA that read-only CI passed; it
-neither checks out PR code nor merges it.
+production and scanner Compose images/rule engines, and GitHub Actions daily,
+grouped into one pull request per ecosystem. A privileged `workflow_run` lane may
+approve only an open, same-repository `dependabot[bot]` PR to `main` at the exact
+SHA that read-only CI passed; it never checks out PR code. That lane then asks
+Dependabot to squash-merge that same SHA, so dependency currency is unattended.
+The merge is delegated to Dependabot's own credentials rather than performed by
+the Actions token: no workflow in this repository holds `contents: write` on the
+protected branch, and branch protection remains the only merge gate. Open
+Dependabot PRs therefore indicate breakage rather than pending review.
 
 PR CI is intentionally secretless. The checked-in branch-protection policy,
 publication procedure, future trusted-promotion rules, randomized-test policy,
