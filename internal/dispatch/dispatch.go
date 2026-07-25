@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,6 +55,10 @@ func New(st *store.Store, bus *events.Bus, q Queue, r Runner, log *slog.Logger) 
 }
 
 func (d *Dispatcher) Dispatch(ctx context.Context, name, task string) (store.Job, error) {
+	name, err := jobName(name)
+	if err != nil {
+		return store.Job{}, err
+	}
 	tx, err := d.store.Pool.Begin(ctx)
 	if err != nil {
 		return store.Job{}, err
@@ -219,17 +224,41 @@ func prepareForResume(x *store.Job) bool {
 	return true
 }
 
+// maxJobNameRunes bounds a spoken job name. The name is the operator's only
+// voice handle on a job, so it must stay short enough to say and hear back.
+const maxJobNameRunes = 120
+
+// jobName normalizes a model-supplied display name. An empty or whitespace-only
+// name would leave the job addressable only by ULID, which no operator speaks,
+// and would additionally match every other blank-named job in the exact-name
+// lookup. Colliding names are deliberately still permitted: ResolveJob surfaces
+// ambiguity for the desk to ask about rather than guessing between them.
+func jobName(raw string) (string, error) {
+	name := strings.Join(strings.Fields(raw), " ")
+	if name == "" {
+		return "", errors.New("job name must contain at least one non-space character")
+	}
+	if runes := []rune(name); len(runes) > maxJobNameRunes {
+		name = strings.TrimSpace(string(runes[:maxJobNameRunes]))
+	}
+	return name, nil
+}
+
 func (d *Dispatcher) Rename(ctx context.Context, ref, newName string) (store.Job, error) {
+	name, err := jobName(newName)
+	if err != nil {
+		return store.Job{}, err
+	}
 	j, err := d.store.ResolveJob(ctx, ref)
 	if err != nil {
 		return store.Job{}, err
 	}
 	old := j.DisplayName
-	j, err = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) { x.DisplayName = newName })
+	j, err = d.store.UpdateJob(ctx, j.ID, func(x *store.Job) { x.DisplayName = name })
 	if err != nil {
 		return store.Job{}, err
 	}
-	d.bus.Publish(events.KindJobRenamed, j.ID, map[string]string{"from": old, "to": newName})
+	d.bus.Publish(events.KindJobRenamed, j.ID, map[string]string{"from": old, "to": name})
 	return j, nil
 }
 

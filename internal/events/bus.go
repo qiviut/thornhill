@@ -224,25 +224,35 @@ func (b *Bus) Subscribe(ctx context.Context, replay bool) <-chan Event {
 	b.mu.Unlock()
 
 	out := make(chan Event, 64)
+	unsubscribe := func() {
+		b.mu.Lock()
+		delete(b.subs, id)
+		b.mu.Unlock()
+	}
 	go func() {
 		defer close(out)
+		// Cancellation must stop the pump, not merely skip one delivery. Falling
+		// through spun the remainder of the replay against a dead context and left
+		// the subscription registered until the next live event arrived.
 		for _, e := range back {
 			select {
 			case out <- e:
 			case <-ctx.Done():
+				unsubscribe()
+				return
 			}
 		}
 		for {
 			select {
 			case <-ctx.Done():
-				b.mu.Lock()
-				delete(b.subs, id)
-				b.mu.Unlock()
+				unsubscribe()
 				return
 			case e := <-ch:
 				select {
 				case out <- e:
 				case <-ctx.Done():
+					unsubscribe()
+					return
 				}
 			}
 		}

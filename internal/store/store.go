@@ -608,9 +608,12 @@ func (s *Store) ResolveJob(ctx context.Context, ref string) (Job, error) {
 	if len(js) > 1 {
 		return Job{}, ErrAmbiguous
 	}
+	// Escape LIKE metacharacters: a spoken reference is literal text, so a job
+	// named "50% headroom" or "read_file audit" must match itself rather than
+	// turning the operator's words into a wildcard pattern.
 	rows, err = s.Pool.Query(ctx, selectJob+
-		` WHERE display_name ILIKE '%'||$1||'%' AND status IN ('queued','running','needs_input','needs_approval','parked_approval')
-		  ORDER BY created_at DESC LIMIT 2`, ref)
+		` WHERE display_name ILIKE '%'||$1||'%' ESCAPE '\' AND status IN ('queued','running','needs_input','needs_approval','parked_approval')
+		  ORDER BY created_at DESC LIMIT 2`, escapeLikePattern(ref))
 	if err != nil {
 		return Job{}, err
 	}
@@ -626,6 +629,20 @@ func (s *Store) ResolveJob(ctx context.Context, ref string) (Job, error) {
 	default:
 		return Job{}, ErrAmbiguous
 	}
+}
+
+// escapeLikePattern neutralizes the three characters PostgreSQL treats specially
+// inside an ILIKE pattern, using the backslash escape the query declares.
+func escapeLikePattern(ref string) string {
+	var b strings.Builder
+	b.Grow(len(ref))
+	for _, r := range ref {
+		if r == '%' || r == '_' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func collect(rows pgx.Rows) ([]Job, error) {

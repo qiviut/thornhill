@@ -433,9 +433,11 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 		return nil // operator input resumes through a new durable River delivery
 	}
 
+	// Bound by runes: the digest is agent-authored prose that is spoken aloud and
+	// stored, so a byte cut could split a multi-byte character.
 	digest := reply
-	if len(digest) > 700 {
-		digest = digest[:700] + "…"
+	if runes := []rune(digest); len(runes) > 700 {
+		digest = string(runes[:700]) + "…"
 	}
 	transitioned := false
 	jj, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {

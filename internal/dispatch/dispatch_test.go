@@ -1,8 +1,10 @@
 package dispatch
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"thornhill/internal/store"
 )
@@ -71,5 +73,45 @@ func TestWorkerHasNoElapsedRuntimeDeadline(t *testing.T) {
 	w := &Worker{}
 	if got := w.Timeout(nil); got != -1 {
 		t.Fatalf("worker timeout = %s, want -1 (no timeout)", got)
+	}
+}
+
+// The display name is the operator's only voice handle on a job. dispatch_job
+// validated it but rename_job did not, so a model could leave a job addressable
+// only by a ULID nobody speaks — and blank names additionally collide with each
+// other in the exact-name lookup.
+func TestJobNamesAreNormalizedAndNeverBlank(t *testing.T) {
+	rejected := []string{"", "   ", "\t\n", "  "}
+	for _, raw := range rejected {
+		if got, err := jobName(raw); err == nil {
+			t.Errorf("jobName(%q) = %q, want an error", raw, got)
+		}
+	}
+	accepted := map[string]string{
+		"CVE triage sweep":  "CVE triage sweep",
+		"  padded  name  ":  "padded name",
+		"multi\nline\tname": "multi line name",
+		"café audit":        "café audit",
+	}
+	for raw, want := range accepted {
+		got, err := jobName(raw)
+		if err != nil {
+			t.Errorf("jobName(%q) = %v", raw, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("jobName(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	// Bounded by runes so a multi-byte name cannot be cut mid-character.
+	long, err := jobName(strings.Repeat("é", maxJobNameRunes+50))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runes := []rune(long); len(runes) != maxJobNameRunes {
+		t.Fatalf("bounded name = %d runes, want %d", len(runes), maxJobNameRunes)
+	}
+	if !utf8.ValidString(long) {
+		t.Fatal("bounded name is not valid UTF-8")
 	}
 }

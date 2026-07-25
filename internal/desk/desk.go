@@ -855,12 +855,15 @@ func (d *Desk) buildInstructions(ctx context.Context) string {
 	return sb.String()
 }
 
+// firstLine bounds by runes, not bytes. Task text is operator- and agent-authored
+// and reaches the model's instructions, so a byte cut could hand it a broken
+// sequence mid-character.
 func firstLine(s string, n int) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
 	}
-	if len(s) > n {
-		s = s[:n] + "…"
+	if runes := []rune(s); len(runes) > n {
+		s = string(runes[:n]) + "…"
 	}
 	return s
 }
