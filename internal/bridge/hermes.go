@@ -96,7 +96,6 @@ type Hermes struct {
 	StreamIdleAfter        time.Duration
 
 	mu             sync.Mutex
-	convos         map[string][]chatMsg
 	cancels        map[string]context.CancelFunc
 	runIDs         map[string]string
 	approvalLocks  map[string]*approvalLock
@@ -112,7 +111,6 @@ func NewHermes(baseURL, apiKey, model string, st JobStore, bus *events.Bus, log 
 		ApprovalControlTimeout: defaultApprovalControlTimeout,
 		ApprovalParkAfter:      defaultApprovalParkAfter,
 		StreamIdleAfter:        defaultStreamIdleAfter,
-		convos:                 map[string][]chatMsg{},
 		cancels:                map[string]context.CancelFunc{},
 		runIDs:                 map[string]string{},
 		approvalLocks:          map[string]*approvalLock{},
@@ -188,6 +186,18 @@ type runEvent struct {
 	AllowPermanent bool     `json:"allow_permanent"`
 	Timestamp      float64  `json:"timestamp"`
 }
+
+// approvalOutcome is a job snapshot plus the authority decision that produced it.
+// store.Job is embedded without a tag so its fields stay promoted to the top
+// level: the browser parses job.approval_resolved as a job snapshot and must keep
+// doing so, while the added fields make the decision analysable in the event log.
+type approvalOutcome struct {
+	store.Job
+	Decision string          `json:"decision"`
+	Decided  *store.Approval `json:"decided_approval,omitempty"`
+}
+
+func ptr[T any](v T) *T { return &v }
 
 // ReconcileOrphans reclaims runs whose in-memory SSE owner disappeared during
 // a process restart. A still-pending approval is parked without decision so its
@@ -338,18 +348,15 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 	}
 
 	h.mu.Lock()
-	h.convos[jobID] = append(recovered, chatMsg{Role: "user", Content: initial})
 	h.sessionAllows[jobID] = map[string]struct{}{}
 	h.sessionDenials[jobID] = map[string]struct{}{}
 	h.mu.Unlock()
 
-	h.mu.Lock()
-	msgs := append([]chatMsg(nil), h.convos[jobID]...)
-	h.mu.Unlock()
-	input := msgs[len(msgs)-1].Content
-	history := msgs[:len(msgs)-1]
-
-	reply, err := h.runTurn(ctx, j, input, history)
+	// Hermes owns the durable transcript: recovered history plus this turn's input
+	// is the complete request. Nothing here may outlive the turn, because a
+	// process-lifetime copy would grow without bound and could not be trusted
+	// against the session Hermes actually holds.
+	reply, err := h.runTurn(ctx, j, initial, recovered)
 	runID := h.ownedRunID(jobID)
 	if err != nil {
 		if errors.Is(err, errApprovalParked) {
@@ -404,10 +411,6 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 		h.Bus.Publish(events.KindJobFailed, jobID, failed)
 		return fmt.Errorf("hermes run: %w", err)
 	}
-
-	h.mu.Lock()
-	h.convos[jobID] = append(h.convos[jobID], chatMsg{Role: "assistant", Content: reply})
-	h.mu.Unlock()
 
 	if q, isQ := trailingQuestion(reply); isQ {
 		transitioned := false
@@ -837,7 +840,7 @@ func (h *Hermes) parkApprovalLocked(ctx context.Context, jobID, runID, approvalI
 			j = updated
 		}
 	}
-	h.Bus.Publish(events.KindJobApprovalParked, jobID, j)
+	h.Bus.Publish(events.KindJobApprovalParked, jobID, j.Redacted())
 	h.Log.Info("approval parked unresolved", "job", jobID, "run", runID,
 		"approval", approvalID, "reason", reason)
 	return j, nil
@@ -940,7 +943,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 			return noRetry(fmt.Errorf("automatic session deny was indeterminate; run stopped: %w", err))
 		}
 		h.Bus.Publish(events.KindJobApprovalAutoDenied, jobID, map[string]any{
-			"decision": DecisionDenySession, "matched_pattern": matched, "approval": approval,
+			"decision": DecisionDenySession, "matched_pattern": matched, "approval": approval.Redacted(),
 		})
 		return nil
 	}
@@ -954,7 +957,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 			return noRetry(fmt.Errorf("automatic permanent deny was indeterminate; run stopped: %w", err))
 		}
 		h.Bus.Publish(events.KindJobApprovalAutoDenied, jobID, map[string]any{
-			"decision": DecisionDenyAlways, "matched_pattern": matched, "approval": approval,
+			"decision": DecisionDenyAlways, "matched_pattern": matched, "approval": approval.Redacted(),
 		})
 		return nil
 	}
@@ -964,7 +967,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 			return noRetry(fmt.Errorf("automatic session allow was indeterminate; run stopped and will not retry: %w", err))
 		}
 		h.Bus.Publish(events.KindJobApprovalAutoAllowed, jobID, map[string]any{
-			"decision": DecisionAllowSession, "matched_pattern": matched, "approval": approval,
+			"decision": DecisionAllowSession, "matched_pattern": matched, "approval": approval.Redacted(),
 		})
 		return nil
 	}
@@ -982,7 +985,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 			return noRetry(fmt.Errorf("automatic permanent allow was indeterminate; run stopped and will not retry: %w", err))
 		} else {
 			h.Bus.Publish(events.KindJobApprovalAutoAllowed, jobID, map[string]any{
-				"decision": DecisionAllowAlways, "matched_pattern": matched, "approval": approval,
+				"decision": DecisionAllowAlways, "matched_pattern": matched, "approval": approval.Redacted(),
 			})
 			return nil
 		}
@@ -1003,7 +1006,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 	if !admitted {
 		return noRetry(errRunSuperseded)
 	}
-	h.Bus.Publish(events.KindJobNeedsApproval, jobID, j)
+	h.Bus.Publish(events.KindJobNeedsApproval, jobID, j.Redacted())
 	h.Log.Info("job waiting for approval", "job", jobID, "approval", approval.ID, "patterns", keys)
 	return nil
 }
@@ -1194,7 +1197,19 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	if !resolved {
 		return j, nil
 	}
-	h.Bus.Publish(events.KindJobApprovalResolved, jobID, j)
+	// The automatic lanes already publish {decision, matched_pattern, approval},
+	// so machine choices were durable while the operator's were not: the resolved
+	// job has had Approvals cleared, and the decision itself only ever reached the
+	// process log. An operator authority decision paired with the exact command and
+	// pattern scope it applied to is the highest-value record Thornhill produces —
+	// it is how dispatched-agent behaviour gets tuned — so it is emitted here with
+	// its evidence. The job snapshot shape is preserved because the browser parses
+	// this kind as one.
+	h.Bus.Publish(events.KindJobApprovalResolved, jobID, approvalOutcome{
+		Job:      j.Redacted(),
+		Decision: decision,
+		Decided:  ptr(current.Redacted()),
+	})
 	h.Log.Info("approval resolved", "job", jobID, "approval", current.ID, "decision", decision)
 	if policyErr != nil {
 		if decision == DecisionAllowAlways {

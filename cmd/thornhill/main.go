@@ -135,6 +135,8 @@ func main() {
 	tts := audio.New(cfg.OpenAIKey, cfg.OpenAIBaseURL, cfg.TTSModel, cfg.TTSVoice, cfg.PrebakeDir, log.With("comp", "tts"))
 	go tts.Prebake(ctx)
 
+	go pruneEvents(ctx, st, cfg.EventRetention, log.With("comp", "retention"))
+
 	hooks := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -183,6 +185,38 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("bye")
+}
+
+// pruneEvents bounds event_log growth on the persistent volume by deleting aged
+// mechanical telemetry only. Job outcomes and operator authority decisions are
+// never swept: that corpus is the record used to improve the dispatched agents,
+// so it is the reason the table exists rather than something to reclaim.
+func pruneEvents(ctx context.Context, st *store.Store, retention time.Duration, log *slog.Logger) {
+	sweep := func() {
+		sweepCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		removed, err := st.PruneTransientEvents(sweepCtx, retention)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Warn("event retention sweep failed", "err", err)
+			}
+			return
+		}
+		if removed > 0 {
+			log.Info("pruned transient events", "rows", removed, "older_than", retention)
+		}
+	}
+	sweep()
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }
 
 func runHealthcheck(rawURL string) error {

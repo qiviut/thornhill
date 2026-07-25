@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS event_log (
     job_id  TEXT NOT NULL DEFAULT '',
     payload JSONB
 );
+-- The event log is a retained corpus, not only a forensic trail: authority
+-- decisions paired with the command and pattern scope they applied to are the
+-- record used to improve dispatched-agent behaviour. These indexes serve the
+-- kind-scoped and per-job analysis reads, and the retention sweep below.
+CREATE INDEX IF NOT EXISTS event_log_kind_ts_idx ON event_log (kind, ts);
+CREATE INDEX IF NOT EXISTS event_log_job_ts_idx ON event_log (job_id, ts) WHERE job_id <> '';
 CREATE TABLE IF NOT EXISTS summaries (
     scope      TEXT PRIMARY KEY, -- 'rolling' | 'debrief'
     content    TEXT NOT NULL,
@@ -220,6 +226,32 @@ type Approval struct {
 	ParkReason     string     `json:"park_reason,omitempty"`
 }
 
+// Redacted returns a copy safe to publish on the bus and into the durable event
+// log. The one-use decision nonce is deliberately retained by the `json` tag
+// because that tag is also the `jobs.approvals` JSONB persistence format, which
+// ClaimApproval and ParkApproval re-read to validate authority — it must not be
+// dropped at the struct level. It has no analytical value and no business in an
+// append-only corpus, so it is cleared here instead, per publication.
+func (a Approval) Redacted() Approval {
+	a.DecisionNonce = ""
+	return a
+}
+
+// Redacted copies the job with every approval nonce cleared. The returned value
+// shares no approval backing array with the receiver, so publishing it cannot
+// mutate the caller's authority state.
+func (j Job) Redacted() Job {
+	if len(j.Approvals) == 0 {
+		return j
+	}
+	approvals := make([]Approval, 0, len(j.Approvals))
+	for _, a := range j.Approvals {
+		approvals = append(approvals, a.Redacted())
+	}
+	j.Approvals = approvals
+	return j
+}
+
 // Progress is the most recent structured Hermes tool lifecycle event.
 type Progress struct {
 	Tool      string    `json:"tool,omitempty"`
@@ -280,6 +312,39 @@ func (s *Store) AppendEvent(ctx context.Context, e events.Event) error {
 		`INSERT INTO event_log (ts, kind, job_id, payload) VALUES ($1,$2,$3,$4)`,
 		e.TS, e.Kind, e.JobID, nullableJSON(e.Payload))
 	return err
+}
+
+// transientEventKinds are pruned on age. They are high-frequency mechanical
+// telemetry with no decision content: progress ticks, per-response token counts,
+// voice-transport state, and raw Hermes hook mirrors. Everything else — job
+// outcomes, needs_input questions, authority requests, and especially the
+// operator's approval decisions with their evidence — is retained, because that
+// is the corpus used to improve the agents Thornhill dispatches.
+var transientEventKinds = []string{
+	events.KindJobProgress,
+	events.KindJobRunning,
+	events.KindUsage,
+	events.KindSessionState,
+	events.KindHermesHook,
+	events.KindErrorVoice,
+}
+
+// PruneTransientEvents deletes aged mechanical telemetry and reports how many
+// rows went. It is intentionally not a blanket age sweep: retaining decisions
+// indefinitely is the point of the table, so growth is bounded by dropping only
+// the kinds that carry no judgement. Deleting rows is not a schema change, so
+// this stays rollback-safe under docs/rollback-compatibility.json.
+func (s *Store) PruneTransientEvents(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, errors.New("event retention window must be positive")
+	}
+	cutoff := time.Now().UTC().Add(-olderThan)
+	tag, err := s.Pool.Exec(ctx,
+		`DELETE FROM event_log WHERE ts < $1 AND kind = ANY($2)`, cutoff, transientEventKinds)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func nullableJSON(r json.RawMessage) any {

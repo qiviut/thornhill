@@ -703,3 +703,38 @@ func TestResponseCreateErrorsAreCorrelatedByEventID(t *testing.T) {
 		t.Fatal("matched response.create rejection did not preserve a retry opportunity")
 	}
 }
+
+// Only the run loop drains d.urgent. A blocking send would therefore stop that
+// same loop draining the sideband reader's channel, so client.Read would stop
+// being called and the WebSocket's read-driven keepalive would die with it.
+// Overflow must degrade to a dropped injection, never to a wedged session.
+func TestUrgentQueueOverflowNeverBlocksTheRunLoop(t *testing.T) {
+	d := testDesk(t, &recordingRealtime{})
+	capacity := cap(d.urgent)
+	if capacity == 0 {
+		t.Fatal("urgent lane must be buffered")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < capacity*2; i++ {
+			d.queueUrgent(injection{role: "system", text: "briefing", attention: []int64{int64(i)}},
+				events.KindJobNeedsApproval)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queueUrgent blocked once the urgent lane filled")
+	}
+
+	if got := len(d.urgent); got != capacity {
+		t.Fatalf("buffered urgent injections = %d, want %d", got, capacity)
+	}
+	// The retained items must still be intact and drainable in order.
+	first := <-d.urgent
+	if len(first.attention) != 1 || first.attention[0] != 0 {
+		t.Fatalf("first retained injection = %v, want attention row 0", first.attention)
+	}
+}

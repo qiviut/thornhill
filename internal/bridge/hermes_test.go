@@ -1432,3 +1432,116 @@ func TestSystemHeaderRequiresManagedOrDisposableDelegatedScripts(t *testing.T) {
 		}
 	}
 }
+
+// An operator authority decision paired with the command and pattern scope it
+// applied to is the record used to improve dispatched-agent behaviour, so it must
+// reach the durable event log rather than only the process log. The job snapshot
+// shape has to survive intact because the browser parses this kind as one.
+func TestOperatorApprovalDecisionIsPublishedWithItsEvidence(t *testing.T) {
+	const jobID = "01JTESTDECISIONRECORD"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run_9/approval" {
+			_, _ = io.WriteString(w, `{"resolved":1}`)
+			return
+		}
+		http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	approval := store.Approval{
+		ID: "appr_1", DecisionNonce: "nonce-must-never-be-published",
+		State: store.ApprovalStatePending, Command: "systemctl restart demo",
+		Description: "restart demo service", PatternKeys: []string{"service restart"},
+		AllowPermanent: true, RequestedAt: time.Now().UTC(),
+	}
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Audit", Task: "audit", Status: store.StatusNeedsApproval,
+		HermesRunID: "run_9", Approvals: []store.Approval{approval},
+	}}, permanent: map[string]bool{}}
+	bus := events.NewBus(nil, testLog())
+	h := NewHermes(server.URL, "test-key", "hermes-agent", fs, bus, testLog())
+	h.mu.Lock()
+	h.runIDs[jobID] = "run_9"
+	h.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sub := bus.Subscribe(ctx, false)
+
+	if _, err := h.DecideApproval(ctx, jobID, approval.ID, approval.DecisionNonce, DecisionAllowOnce); err != nil {
+		t.Fatalf("decide approval: %v", err)
+	}
+
+	for {
+		select {
+		case e := <-sub:
+			if e.Kind != events.KindJobApprovalResolved {
+				continue
+			}
+			if strings.Contains(string(e.Payload), "nonce-must-never-be-published") {
+				t.Fatalf("one-use decision nonce reached the event log: %s", e.Payload)
+			}
+			var got struct {
+				ID          string `json:"id"`
+				DisplayName string `json:"display_name"`
+				Status      string `json:"status"`
+				Decision    string `json:"decision"`
+				Decided     *struct {
+					ID            string   `json:"id"`
+					Command       string   `json:"command"`
+					PatternKeys   []string `json:"pattern_keys"`
+					DecisionNonce string   `json:"decision_nonce"`
+				} `json:"decided_approval"`
+			}
+			if err := json.Unmarshal(e.Payload, &got); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			// Job snapshot shape must be preserved for the browser parser.
+			if got.ID != jobID || got.DisplayName != "Audit" || got.Status != store.StatusRunning {
+				t.Fatalf("job snapshot fields not promoted: %+v", got)
+			}
+			if got.Decision != DecisionAllowOnce {
+				t.Fatalf("decision = %q, want %q", got.Decision, DecisionAllowOnce)
+			}
+			if got.Decided == nil {
+				t.Fatal("decision was published without its approval evidence")
+			}
+			if got.Decided.Command != "systemctl restart demo" ||
+				len(got.Decided.PatternKeys) != 1 || got.Decided.PatternKeys[0] != "service restart" {
+				t.Fatalf("evidence lost the command or pattern scope: %+v", got.Decided)
+			}
+			if got.Decided.DecisionNonce != "" {
+				t.Fatalf("evidence retained the one-use nonce: %q", got.Decided.DecisionNonce)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("no approval-resolved event was published")
+		}
+	}
+}
+
+// Nothing that leaves the process may carry the one-use nonce, but the struct tag
+// must keep it because that tag is also the jobs.approvals persistence format the
+// broker re-reads to validate authority.
+func TestApprovalNonceSurvivesPersistenceButNeverPublication(t *testing.T) {
+	a := store.Approval{ID: "appr_1", DecisionNonce: "secret", PatternKeys: []string{"k"}}
+	persisted, err := json.Marshal([]store.Approval{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(persisted), "secret") {
+		t.Fatal("nonce must remain in the JSONB persistence form the broker validates against")
+	}
+
+	published, err := json.Marshal(store.Job{ID: "j", Approvals: []store.Approval{a}}.Redacted())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(published), "secret") {
+		t.Fatalf("redacted job still published the nonce: %s", published)
+	}
+	// Redaction must not reach back into the caller's authority state.
+	if a.DecisionNonce != "secret" {
+		t.Fatal("Redacted mutated the source approval")
+	}
+}

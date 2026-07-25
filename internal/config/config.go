@@ -8,9 +8,11 @@ import (
 	"crypto/ecdh"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -59,6 +61,12 @@ type Config struct {
 	// --- dispatch ---
 	FakeJobSeconds int // FAKE_JOB_SECONDS, default 90: stub worker duration when HERMES_BASE_URL is empty
 
+	// --- retention ---
+	// EventRetention bounds only mechanical telemetry in event_log. Job outcomes
+	// and operator authority decisions are retained indefinitely: that corpus is
+	// how the capability of the dispatched agents is improved over time.
+	EventRetention time.Duration // EVENT_RETENTION, default 720h
+
 	// --- budget ---
 	DailyBudgetUSD float64 // DAILY_BUDGET_USD, default 25: breaker for the voice leg (estimate)
 }
@@ -70,13 +78,52 @@ func getenv(k, def string) string {
 	return def
 }
 
-func getdur(k string, def time.Duration) time.Duration {
-	if v := os.Getenv(k); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+// getdur, getint and getfloat fail closed on a malformed value rather than
+// silently substituting the default. A typo in a breaker threshold or a timer
+// bound must not present itself as a working configuration.
+func getdur(k string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
 	}
-	return def
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a Go duration such as 90s or 15m: %w", k, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", k)
+	}
+	return d, nil
+}
+
+func getint(k string, def int) (int, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", k, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", k)
+	}
+	return n, nil
+}
+
+func getfloat(k string, def float64) (float64, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number: %w", k, err)
+	}
+	if f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("%s must be a finite, non-negative number", k)
+	}
+	return f, nil
 }
 
 func splitCSV(v string) []string {
@@ -206,7 +253,6 @@ func Load() (*Config, error) {
 		HermesBaseURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("HERMES_BASE_URL")), "/"),
 		HermesAPIKey:        os.Getenv("HERMES_API_KEY"),
 		HermesModel:         getenv("HERMES_MODEL", "default"),
-		ApprovalParkAfter:   getdur("APPROVAL_PARK_AFTER", 15*time.Minute),
 		ListenAddr:          getenv("LISTEN_ADDR", ":8787"),
 		StaticDir:           getenv("STATIC_DIR", "web/dist"),
 		AllowedOrigins:      splitCSV(os.Getenv("ALLOWED_ORIGINS")),
@@ -214,39 +260,49 @@ func Load() (*Config, error) {
 		PushVAPIDPublicKey:  strings.TrimSpace(os.Getenv("PUSH_VAPID_PUBLIC_KEY")),
 		PushVAPIDPrivateKey: strings.TrimSpace(os.Getenv("PUSH_VAPID_PRIVATE_KEY")),
 		PushVAPIDSubject:    strings.TrimSpace(os.Getenv("PUSH_VAPID_SUBJECT")),
-		QuietAfter:          getdur("QUIET_AFTER", 30*time.Second),
-		ParkAfter:           getdur("PARK_AFTER", 10*time.Minute),
-		RolloverAt:          getdur("ROLLOVER_AT", 57*time.Minute),
-		FakeJobSeconds:      90,
 	}
-	if v := os.Getenv("FAKE_JOB_SECONDS"); v != "" {
-		fmt.Sscanf(v, "%d", &c.FakeJobSeconds)
+	for _, knob := range []struct {
+		name   string
+		target *time.Duration
+		def    time.Duration
+	}{
+		{"APPROVAL_PARK_AFTER", &c.ApprovalParkAfter, 15 * time.Minute},
+		{"QUIET_AFTER", &c.QuietAfter, 30 * time.Second},
+		{"PARK_AFTER", &c.ParkAfter, 10 * time.Minute},
+		{"ROLLOVER_AT", &c.RolloverAt, 57 * time.Minute},
+		{"EVENT_RETENTION", &c.EventRetention, 30 * 24 * time.Hour},
+	} {
+		value, durErr := getdur(knob.name, knob.def)
+		if durErr != nil {
+			return nil, durErr
+		}
+		*knob.target = value
 	}
-	c.DailyBudgetUSD = 25
-	if v := os.Getenv("DAILY_BUDGET_USD"); v != "" {
-		fmt.Sscanf(v, "%f", &c.DailyBudgetUSD)
+	var err error
+	if c.FakeJobSeconds, err = getint("FAKE_JOB_SECONDS", 90); err != nil {
+		return nil, err
+	}
+	if c.DailyBudgetUSD, err = getfloat("DAILY_BUDGET_USD", 25); err != nil {
+		return nil, err
 	}
 	if c.OpenAIRealtimeWSURL == "" {
 		c.OpenAIRealtimeWSURL = realtimeURL(c.OpenAIBaseURL)
 	}
-	if err := validateDatabasePassword(); err != nil {
+	if err = validateDatabasePassword(); err != nil {
 		return nil, err
 	}
-	if err := validateProviderURL("OPENAI_BASE_URL", c.OpenAIBaseURL, false); err != nil {
+	if err = validateProviderURL("OPENAI_BASE_URL", c.OpenAIBaseURL, false); err != nil {
 		return nil, err
 	}
-	if err := validateProviderURL("OPENAI_REALTIME_WS_URL", c.OpenAIRealtimeWSURL, true); err != nil {
+	if err = validateProviderURL("OPENAI_REALTIME_WS_URL", c.OpenAIRealtimeWSURL, true); err != nil {
 		return nil, err
 	}
 	if c.HermesBaseURL != "" {
-		if err := validateProviderURL("HERMES_BASE_URL", c.HermesBaseURL, false); err != nil {
+		if err = validateProviderURL("HERMES_BASE_URL", c.HermesBaseURL, false); err != nil {
 			return nil, err
 		}
 	}
-	if c.ApprovalParkAfter <= 0 {
-		return nil, fmt.Errorf("APPROVAL_PARK_AFTER must be greater than zero")
-	}
-	if err := validatePushConfig(c); err != nil {
+	if err = validatePushConfig(c); err != nil {
 		return nil, err
 	}
 	if c.OpenAIKey == "" {

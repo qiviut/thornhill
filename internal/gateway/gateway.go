@@ -185,11 +185,27 @@ func (g *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /offer", g.handleOffer)
 	mux.HandleFunc("GET /ws", g.handleWS)
 	mux.HandleFunc("GET /events", g.handleSSE)
-	mux.HandleFunc("POST /hooks/hermes", g.Hooks)
+	mux.HandleFunc("POST /hooks/hermes", g.guardHooks(g.Hooks))
 	mux.Handle("GET /audio/prebaked/", http.StripPrefix("/audio/prebaked/",
 		http.FileServer(http.Dir(g.Cfg.PrebakeDir))))
 	mux.Handle("GET /", staticHandler(g.Cfg.StaticDir))
 	return withLogging(mux, g.Log)
+}
+
+// guardHooks rejects browser-originated hook posts. Hermes and other server-side
+// callers send no Origin and are unaffected; the tailnet is still the perimeter
+// for them. A page the operator visits, however, can reach a tailnet address, and
+// a simple-content-type POST needs no preflight — so without this a third-party
+// site could inject bus events and grow the durable event log. Same-origin
+// browser writes stay allowed so the UI could post hooks during development.
+func (g *Gateway) guardHooks(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") != "" && !browserSameOrigin(r) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
 }
 
 const immutableAssetCacheControl = "public, max-age=31536000, immutable"

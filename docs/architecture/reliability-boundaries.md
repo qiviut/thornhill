@@ -52,6 +52,27 @@ type assertion, and do not leave validated application state broadly typed.
 - Time-range ledgers need timestamp indexes. Additive indexes are rollback-safe:
   older application images ignore them.
 
+## The event log is a retained decision corpus
+
+`event_log` is not only a forensic trail. An operator authority decision paired
+with the exact command and pattern scope it applied to is the record used to
+improve the behaviour of the agents Thornhill dispatches, so that content is a
+product asset and is retained indefinitely.
+
+- Both automatic and operator authority decisions must publish the decision plus
+  its approval evidence. Publishing a post-resolution job snapshot alone loses the
+  decision, because resolution clears `Approvals`.
+- Retention prunes only mechanical telemetry — progress ticks, usage, session
+  state, hook mirrors, voice-transport errors. Never widen the sweep to job
+  outcomes, questions, authority requests, or decisions, and never replace it with
+  a blanket age cutoff.
+- Nothing published on the bus or written to `event_log` may carry the one-use
+  decision nonce. `store.Approval` keeps the `json` tag because that tag is also
+  the `jobs.approvals` JSONB persistence format the broker re-reads to validate
+  authority; redact per publication with `Redacted()` instead of dropping the tag.
+- Analysis reads are kind-scoped and per-job, which is what the `(kind, ts)` and
+  partial `(job_id, ts)` indexes exist for.
+
 ## Deployment and rollback
 
 - The deploy drain and all transitions into `queued` or `running` use one

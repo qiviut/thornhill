@@ -211,10 +211,10 @@ func (d *Desk) Run(ctx context.Context, callID string) (reason ParkReason, err e
 
 		case be := <-busCh:
 			if inj, ok := d.attentionBriefing(d.claimAttention(ctx)); ok {
-				d.urgent <- inj
+				d.queueUrgent(inj, be.Kind)
 			} else if inj, ok := d.announcementFor(be); ok {
 				if be.Kind == events.KindJobNeedsApproval {
-					d.urgent <- inj
+					d.queueUrgent(inj, be.Kind)
 				} else {
 					select {
 					case d.inject <- inj:
@@ -259,6 +259,21 @@ func (d *Desk) Run(ctx context.Context, callID string) (reason ParkReason, err e
 				return why, nil
 			}
 		}
+	}
+}
+
+// queueUrgent admits a priority injection without ever blocking the run loop.
+// Only that loop drains d.urgent, so a blocking send would stop it draining the
+// sideband reader's channel too, killing the WebSocket's own read-driven
+// keepalive. Dropping is safe for both urgent kinds: an unspoken attention row
+// stays pending because acknowledgement requires completed output audio, and the
+// desk releases its lease on exit, so the next session claims and voices it.
+func (d *Desk) queueUrgent(inj injection, kind string) {
+	select {
+	case d.urgent <- inj:
+	default:
+		d.Log.Warn("urgent queue full, dropping priority injection; it remains durable",
+			"kind", kind, "attention_rows", len(inj.attention))
 	}
 }
 

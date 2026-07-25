@@ -195,7 +195,7 @@ func (d *Dispatcher) Resume(ctx context.Context, ref string) (store.Job, error) 
 	if err := tx.Commit(ctx); err != nil {
 		return j, fmt.Errorf("commit resume: %w", err)
 	}
-	d.bus.Publish(events.KindJobQueued, j.ID, j)
+	d.bus.Publish(events.KindJobQueued, j.ID, j.Redacted())
 	d.log.Info("job queued for safe resume", "id", j.ID, "name", j.DisplayName, "from_parked_approval", wasParked)
 	return j, nil
 }

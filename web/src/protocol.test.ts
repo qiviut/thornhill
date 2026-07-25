@@ -91,6 +91,35 @@ describe("control protocol", () => {
     });
   });
 
+  it("keeps parsing an approval-resolved snapshot enriched for the decision corpus", () => {
+    // The server publishes this kind as the job snapshot plus the operator's
+    // authority decision and its evidence, so the record is analysable later. The
+    // browser must still read it as a plain snapshot and must not adopt the
+    // audit-only fields into application state.
+    const raw = eventFrame({
+      seq: 5,
+      kind: "job.approval_resolved",
+      job_id: "job-2",
+      payload: {
+        id: "job-2",
+        display_name: "Two",
+        status: "running",
+        decision: "allow_once",
+        decided_approval: {
+          id: "approval-2",
+          state: "pending",
+          allow_permanent: true,
+          command: "systemctl restart demo",
+          pattern_keys: ["service restart"],
+        },
+      },
+    });
+    const parsed = parseServerMessage(raw);
+    expect(parsed?.type).toBe("event");
+    if (parsed?.type !== "event" || parsed.event.kind !== "job.approval_resolved") return;
+    expect(parsed.event.payload).toEqual({ id: "job-2", display_name: "Two", status: "running" });
+  });
+
   it("accounts exactly once for every Go event kind", () => {
     const go = readFileSync(new URL("../../internal/events/bus.go", import.meta.url), "utf8");
     const goKinds = [...go.matchAll(/Kind\w+\s+=\s+"([^"]+)"/g)].map((match) => match[1]).sort();

@@ -168,3 +168,71 @@ func TestLoadRejectsPartialOrMalformedVAPIDConfiguration(t *testing.T) {
 		})
 	}
 }
+
+// Every other value in this package fails closed on malformed input. The numeric
+// and duration knobs must behave the same way: a typo in a breaker threshold or
+// a timer bound silently becoming the default is a configuration that looks like
+// it works and does not.
+func TestMalformedNumericAndDurationKnobsFailClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		value   string
+		contain string
+	}{
+		{name: "unparseable budget", key: "DAILY_BUDGET_USD", value: "25 usd", contain: "must be a number"},
+		{name: "infinite budget", key: "DAILY_BUDGET_USD", value: "Inf", contain: "finite"},
+		{name: "unparseable stub duration", key: "FAKE_JOB_SECONDS", value: "ninety", contain: "must be an integer"},
+		{name: "negative stub duration", key: "FAKE_JOB_SECONDS", value: "-5", contain: "greater than zero"},
+		{name: "unparseable timer", key: "PARK_AFTER", value: "10 minutes", contain: "must be a Go duration"},
+		// A zero rollover would park and redial every call on the first tick.
+		{name: "zero rollover", key: "ROLLOVER_AT", value: "0s", contain: "greater than zero"},
+		{name: "zero quiet window", key: "QUIET_AFTER", value: "0", contain: "greater than zero"},
+		{name: "zero approval threshold", key: "APPROVAL_PARK_AFTER", value: "0s", contain: "greater than zero"},
+		{name: "negative retention", key: "EVENT_RETENTION", value: "-1h", contain: "greater than zero"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENAI_API_KEY", "test-key")
+			t.Setenv("DATABASE_URL", "postgres://localhost/thornhill")
+			t.Setenv(tc.key, tc.value)
+			cfg, err := Load()
+			if err == nil {
+				t.Fatalf("Load() accepted %s=%q as %+v", tc.key, tc.value, cfg)
+			}
+			if !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Load() error = %v, want it to mention %q", err, tc.contain)
+			}
+		})
+	}
+}
+
+func TestDefaultsApplyWhenKnobsAreUnset(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("DATABASE_URL", "postgres://localhost/thornhill")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if cfg.DailyBudgetUSD != 25 || cfg.FakeJobSeconds != 90 {
+		t.Fatalf("budget/stub defaults = %v/%v", cfg.DailyBudgetUSD, cfg.FakeJobSeconds)
+	}
+	if cfg.RolloverAt != 57*time.Minute || cfg.EventRetention != 30*24*time.Hour {
+		t.Fatalf("timer defaults = %v/%v", cfg.RolloverAt, cfg.EventRetention)
+	}
+}
+
+// A deliberate zero budget must still be accepted: it is the documented way to
+// stop admitting new calls without tearing the deployment down.
+func TestZeroDailyBudgetIsAnIntentionalBreaker(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("DATABASE_URL", "postgres://localhost/thornhill")
+	t.Setenv("DAILY_BUDGET_USD", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if cfg.DailyBudgetUSD != 0 {
+		t.Fatalf("DailyBudgetUSD = %v, want 0", cfg.DailyBudgetUSD)
+	}
+}
