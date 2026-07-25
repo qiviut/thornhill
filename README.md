@@ -228,6 +228,11 @@ the Actions token: no workflow in this repository holds `contents: write` on the
 protected branch, and branch protection remains the only merge gate. Open
 Dependabot PRs therefore indicate breakage rather than pending review.
 
+A separate weekly lane scores the repository's own supply-chain posture with
+OpenSSF Scorecard and files regressions as code-scanning alerts. It is advisory
+by design: branch protection still requires exactly one check, and result
+publication is disabled so the lane needs no OIDC token.
+
 PR CI is intentionally secretless. The checked-in branch-protection policy,
 publication procedure, future trusted-promotion rules, randomized-test policy,
 and dummy-provider scope are documented in [docs/ci-security.md](docs/ci-security.md).

@@ -149,6 +149,9 @@ func Check(root string) error {
 	if err := checkDependabotApproval(root); err != nil {
 		return err
 	}
+	if err := checkScorecard(root); err != nil {
+		return err
+	}
 	if err := checkPinnedImages(root); err != nil {
 		return err
 	}
@@ -365,6 +368,85 @@ func checkDependabotApproval(root string) error {
 		}
 	}
 	return nil
+}
+
+// checkScorecard pins the measurement lane. It is the only workflow that holds
+// `security-events: write`, so that grant must stay confined to one job, the
+// workflow default must stay read-only, and the escalation must not quietly grow
+// an `id-token` for result publication. Scorecard is advisory by design: it must
+// never become the required check, which the single-context assertion above
+// already enforces.
+func checkScorecard(root string) error {
+	relative := ".github/workflows/scorecard.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if strings.Contains(text, "secrets.") || strings.Contains(text, "pull_request_target") {
+		return fmt.Errorf("%s must not access secrets or use pull_request_target", relative)
+	}
+	// Publication is what would require an OIDC token; the permission assertions
+	// below are what actually deny one, at both the workflow and job level.
+	if !strings.Contains(text, "publish_results: false") {
+		return fmt.Errorf("%s must explicitly disable result publication", relative)
+	}
+
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	gotTriggers := make([]string, 0, len(wf.On))
+	for trigger := range wf.On {
+		gotTriggers = append(gotTriggers, trigger)
+	}
+	sort.Strings(gotTriggers)
+	// Never pull_request: Scorecard evaluates the default branch, and a
+	// contributor-triggered run must not reach a lane holding a write grant.
+	if want := []string{"push", "schedule", "workflow_dispatch"}; strings.Join(gotTriggers, ",") != strings.Join(want, ",") {
+		return fmt.Errorf("%s triggers = %v, want %v", relative, gotTriggers, want)
+	}
+	if len(wf.Permissions) != 1 || wf.Permissions["contents"] != "read" {
+		return fmt.Errorf("%s must default to exactly contents: read", relative)
+	}
+
+	analyze, ok := wf.Jobs["analyze"]
+	if len(wf.Jobs) != 1 || !ok {
+		return fmt.Errorf("%s must contain only the analysis job", relative)
+	}
+	wantJobPermissions := map[string]string{"security-events": "write", "actions": "read", "contents": "read"}
+	if len(analyze.Permissions) != len(wantJobPermissions) {
+		return fmt.Errorf("%s analysis job must hold exactly the documented narrow permissions", relative)
+	}
+	for name, access := range wantJobPermissions {
+		if analyze.Permissions[name] != access {
+			return fmt.Errorf("%s analysis job permission %s must be %s", relative, name, access)
+		}
+	}
+	for _, step := range analyze.Steps {
+		if step.Uses == "" {
+			continue
+		}
+		if _, pinned := pinnedActionSHA(step.Uses); !pinned {
+			return fmt.Errorf("%s uses unpinned action %q", relative, step.Uses)
+		}
+	}
+	return nil
+}
+
+// pinnedActionSHA reports whether a `uses:` reference names a full 40-character
+// commit SHA. A tag or branch reference is mutable and therefore not a pin.
+func pinnedActionSHA(uses string) (string, bool) {
+	_, ref, found := strings.Cut(uses, "@")
+	if !found || len(ref) != 40 {
+		return "", false
+	}
+	for _, r := range ref {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return "", false
+		}
+	}
+	return ref, true
 }
 
 func checkDependabot(root string) error {

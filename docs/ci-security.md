@@ -61,6 +61,36 @@ There is deliberately no cooldown on version updates: the operator's stated pref
 
 If Dependabot does not honour a command authored by `github-actions[bot]`, the failure mode is inert: PRs stay open and approved. The documented fallback is a separate `workflow_run` job holding `contents: write` plus `pull-requests: write` that runs `gh pr merge --auto --squash`, with `cipolicy` extended to pin that job's permissions in isolation. Prefer the delegated form; adopt the fallback only after confirming the delegated form does not work.
 
+### 2b. Measurement: advisory, never a gate
+
+`.github/workflows/scorecard.yml` scores this repository's own supply-chain posture
+weekly, on pushes to `main`, and on demand, and files regressions as code-scanning
+alerts beside the CodeQL analyses. It never runs on `pull_request`: Scorecard
+evaluates the default branch, and a contributor-triggered run must not reach a lane
+holding a write grant.
+
+It is deliberately advisory. Branch protection requires exactly one check, and that
+stays the qualification lane; `cipolicy` enforces the single required context, so a
+drifted third-party heuristic opens a conversation instead of blocking a merge.
+
+This is the only workflow holding `security-events: write`, so the grant is confined
+to one job while the workflow default stays `contents: read`. Result publication is
+disabled on purpose: `publish_results: true` requires `id-token: write`, and an OIDC
+token is a materially larger grant than this measurement justifies. The cost is only
+the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
+both permission sets, the single job, the absence of publication, and that every
+action is referenced by a full commit SHA rather than a mutable tag.
+
+Read two sub-scores with context rather than at face value:
+
+- **Branch-Protection** scores low because `GITHUB_TOKEN` cannot read protection
+  settings; that needs an admin-scoped PAT this lane deliberately does not hold.
+  The real contract is `.github/branch-protection.json`, applied and verified by
+  `./scripts/apply-branch-protection.sh` and asserted by `cipolicy`.
+- **Signed-Releases** and provenance sub-scores reflect the documented absence of a
+  signed artifact lane. Promotion here is source-revision correspondence, not binary
+  artifact promotion, as described below.
+
 ### 3. Secret-bearing canaries or deployment: trusted revision only
 
 If a live OpenAI/Hermes canary or deployment workflow is added, trigger it from a completed successful `CI` run and fail closed unless all of these are true:
