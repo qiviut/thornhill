@@ -22,6 +22,18 @@ services:
       - --
     command: ["postgres"]
     restart: unless-stopped
+    # Default json-file logging is unbounded, and this host keeps a long-lived
+    # deployment on a persistent volume. Rotate in place: slog writes to stderr,
+    # so these files are the only copy of the process diagnostics. Point the
+    # driver at syslog/journald instead if these logs should be aggregated
+    # off-host — note that a log driver forwards lines opaquely and cannot map
+    # slog levels to syslog severities, so every record would land at one
+    # priority. Durable decision history lives in event_log, not here.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
     environment:
       POSTGRES_USER: thornhill
       POSTGRES_PASSWORD: ${THORNHILL_DB_PASSWORD:?set a 64-character lowercase hex THORNHILL_DB_PASSWORD in .env}
@@ -89,6 +101,18 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
+    # Default json-file logging is unbounded, and this host keeps a long-lived
+    # deployment on a persistent volume. Rotate in place: slog writes to stderr,
+    # so these files are the only copy of the process diagnostics. Point the
+    # driver at syslog/journald instead if these logs should be aggregated
+    # off-host — note that a log driver forwards lines opaquely and cannot map
+    # slog levels to syslog severities, so every record would land at one
+    # priority. Durable decision history lives in event_log, not here.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
 
 volumes:
   dbdata:
