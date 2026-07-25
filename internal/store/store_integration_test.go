@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"thornhill/internal/events"
 )
 
 func randomTestValue(t *testing.T, prefix string, bytes int) string {
@@ -445,5 +447,95 @@ func TestPostgresAttentionClaimAckAndPushOutbox(t *testing.T) {
 	}
 	if replay, err := st.ClaimPushDeliveries(ctx, "push-reactivated", 20, time.Minute); err != nil || len(replay) != 0 {
 		t.Fatalf("reactivation replay=%+v err=%v", replay, err)
+	}
+}
+
+// Retention must bound the mechanical telemetry that would otherwise grow without
+// limit on the persistent volume, while never touching the decision record: an
+// operator authority decision paired with the command it applied to is the corpus
+// used to improve dispatched-agent behaviour, so age is not a reason to drop it.
+func TestPostgresRetentionPrunesTelemetryAndKeepsDecisions(t *testing.T) {
+	databaseURL := os.Getenv("THORNHILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THORNHILL_TEST_DATABASE_URL is required")
+	}
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := Open(ctx, databaseURL, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Pool.Close()
+
+	marker := randomTestValue(t, "retention_", 18)
+	aged := time.Now().UTC().Add(-90 * 24 * time.Hour)
+	fresh := time.Now().UTC()
+	kinds := []struct {
+		kind    string
+		ts      time.Time
+		survive bool
+	}{
+		{events.KindJobProgress, aged, false},
+		{events.KindUsage, aged, false},
+		{events.KindSessionState, aged, false},
+		{events.KindHermesHook, aged, false},
+		{events.KindJobApprovalResolved, aged, true},
+		{events.KindJobApprovalAutoDenied, aged, true},
+		{events.KindJobNeedsApproval, aged, true},
+		{events.KindJobApprovalParked, aged, true},
+		{events.KindJobDone, aged, true},
+		{events.KindJobFailed, aged, true},
+		{events.KindJobNeedsInput, aged, true},
+		{events.KindTranscriptIn, aged, true},
+		// Recent telemetry is inside the window and must be left alone.
+		{events.KindJobProgress, fresh, true},
+	}
+	for _, k := range kinds {
+		if err := st.AppendEvent(ctx, events.Event{TS: k.ts, Kind: k.kind, JobID: marker}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := st.PruneTransientEvents(ctx, 0); err == nil {
+		t.Fatal("a non-positive retention window must be rejected rather than deleting everything")
+	}
+	if _, err := st.PruneTransientEvents(ctx, 30*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := st.Pool.Query(ctx,
+		`SELECT kind, ts FROM event_log WHERE job_id=$1 ORDER BY seq`, marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	survived := map[string]int{}
+	for rows.Next() {
+		var kind string
+		var ts time.Time
+		if err := rows.Scan(&kind, &ts); err != nil {
+			t.Fatal(err)
+		}
+		survived[kind]++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]int{}
+	for _, k := range kinds {
+		if k.survive {
+			want[k.kind]++
+		}
+	}
+	for kind, n := range want {
+		if survived[kind] != n {
+			t.Errorf("kind %s survived %d rows, want %d", kind, survived[kind], n)
+		}
+	}
+	for _, k := range kinds {
+		if !k.survive && survived[k.kind] > want[k.kind] {
+			t.Errorf("aged telemetry kind %s was not pruned", k.kind)
+		}
 	}
 }

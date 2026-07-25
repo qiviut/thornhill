@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "e33662ec9f5fcf1efb27781366bb3af25093ff310e53ae01747aecf7fe80bca1",
+  "schema_sha256": "32dc01d18ec85835736307acb9fbfaf6174c02bd6f3cb864194a37b4cf39ba54",
   "mode": "backward-compatible-additive",
-  "rationale": "The added jobs expression/partial indexes and usage_ledger timestamp index do not change table data or application semantics. Existing application and PostgreSQL images can continue operating after this schema is applied; they ignore the additional indexes. Destructive or version-coupled migrations must use mode manual-forward-only and are ineligible for automatic rollback deployment."
+  "rationale": "The added jobs expression/partial indexes, usage_ledger timestamp index, and event_log (kind, ts) plus partial (job_id, ts) indexes do not change table data or application semantics. Existing application and PostgreSQL images can continue operating after this schema is applied; they ignore the additional indexes. Event retention prunes transient telemetry kinds with a DELETE rather than a migration, so it introduces no rollback coupling either. Destructive or version-coupled migrations must use mode manual-forward-only and are ineligible for automatic rollback deployment."
 }

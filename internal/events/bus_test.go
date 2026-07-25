@@ -194,3 +194,41 @@ func TestUnsubscribeOnCancel(t *testing.T) {
 		}
 	}
 }
+
+// A cancelled subscriber must stop the pump and deregister immediately. Falling
+// through the cancellation branch spun the remaining replay against a dead
+// context and left the subscription in the fan-out map until the next live event.
+func TestCancelledSubscriberDeregistersDuringReplay(t *testing.T) {
+	b := NewBus(nil, testLog())
+	for range b.ringCap {
+		b.Publish("job.progress", "j", map[string]string{"k": "v"})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := b.Subscribe(ctx, true)
+	cancel()
+
+	// Draining to close proves the pump returned rather than spinning.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-out:
+			if !ok {
+				goto closed
+			}
+		case <-deadline:
+			t.Fatal("cancelled subscriber channel was never closed")
+		}
+	}
+closed:
+	for range 100 {
+		b.mu.Lock()
+		n := len(b.subs)
+		b.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("cancelled subscriber stayed registered in the fan-out map")
+}

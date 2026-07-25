@@ -88,6 +88,7 @@ func policyFixture(t *testing.T) string {
 		".github/workflows/dependabot-auto-approve.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
+		".github/workflows/scorecard.yml",
 		"Dockerfile",
 		"Dockerfile.postgres",
 		"docs/rollback-compatibility.json",
@@ -133,6 +134,26 @@ func TestCheckRejectsUnsafeDependabotApproval(t *testing.T) {
 			old:     "            -f \"commit_id=${head_sha}\" \\\n",
 			new:     "",
 			contain: "approval lane must include",
+		},
+		{
+			name:    "merge is not delegated to Dependabot",
+			old:     "@dependabot squash and merge",
+			new:     "gh pr merge --auto --squash",
+			contain: "approval lane must include",
+		},
+		{
+			name:    "merge request is not bound to the tested revision",
+			old:     `merge_marker="Requested squash merge for ${head_sha}."`,
+			new:     `merge_marker="Requested squash merge."`,
+			contain: "approval lane must include",
+		},
+		{
+			name: "merge lane takes write access to the protected branch",
+			old:  "  contents: read\n",
+			new:  "  contents: write\n",
+			// Delegating the merge to Dependabot is what keeps this lane free of
+			// branch write access; escalating it must remain a policy failure.
+			contain: "permission contents must be read",
 		},
 	}
 	for _, tc := range tests {
@@ -246,5 +267,96 @@ func TestCheckRejectsSchemaWithoutUpdatedRollbackDeclaration(t *testing.T) {
 	err = Check(root)
 	if err == nil || !strings.Contains(err.Error(), "does not cover current schema") {
 		t.Fatalf("Check() error = %v, want rollback compatibility hash error", err)
+	}
+}
+
+// The measurement lane is the only workflow holding `security-events: write`, so
+// its blast radius must stay pinned the same way the other lanes are: read-only
+// by default, one job, no OIDC grant, no contributor-triggered entry point, and
+// no mutable action reference.
+func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
+	tests := []struct {
+		name    string
+		old     string
+		new     string
+		contain string
+	}{
+		{
+			name:    "workflow default is not read-only",
+			old:     "permissions:\n  contents: read\n",
+			new:     "permissions:\n  contents: write\n",
+			contain: "must default to exactly contents: read",
+		},
+		{
+			name:    "escalates to an OIDC token",
+			old:     "      security-events: write\n",
+			new:     "      security-events: write\n      id-token: write\n",
+			contain: "narrow permissions",
+		},
+		{
+			name:    "publishes results",
+			old:     "publish_results: false",
+			new:     "publish_results: true",
+			contain: "must explicitly disable result publication",
+		},
+		{
+			name:    "contributor-triggered entry point",
+			old:     "  workflow_dispatch:\n",
+			new:     "  pull_request:\n",
+			contain: "triggers",
+		},
+		{
+			name:    "unpinned action reference",
+			old:     "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4",
+			new:     "ossf/scorecard-action@v2.4.4",
+			contain: "unpinned action",
+		},
+		{
+			name:    "secret access",
+			old:     "          results_file: scorecard.sarif\n",
+			new:     "          token: ${{ secrets.SCORECARD_TOKEN }}\n",
+			contain: "must not access secrets",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/scorecard.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
+	}
+}
+
+func TestPinnedActionSHARejectsMutableReferences(t *testing.T) {
+	pinned := "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+	if _, ok := pinnedActionSHA(pinned); !ok {
+		t.Errorf("pinnedActionSHA(%q) rejected a full commit SHA", pinned)
+	}
+	for _, mutable := range []string{
+		"actions/checkout@v7",
+		"actions/checkout@main",
+		"actions/checkout",
+		// Abbreviated SHAs are still ambiguous and must not count as a pin.
+		"actions/checkout@9c091bb",
+		// Right length, not hexadecimal.
+		"actions/checkout@zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+	} {
+		if _, ok := pinnedActionSHA(mutable); ok {
+			t.Errorf("pinnedActionSHA(%q) accepted a mutable reference", mutable)
+		}
 	}
 }

@@ -185,11 +185,67 @@ func (g *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /offer", g.handleOffer)
 	mux.HandleFunc("GET /ws", g.handleWS)
 	mux.HandleFunc("GET /events", g.handleSSE)
-	mux.HandleFunc("POST /hooks/hermes", g.Hooks)
+	mux.HandleFunc("POST /hooks/hermes", g.guardHooks(g.Hooks))
 	mux.Handle("GET /audio/prebaked/", http.StripPrefix("/audio/prebaked/",
 		http.FileServer(http.Dir(g.Cfg.PrebakeDir))))
 	mux.Handle("GET /", staticHandler(g.Cfg.StaticDir))
-	return withLogging(mux, g.Log)
+	return withLogging(withSecurityHeaders(mux), g.Log)
+}
+
+// contentSecurityPolicy is deliberately strict because every resource Thornhill's
+// UI needs is same-origin: the bundle and stylesheet, the manifest, icons,
+// prebaked audio, /offer, and the control WebSocket. Live call audio arrives as a
+// WebRTC MediaStream attached via srcObject, which no fetch directive governs, and
+// RTCPeerConnection is constructed without ICE servers, so no external host is
+// contacted from the page. There is no XSS sink today — the UI holds no innerHTML,
+// dangerouslySetInnerHTML, or eval, and React escapes the untrusted agent text it
+// renders — so this is defence in depth for a page that displays agent output and
+// authority requests. frame-ancestors additionally denies framing the ring and
+// approval controls, which is a clickjacking target a tailnet perimeter does not
+// address: the operator's own browser can always reach a tailnet address.
+const contentSecurityPolicy = "default-src 'self'; " +
+	"script-src 'self'; " +
+	"style-src 'self'; " +
+	"img-src 'self' data:; " +
+	"media-src 'self' blob:; " +
+	"connect-src 'self'; " +
+	"manifest-src 'self'; " +
+	"worker-src 'self'; " +
+	"font-src 'self'; " +
+	"base-uri 'none'; " +
+	"form-action 'none'; " +
+	"object-src 'none'; " +
+	"frame-ancestors 'none'"
+
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := w.Header()
+		header.Set("Content-Security-Policy", contentSecurityPolicy)
+		// Prebaked audio and the SDP answer are served with explicit content types;
+		// never let a browser sniff its way to a different interpretation.
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("Referrer-Policy", "no-referrer")
+		// The tailnet name and any job identifiers in a URL are not the business of
+		// a cross-origin navigation target, and nothing here needs these features.
+		header.Set("Permissions-Policy", "camera=(), geolocation=(), payment=(), usb=()")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// guardHooks rejects browser-originated hook posts. Hermes and other server-side
+// callers send no Origin and are unaffected; the tailnet is still the perimeter
+// for them. A page the operator visits, however, can reach a tailnet address, and
+// a simple-content-type POST needs no preflight — so without this a third-party
+// site could inject bus events and grow the durable event log. Same-origin
+// browser writes stay allowed so the UI could post hooks during development.
+func (g *Gateway) guardHooks(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") != "" && !browserSameOrigin(r) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
 }
 
 const immutableAssetCacheControl = "public, max-age=31536000, immutable"
@@ -448,7 +504,18 @@ func (g *Gateway) handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if usd, err := g.Store.UsageTodayUSD(r.Context()); err == nil && usd >= g.Cfg.DailyBudgetUSD {
+	// The breaker admits the call when the ledger cannot be read: a database
+	// hiccup should not be able to silence the desk, which is the one channel the
+	// operator has for noticing and fixing that hiccup. It is the sole deliberate
+	// fail-open in this service, so it is never silent — losing a spend guard is
+	// announced on the error bus and logged rather than inferred from a $0 read.
+	switch usd, err := g.Store.UsageTodayUSD(r.Context()); {
+	case err != nil:
+		g.Log.Warn("daily budget breaker could not be evaluated; admitting the call", "err", err)
+		g.Bus.Publish(events.KindErrorVoice, "", map[string]string{
+			"message": "daily spend check unavailable; the budget breaker is not enforcing",
+		})
+	case usd >= g.Cfg.DailyBudgetUSD:
 		g.Bus.Publish(events.KindErrorVoice, "", map[string]string{"message": "daily budget reached", "play": "budget_tripped"})
 		http.Error(w, "daily budget reached", http.StatusTooManyRequests)
 		return
@@ -625,11 +692,15 @@ func (g *Gateway) voiceDown(msg string) {
 	g.Bus.Publish(events.KindErrorVoice, "", map[string]string{"message": msg, "play": "voice_down"})
 }
 
+// truncate bounds by runes, not bytes. These strings are upstream error bodies of
+// unknown encoding that flow into logs and the error bus; a byte cut can split a
+// multi-byte sequence and emit replacement characters.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }
 
 // --- control WebSocket ---
