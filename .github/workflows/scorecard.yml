@@ -4,6 +4,14 @@ name: Supply-chain scorecard
 # code-scanning alerts. It is deliberately advisory: `.github/branch-protection.json`
 # requires exactly one check, and that stays the qualification lane. A drifted
 # score should open a conversation, not block a merge on a third-party heuristic.
+#
+# Requires `ossf/scorecard-action@*` on the repository action allowlist. The
+# wildcard is an accepted balance rather than an oversight: the allowlist's
+# separate full-SHA requirement still applies, so it admits any *pinned commit* of
+# that one repository and never a mutable tag or branch. An exact-SHA entry would
+# be tighter but would need a paired Dependabot ignore, because otherwise an
+# auto-merged bump reverts this lane to a logless startup failure on main.
+# See docs/ci-security.md.
 on:
   schedule:
     # Weekly, matching the long fuzz campaign's cadence.
@@ -30,7 +38,7 @@ jobs:
       contents: read
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 

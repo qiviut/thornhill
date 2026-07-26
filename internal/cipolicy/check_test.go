@@ -3,6 +3,7 @@ package cipolicy
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -87,9 +88,9 @@ func policyFixture(t *testing.T) string {
 		".github/scanners/compose.yml",
 		".github/workflows/dependabot-auto-approve.yml",
 		".github/workflows/dependabot-auto-merge.yml",
+		".github/workflows/scorecard.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
-		".github/workflows/scorecard.yml",
 		"Dockerfile",
 		"Dockerfile.postgres",
 		"docs/rollback-compatibility.json",
@@ -360,8 +361,10 @@ func TestApprovalLaneCannotMerge(t *testing.T) {
 	}
 }
 
+// The measurement lane is the only one holding security-events: write, so its
+// containment must stay asserted even though it is advisory.
 func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
-	tests := []struct {
+	for _, tc := range []struct {
 		name    string
 		old     string
 		new     string
@@ -392,19 +395,12 @@ func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
 			contain: "triggers",
 		},
 		{
-			name:    "unpinned action reference",
-			old:     "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4",
-			new:     "ossf/scorecard-action@v2.4.4",
-			contain: "unpinned action",
-		},
-		{
 			name:    "secret access",
 			old:     "          results_file: scorecard.sarif\n",
-			new:     "          token: ${{ secrets.SCORECARD_TOKEN }}\n",
+			new:     "          repo_token: ${{ secrets.SCORECARD_TOKEN }}\n",
 			contain: "must not access secrets",
 		},
-	}
-	for _, tc := range tests {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := policyFixture(t)
 			path := filepath.Join(root, ".github/workflows/scorecard.yml")
@@ -422,6 +418,45 @@ func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
 			err = Check(root)
 			if err == nil || !strings.Contains(err.Error(), tc.contain) {
 				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
+	}
+}
+
+// A mutable action reference is rejected remotely by the repository's action
+// allowlist, but only at workflow startup: the run reports startup_failure with no
+// jobs and no logs, which is an expensive way to find out. This must fail the
+// required check on the pull request instead, next to the reason.
+func TestCheckRejectsUnpinnedWorkflowActions(t *testing.T) {
+	// Derive the pin from the fixture rather than hardcoding a SHA: these are
+	// exactly the references Dependabot rewrites, so a literal would rot on the
+	// next bump and fail for the wrong reason.
+	pinned := regexp.MustCompile(`(uses: \S+)@[0-9a-f]{40}`)
+	for _, tc := range []struct {
+		name        string
+		replacement string
+	}{
+		{name: "tag reference", replacement: "${1}@v7"},
+		{name: "branch reference", replacement: "${1}@main"},
+		{name: "abbreviated sha", replacement: "${1}@9c091bb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/ci.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !pinned.Match(data) {
+				t.Fatal("fixture contains no SHA-pinned action to unpin")
+			}
+			changed := pinned.ReplaceAll(data, []byte(tc.replacement))
+			if err := os.WriteFile(path, changed, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), "unpinned action") {
+				t.Fatalf("Check() error = %v, want an unpinned-action error", err)
 			}
 		})
 	}

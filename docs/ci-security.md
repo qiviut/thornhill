@@ -75,10 +75,36 @@ There is deliberately no cooldown on version updates: the operator's stated pref
 
 If unattended promotion ever needs to be withdrawn, delete `dependabot-auto-merge.yml` along with `checkDependabotMerge` and its test. The review lane keeps working on its own and the repository returns to approve-only, where a stale queue of open Dependabot PRs means a human has not looked yet rather than that something is broken.
 
-### 2b. Measurement: advisory, never a gate
+### 2b. The action allowlist
+
+A repository-level Actions policy restricts which actions may run at all: those
+owned by this account, those authored by GitHub, and explicitly vetted exceptions —
+currently `gitleaks/gitleaks-action@*` and `ossf/scorecard-action@*`. It
+**additionally** requires every reference to be a full-length commit SHA. Those two
+conditions are independent, which is what makes a wildcard entry narrower than it
+first appears: it admits any *pinned commit* of that one repository, never a mutable
+tag or branch.
+
+The policy is enforced before a workflow starts, so a violation surfaces as a
+`startup_failure` run with **no jobs and no logs** — a uniquely unhelpful signal, and
+one that a workflow which does not run on pull requests will only produce after
+merge. `cipolicy.checkPinnedWorkflowActions` therefore asserts the SHA-pinning half
+locally, so a mutable reference fails the required check on the pull request next to
+its reason. The *which actions* half lives in repository settings and cannot be
+asserted from here; adding a workflow that uses anything else requires widening the
+allowlist first, and a lane added without that step will silently never run.
+
+The wildcard form is a deliberate balance for this project rather than an oversight.
+An exact-SHA entry would be tighter, but it has to be paired with a Dependabot
+`ignore` for that action: otherwise an auto-merged bump introduces a SHA the
+allowlist does not admit, and the lane reverts to a logless startup failure while
+the bump's own CI stays green. That trade buys little for an advisory check and costs
+a two-place manual update on every version.
+
+### 2c. Measurement: advisory, never a gate
 
 `.github/workflows/scorecard.yml` scores this repository's own supply-chain posture
-weekly, on pushes to `main`, and on demand, and files regressions as code-scanning
+weekly, on pushes to `main`, and on demand, filing regressions as code-scanning
 alerts beside the CodeQL analyses. It never runs on `pull_request`: Scorecard
 evaluates the default branch, and a contributor-triggered run must not reach a lane
 holding a write grant.
@@ -92,8 +118,7 @@ to one job while the workflow default stays `contents: read`. Result publication
 disabled on purpose: `publish_results: true` requires `id-token: write`, and an OIDC
 token is a materially larger grant than this measurement justifies. The cost is only
 the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
-both permission sets, the single job, the absence of publication, and that every
-action is referenced by a full commit SHA rather than a mutable tag.
+both permission sets, the single job, and the absence of publication.
 
 Read two sub-scores with context rather than at face value:
 

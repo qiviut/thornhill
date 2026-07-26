@@ -231,7 +231,11 @@ Dependabot PRs therefore indicate breakage rather than pending review.
 A separate weekly lane scores the repository's own supply-chain posture with
 OpenSSF Scorecard and files regressions as code-scanning alerts. It is advisory
 by design: branch protection still requires exactly one check, and result
-publication is disabled so the lane needs no OIDC token.
+publication is disabled so the lane needs no OIDC token. A repository-level
+Actions policy admits only GitHub-authored actions plus explicitly vetted
+exceptions and requires full-SHA pinning; `cipolicy` asserts the pinning half
+locally, so a mutable reference fails review rather than failing a workflow at
+startup after merge.
 
 PR CI is intentionally secretless. The checked-in branch-protection policy,
 publication procedure, future trusted-promotion rules, randomized-test policy,
