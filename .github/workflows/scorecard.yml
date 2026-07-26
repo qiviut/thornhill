@@ -1,0 +1,59 @@
+name: Supply-chain scorecard
+
+# Measures this repository's own supply-chain posture and files regressions as
+# code-scanning alerts. It is deliberately advisory: `.github/branch-protection.json`
+# requires exactly one check, and that stays the qualification lane. A drifted
+# score should open a conversation, not block a merge on a third-party heuristic.
+#
+# Requires `ossf/scorecard-action@*` on the repository action allowlist. The
+# wildcard is an accepted balance rather than an oversight: the allowlist's
+# separate full-SHA requirement still applies, so it admits any *pinned commit* of
+# that one repository and never a mutable tag or branch. An exact-SHA entry would
+# be tighter but would need a paired Dependabot ignore, because otherwise an
+# auto-merged bump reverts this lane to a logless startup failure on main.
+# See docs/ci-security.md.
+on:
+  schedule:
+    # Weekly, matching the long fuzz campaign's cadence.
+    - cron: "41 6 * * 1"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only by default. The analysis job escalates narrowly and alone.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze supply-chain posture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Files findings as code-scanning alerts next to the CodeQL analyses.
+      security-events: write
+      # Scorecard reads workflow definitions and run metadata for its
+      # Dangerous-Workflow, Token-Permissions, and Pinned-Dependencies checks.
+      actions: read
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Run OpenSSF Scorecard
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          # Deliberately false. Publishing requires `id-token: write`, and an OIDC
+          # token is a materially larger grant than this measurement is worth. The
+          # cost is only the public badge and the OpenSSF dataset entry.
+          publish_results: false
+
+      - name: Upload results to code scanning
+        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4
+        with:
+          sarif_file: scorecard.sarif
+          category: ossf-scorecard

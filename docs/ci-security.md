@@ -75,42 +75,60 @@ There is deliberately no cooldown on version updates: the operator's stated pref
 
 If unattended promotion ever needs to be withdrawn, delete `dependabot-auto-merge.yml` along with `checkDependabotMerge` and its test. The review lane keeps working on its own and the repository returns to approve-only, where a stale queue of open Dependabot PRs means a human has not looked yet rather than that something is broken.
 
-### 2b. The action allowlist, and why there is no Scorecard lane
+### 2b. The action allowlist
 
 A repository-level Actions policy restricts which actions may run at all: those
-owned by this account, those authored by GitHub, and one explicitly vetted
-exception, `gitleaks/gitleaks-action@*`. It additionally requires every reference to
-be a full-length commit SHA. This is enforced before a workflow starts, so a
-violation surfaces as a `startup_failure` run with **no jobs and no logs** — a
-uniquely unhelpful signal.
+owned by this account, those authored by GitHub, and explicitly vetted exceptions —
+currently `gitleaks/gitleaks-action@*` and `ossf/scorecard-action@*`. It
+**additionally** requires every reference to be a full-length commit SHA. Those two
+conditions are independent, which is what makes a wildcard entry narrower than it
+first appears: it admits any *pinned commit* of that one repository, never a mutable
+tag or branch.
 
-`cipolicy.checkPinnedWorkflowActions` therefore asserts the SHA-pinning half locally,
-so a mutable reference fails the required check on the pull request next to its
-reason rather than as a silent startup failure after merge. The *which actions*
-half lives in repository settings and cannot be asserted from here.
+The policy is enforced before a workflow starts, so a violation surfaces as a
+`startup_failure` run with **no jobs and no logs** — a uniquely unhelpful signal, and
+one that a workflow which does not run on pull requests will only produce after
+merge. `cipolicy.checkPinnedWorkflowActions` therefore asserts the SHA-pinning half
+locally, so a mutable reference fails the required check on the pull request next to
+its reason. The *which actions* half lives in repository settings and cannot be
+asserted from here; adding a workflow that uses anything else requires widening the
+allowlist first, and a lane added without that step will silently never run.
 
-An OpenSSF Scorecard lane was added and then removed, because `ossf/scorecard-action`
-is not on the allowlist and every run failed at startup. Adding it back means one of:
+The wildcard form is a deliberate balance for this project rather than an oversight.
+An exact-SHA entry would be tighter, but it has to be paired with a Dependabot
+`ignore` for that action: otherwise an auto-merged bump introduces a SHA the
+allowlist does not admit, and the lane reverts to a logless startup failure while
+the bump's own CI stays green. That trade buys little for an advisory check and costs
+a two-place manual update on every version.
 
-1. **Widen the allowlist** to include `ossf/scorecard-action@*`. This is the honest
-   option and a real decision: that action would then execute in CI with the job's
-   token. It is the same class of judgement already made once for Gitleaks.
-2. **Run the scanner without an action**, as a digest-pinned container invoked from a
-   `run:` step. This satisfies the letter of the allowlist while running the same
-   third-party code, so it should not be chosen to avoid the conversation in (1).
-   It does contain the code more tightly — no action context, and only whatever
-   token is passed explicitly — but Scorecard needs an API token for most of its
-   interesting checks, which erodes much of that advantage.
-3. **Leave it out.** Most of what Scorecard would measure here is already asserted
-   directly: digest-pinned bases and SHA-pinned actions by `cipolicy`, secretless
-   PR CI and branch protection by this document and `branch-protection.json`,
-   vulnerability gates by `govulncheck`, `npm audit`, and Trivy.
+### 2c. Measurement: advisory, never a gate
 
-If a lane is ever reinstated, note that two sub-scores read low for structural
-reasons rather than real gaps: **Branch-Protection**, because `GITHUB_TOKEN` cannot
-read protection settings and no admin PAT should be handed to a measurement lane, and
-the **provenance** scores, which reflect the deliberate absence of a signed artifact
-lane under source-revision correspondence.
+`.github/workflows/scorecard.yml` scores this repository's own supply-chain posture
+weekly, on pushes to `main`, and on demand, filing regressions as code-scanning
+alerts beside the CodeQL analyses. It never runs on `pull_request`: Scorecard
+evaluates the default branch, and a contributor-triggered run must not reach a lane
+holding a write grant.
+
+It is deliberately advisory. Branch protection requires exactly one check, and that
+stays the qualification lane; `cipolicy` enforces the single required context, so a
+drifted third-party heuristic opens a conversation instead of blocking a merge.
+
+This is the only workflow holding `security-events: write`, so the grant is confined
+to one job while the workflow default stays `contents: read`. Result publication is
+disabled on purpose: `publish_results: true` requires `id-token: write`, and an OIDC
+token is a materially larger grant than this measurement justifies. The cost is only
+the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
+both permission sets, the single job, and the absence of publication.
+
+Read two sub-scores with context rather than at face value:
+
+- **Branch-Protection** scores low because `GITHUB_TOKEN` cannot read protection
+  settings; that needs an admin-scoped PAT this lane deliberately does not hold.
+  The real contract is `.github/branch-protection.json`, applied and verified by
+  `./scripts/apply-branch-protection.sh` and asserted by `cipolicy`.
+- **Signed-Releases** and provenance sub-scores reflect the documented absence of a
+  signed artifact lane. Promotion here is source-revision correspondence, not binary
+  artifact promotion, as described below.
 
 ### 3. Secret-bearing canaries or deployment: trusted revision only
 

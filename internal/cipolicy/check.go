@@ -155,6 +155,9 @@ func Check(root string) error {
 	if err := checkPinnedWorkflowActions(root); err != nil {
 		return err
 	}
+	if err := checkScorecard(root); err != nil {
+		return err
+	}
 	if err := checkPinnedImages(root); err != nil {
 		return err
 	}
@@ -443,6 +446,64 @@ func checkDependabotMerge(root string) error {
 	} {
 		if !strings.Contains(lane.String(), required) {
 			return fmt.Errorf("%s merge lane must include %q", relative, required)
+		}
+	}
+	return nil
+}
+
+// checkScorecard pins the measurement lane. It is the only workflow holding
+// `security-events: write`, so that grant must stay confined to one job while the
+// workflow default stays read-only, and it must not quietly grow an `id-token` for
+// result publication. Scorecard is advisory by design and must never become the
+// required check, which the single-required-context assertion above enforces.
+//
+// SHA pinning is not re-checked here; checkPinnedWorkflowActions covers every
+// workflow, including this one.
+func checkScorecard(root string) error {
+	relative := ".github/workflows/scorecard.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if strings.Contains(text, "secrets.") || strings.Contains(text, "pull_request_target") {
+		return fmt.Errorf("%s must not access secrets or use pull_request_target", relative)
+	}
+	// Publication is what would require an OIDC token; the permission assertions
+	// below are what actually deny one, at both the workflow and job level.
+	if !strings.Contains(text, "publish_results: false") {
+		return fmt.Errorf("%s must explicitly disable result publication", relative)
+	}
+
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	gotTriggers := make([]string, 0, len(wf.On))
+	for trigger := range wf.On {
+		gotTriggers = append(gotTriggers, trigger)
+	}
+	sort.Strings(gotTriggers)
+	// Never pull_request: Scorecard evaluates the default branch, and a
+	// contributor-triggered run must not reach a lane holding a write grant.
+	if want := []string{"push", "schedule", "workflow_dispatch"}; strings.Join(gotTriggers, ",") != strings.Join(want, ",") {
+		return fmt.Errorf("%s triggers = %v, want %v", relative, gotTriggers, want)
+	}
+	if len(wf.Permissions) != 1 || wf.Permissions["contents"] != "read" {
+		return fmt.Errorf("%s must default to exactly contents: read", relative)
+	}
+
+	analyze, ok := wf.Jobs["analyze"]
+	if len(wf.Jobs) != 1 || !ok {
+		return fmt.Errorf("%s must contain only the analysis job", relative)
+	}
+	wantJobPermissions := map[string]string{"security-events": "write", "actions": "read", "contents": "read"}
+	if len(analyze.Permissions) != len(wantJobPermissions) {
+		return fmt.Errorf("%s analysis job must hold exactly the documented narrow permissions", relative)
+	}
+	for name, access := range wantJobPermissions {
+		if analyze.Permissions[name] != access {
+			return fmt.Errorf("%s analysis job permission %s must be %s", relative, name, access)
 		}
 	}
 	return nil

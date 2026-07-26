@@ -88,6 +88,7 @@ func policyFixture(t *testing.T) string {
 		".github/scanners/compose.yml",
 		".github/workflows/dependabot-auto-approve.yml",
 		".github/workflows/dependabot-auto-merge.yml",
+		".github/workflows/scorecard.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
 		"Dockerfile",
@@ -357,6 +358,68 @@ func TestApprovalLaneCannotMerge(t *testing.T) {
 		if strings.Contains(string(data), forbidden) {
 			t.Errorf("the review lane must not contain %q", forbidden)
 		}
+	}
+}
+
+// The measurement lane is the only one holding security-events: write, so its
+// containment must stay asserted even though it is advisory.
+func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		old     string
+		new     string
+		contain string
+	}{
+		{
+			name:    "workflow default is not read-only",
+			old:     "permissions:\n  contents: read\n",
+			new:     "permissions:\n  contents: write\n",
+			contain: "must default to exactly contents: read",
+		},
+		{
+			name:    "escalates to an OIDC token",
+			old:     "      security-events: write\n",
+			new:     "      security-events: write\n      id-token: write\n",
+			contain: "narrow permissions",
+		},
+		{
+			name:    "publishes results",
+			old:     "publish_results: false",
+			new:     "publish_results: true",
+			contain: "must explicitly disable result publication",
+		},
+		{
+			name:    "contributor-triggered entry point",
+			old:     "  workflow_dispatch:\n",
+			new:     "  pull_request:\n",
+			contain: "triggers",
+		},
+		{
+			name:    "secret access",
+			old:     "          results_file: scorecard.sarif\n",
+			new:     "          repo_token: ${{ secrets.SCORECARD_TOKEN }}\n",
+			contain: "must not access secrets",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/scorecard.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
 	}
 }
 
