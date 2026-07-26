@@ -149,6 +149,9 @@ func Check(root string) error {
 	if err := checkDependabotApproval(root); err != nil {
 		return err
 	}
+	if err := checkDependabotMerge(root); err != nil {
+		return err
+	}
 	if err := checkScorecard(root); err != nil {
 		return err
 	}
@@ -355,16 +358,91 @@ func checkDependabotApproval(root string) error {
 		`repos/${REPOSITORY}/pulls/${pull_request}/reviews`,
 		"-f event=APPROVE",
 		`-f "commit_id=${head_sha}"`,
-		// Unattended merging must stay delegated to Dependabot's own credentials
-		// and stay bound to the CI-tested SHA. The workflow-level permission
-		// assertion above already denies this lane `contents: write`, so it can
-		// request a merge but can never write to the protected branch itself.
-		"@dependabot squash and merge",
-		`merge_marker="Requested squash merge for ${head_sha}."`,
-		`repos/${REPOSITORY}/issues/${pull_request}/comments`,
 	} {
 		if !strings.Contains(lane.String(), required) {
 			return fmt.Errorf("%s approval lane must include %q", relative, required)
+		}
+	}
+	return nil
+}
+
+// checkDependabotMerge pins the one lane that can write to the protected branch.
+// The grant must stay confined to a single job whose workflow default is
+// read-only, the lane must run no actions at all so nothing third-party executes
+// with that token, and it must re-derive its own guards from the workflow_run
+// metadata rather than trusting the review lane. The merge must name the
+// CI-tested SHA so a rebase landing between qualification and this request is
+// refused instead of merged.
+func checkDependabotMerge(root string) error {
+	relative := ".github/workflows/dependabot-auto-merge.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if strings.Contains(text, "secrets.") || strings.Contains(text, "actions/checkout@") ||
+		strings.Contains(text, "pull_request_target") {
+		return fmt.Errorf("%s must not access secrets, check out code, or use pull_request_target", relative)
+	}
+
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	if len(wf.On) != 1 || wf.On["workflow_run"] == nil {
+		return fmt.Errorf("%s must trigger only from workflow_run", relative)
+	}
+	wantDefaults := map[string]string{"actions": "read", "contents": "read"}
+	if len(wf.Permissions) != len(wantDefaults) {
+		return fmt.Errorf("%s must default to exactly the documented read-only permissions", relative)
+	}
+	for name, access := range wantDefaults {
+		if wf.Permissions[name] != access {
+			return fmt.Errorf("%s default permission %s must be %s", relative, name, access)
+		}
+	}
+
+	merge, ok := wf.Jobs["merge"]
+	if len(wf.Jobs) != 1 || !ok || merge.If != "github.event.workflow_run.conclusion == 'success'" {
+		return fmt.Errorf("%s must contain only the success-gated merge job", relative)
+	}
+	wantJob := map[string]string{"contents": "write", "pull-requests": "write", "actions": "read"}
+	if len(merge.Permissions) != len(wantJob) {
+		return fmt.Errorf("%s merge job must hold exactly the documented narrow permissions", relative)
+	}
+	for name, access := range wantJob {
+		if merge.Permissions[name] != access {
+			return fmt.Errorf("%s merge job permission %s must be %s", relative, name, access)
+		}
+	}
+
+	var lane strings.Builder
+	for _, step := range merge.Steps {
+		if step.Uses != "" {
+			return fmt.Errorf("%s merge job must not run external actions", relative)
+		}
+		lane.WriteString(step.Run)
+		lane.WriteByte('\n')
+	}
+	for _, required := range []string{
+		".actor.login",
+		".head_repository.full_name",
+		".head_branch",
+		".head_sha",
+		`"${actor}" != 'dependabot[bot]'`,
+		`"${source_repository}" != "${REPOSITORY}"`,
+		`"${head_branch}" != dependabot/*`,
+		`.user.login == "dependabot[bot]"`,
+		`.head.repo.full_name == .base.repo.full_name`,
+		`.base.ref == "main"`,
+		`.head.sha == $sha`,
+		`repos/${REPOSITORY}/pulls/${pull_request}/merge`,
+		// Bind the merge to the qualified revision, and keep linear history.
+		`-f "sha=${head_sha}"`,
+		"-f merge_method=squash",
+	} {
+		if !strings.Contains(lane.String(), required) {
+			return fmt.Errorf("%s merge lane must include %q", relative, required)
 		}
 	}
 	return nil

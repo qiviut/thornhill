@@ -221,11 +221,11 @@ Dependabot checks Go tools/modules, npm packages and Biome rules, Dockerfiles,
 production and scanner Compose images/rule engines, and GitHub Actions daily,
 grouped into one pull request per ecosystem. A privileged `workflow_run` lane may
 approve only an open, same-repository `dependabot[bot]` PR to `main` at the exact
-SHA that read-only CI passed; it never checks out PR code. That lane then asks
-Dependabot to squash-merge that same SHA, so dependency currency is unattended.
-The merge is delegated to Dependabot's own credentials rather than performed by
-the Actions token: no workflow in this repository holds `contents: write` on the
-protected branch, and branch protection remains the only merge gate. Open
+SHA that read-only CI passed; it never checks out PR code. A second lane then
+squash-merges that same SHA, so dependency currency is unattended. Reviewing and
+merging are separated so only the merge lane can write to the protected branch,
+and that lane runs no third-party actions, re-derives its own guards, and binds
+the request to the tested commit; branch protection remains the decider. Open
 Dependabot PRs therefore indicate breakage rather than pending review.
 
 A separate weekly lane scores the repository's own supply-chain posture with

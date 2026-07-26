@@ -86,6 +86,7 @@ func policyFixture(t *testing.T) string {
 		".github/dependabot.yml",
 		".github/scanners/compose.yml",
 		".github/workflows/dependabot-auto-approve.yml",
+		".github/workflows/dependabot-auto-merge.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
 		".github/workflows/scorecard.yml",
@@ -136,23 +137,11 @@ func TestCheckRejectsUnsafeDependabotApproval(t *testing.T) {
 			contain: "approval lane must include",
 		},
 		{
-			name:    "merge is not delegated to Dependabot",
-			old:     "@dependabot squash and merge",
-			new:     "gh pr merge --auto --squash",
-			contain: "approval lane must include",
-		},
-		{
-			name:    "merge request is not bound to the tested revision",
-			old:     `merge_marker="Requested squash merge for ${head_sha}."`,
-			new:     `merge_marker="Requested squash merge."`,
-			contain: "approval lane must include",
-		},
-		{
-			name: "merge lane takes write access to the protected branch",
+			name: "review lane takes write access to the protected branch",
 			old:  "  contents: read\n",
 			new:  "  contents: write\n",
-			// Delegating the merge to Dependabot is what keeps this lane free of
-			// branch write access; escalating it must remain a policy failure.
+			// Merging lives in its own lane precisely so the reviewing lane never
+			// needs branch write access; escalating it must stay a policy failure.
 			contain: "permission contents must be read",
 		},
 	}
@@ -274,6 +263,103 @@ func TestCheckRejectsSchemaWithoutUpdatedRollbackDeclaration(t *testing.T) {
 // its blast radius must stay pinned the same way the other lanes are: read-only
 // by default, one job, no OIDC grant, no contributor-triggered entry point, and
 // no mutable action reference.
+// This is the only lane that can write to the protected branch, so every part of
+// its containment must stay asserted: a read-only workflow default, one job, no
+// third-party action executing with that token, its own independently derived
+// guards, and a merge bound to the qualified SHA under squash.
+func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
+	tests := []struct {
+		name    string
+		old     string
+		new     string
+		contain string
+	}{
+		{
+			name:    "workflow default is not read-only",
+			old:     "permissions:\n  actions: read\n  contents: read\n",
+			new:     "permissions:\n  actions: read\n  contents: write\n",
+			contain: "default permission contents must be read",
+		},
+		{
+			name:    "merge is not bound to the tested revision",
+			old:     "            -f \"sha=${head_sha}\" \\\n",
+			new:     "",
+			contain: "merge lane must include",
+		},
+		{
+			name:    "merge method breaks linear history",
+			old:     "-f merge_method=squash",
+			new:     "-f merge_method=merge",
+			contain: "merge lane must include",
+		},
+		{
+			name:    "actor guard removed",
+			old:     `                "${actor}" != 'dependabot[bot]' ||`,
+			new:     `                "${actor}" != 'anyone' ||`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "base branch guard removed",
+			old:     `                  | select(.base.ref == "main")`,
+			new:     `                  | select(.base.ref != "")`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "runs a third-party action with the write token",
+			old:     "    steps:\n",
+			new:     "    steps:\n      - uses: some/action@0000000000000000000000000000000000000000\n",
+			contain: "must not run external actions",
+		},
+		{
+			name:    "checks out pull-request code",
+			old:     "      - name: Merge the exact Dependabot revision CI tested\n",
+			new:     "      - uses: actions/checkout@0000000000000000000000000000000000000000\n",
+			contain: "must not access secrets, check out code",
+		},
+		{
+			name:    "triggered directly by a pull request",
+			old:     "  workflow_run:\n    workflows: [CI]\n    types: [completed]\n",
+			new:     "  pull_request_target:\n",
+			contain: "must not access secrets, check out code, or use pull_request_target",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/dependabot-auto-merge.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
+	}
+}
+
+// The reviewing lane must never regain the ability to merge. If merging returns
+// to that file, the write grant and the review authority live together again.
+func TestApprovalLaneCannotMerge(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(repositoryRoot(t), ".github/workflows/dependabot-auto-approve.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"contents: write", "/merge", "gh pr merge", "@dependabot"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Errorf("the review lane must not contain %q", forbidden)
+		}
+	}
+}
+
 func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
 	tests := []struct {
 		name    string
