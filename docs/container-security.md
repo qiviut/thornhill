@@ -46,7 +46,7 @@ The PostgreSQL wrapper starts from a pinned official image and applies current A
 
 ## Qualification pipeline
 
-The required `Go, web, and image build` job is one secretless, read-only qualification lane. It runs:
+`Go, web, and image build` is the required check and stays the branch-protection name, but it is a fail-closed aggregator rather than the job that does the work. A history-and-policy preflight runs first, then source analysis and image security qualify in parallel, and the aggregator fails unless both succeed — see [performance/2026-07-16-optimization-review.md](performance/2026-07-16-optimization-review.md) for that topology and `cmd/ci-policy-check` for the assertions that hold it in place. Collectively the lane remains secretless and read-only, and it runs:
 
 - Gitleaks over fetched Git history;
 - `gofmt`, `go vet`, Staticcheck, and `govulncheck`;
@@ -77,14 +77,14 @@ No scanner is installed from an unversioned network command in CI.
 - Biome and its rules are locked in `web/package-lock.json`; the `/web` npm entry updates them. `biome.json` references the package-local schema rather than a separately pinned remote schema URL.
 - Hadolint, ShellCheck, and Trivy run from tag-plus-digest-pinned images in `.github/scanners/compose.yml`; a dedicated `docker-compose` Dependabot entry groups updates to the scanners and their embedded rule engines.
 - Trivy refreshes its vulnerability database and misconfiguration checks on each clean CI run. The scanner version remains reviewable and reproducible.
-- GitHub Actions, including Gitleaks and SBOM artifact upload, are full-SHA pinned and updated by the `github-actions` Dependabot ecosystem.
+- GitHub Actions, including Gitleaks and SBOM artifact upload, are full-SHA pinned and updated by the `github-actions` Dependabot ecosystem. A repository-level allowlist independently restricts which actions may run at all and requires full-SHA references; `cipolicy.checkPinnedWorkflowActions` asserts the pinning half locally, because the remote policy rejects a violating workflow at startup with no jobs and no logs.
 - Application build bases are updated by the Docker ecosystem; production and scanner Compose references are covered separately by the Docker Compose ecosystem.
 
-`cmd/ci-policy-check` fails CI if scanner steps disappear, images lose digest pins, or any required Dependabot ecosystem/directory coverage is removed.
+`cmd/ci-policy-check` fails CI if scanner steps disappear, images lose digest pins, a workflow action reference becomes mutable, or any required Dependabot ecosystem/directory coverage is removed.
 
 ## Operations and patch cadence
 
-1. Review daily Dependabot PRs; do not merge a digest or scanner update unless the entire qualification lane passes.
+1. Dependabot promotion is unattended: strict branch protection requires the green qualification check on the current PR head, then an isolated merge lane uses `contents: write` and `pull-requests: write` to request the SHA-bound squash. That lane never checks out code or runs third-party actions. Read the resulting commits rather than only the pull requests, and treat a queue of *open* Dependabot PRs as a signal that something is broken. See [ci-security.md](ci-security.md).
 2. Rebuild and redeploy promptly after base, Go, Node, npm, PostgreSQL, scanner, or vulnerability-database changes. Do not assume a previously clean image remains clean.
 3. Retain source SHA, OCI revision label, linked binary version, status response, SBOM, CI run, and deployment receipt as the correspondence chain.
 4. Investigate scanner findings in reachability and runtime context; do not dismiss a raw package-name match, but do not present it as an exploitable incident without evidence.

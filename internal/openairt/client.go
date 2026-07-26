@@ -2,7 +2,8 @@
 // sideband channel: a WebSocket attached to an existing WebRTC call via
 // call_id. Event names and payload shapes follow the vendored docs in
 // docs/vendor/openai/ (realtime-conversations.md, realtime-server-controls.md,
-// realtime-webrtc.md). Where a field is unconfirmed it carries TODO(verify).
+// realtime-webrtc.md). Field paths and model names were reconfirmed against
+// those sources and the live model catalog on 2026-07-26.
 package openairt
 
 import (
@@ -173,7 +174,7 @@ func (c *Client) SessionUpdate(ctx context.Context, instructions string, tools [
 			"tools":        tools,
 			"audio": map[string]any{
 				"input": map[string]any{
-					"transcription": map[string]any{"model": transcribeModel}, // TODO(verify) model name
+					"transcription": map[string]any{"model": transcribeModel},
 					// Thornhill owns response creation. Microphone noise or echo
 					// must not cancel audible output, and the desk must serialize
 					// user turns, tool continuations, and announcements.
@@ -182,7 +183,8 @@ func (c *Client) SessionUpdate(ctx context.Context, instructions string, tools [
 					},
 				},
 			},
-			// TODO(verify): exact truncation field path per realtime-costs.md
+			// Field path matches realtime-costs.md. The optional
+			// token_limits.post_instructions cost lever is deliberately unset.
 			"truncation": map[string]any{"type": "retention_ratio", "retention_ratio": 0.8},
 		},
 	}

@@ -67,13 +67,12 @@ rather than asking for those literal tokens. For example, an affirmative
 "uh-huh" given directly in response to the decision prompt means allow_once;
 "use a safer way" means use_safer_alternative; "for this job" means
 allow_session; "don't ask me again" means the matching always choice. Treat
-"yolo" as allow_session unless the operator explicitly
-makes it permanent. Before allow_always, state that the entire displayed
-pattern category will be trusted permanently and require a direct confirmation;
-never silently downgrade an ineligible permanent choice. If durable scope is
-genuinely ambiguous, ask one compact
-clarifying question or choose the less durable scope. A question is never
-consent, silence is never consent, and backend failure is never consent.
+"yolo" as allow_session unless the operator explicitly makes it permanent.
+Before allow_always, state that the entire displayed pattern category will be
+trusted permanently and require a direct confirmation; never silently downgrade
+an ineligible permanent choice. If durable scope is genuinely ambiguous, ask one
+compact clarifying question or choose the less durable scope. A question is
+never consent, silence is never consent, and backend failure is never consent.
 
 After resolve_approval succeeds, confirm the decision and scope in one short
 sentence. If it fails, say so; do not claim the action was authorized. On a

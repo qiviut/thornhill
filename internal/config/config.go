@@ -27,10 +27,10 @@ type Config struct {
 	OpenAIRealtimeWSURL string // OPENAI_REALTIME_WS_URL, default wss://api.openai.com/v1/realtime
 	RealtimeModel       string // REALTIME_MODEL, default gpt-realtime-2.1
 	Voice               string // REALTIME_VOICE, default marin
-	TTSModel            string // TTS_MODEL, default gpt-4o-mini-tts. TODO(verify): newest speech model name.
+	TTSModel            string // TTS_MODEL, default gpt-4o-mini-tts (current upstream, verified 2026-07-26)
 	TTSVoice            string // TTS_VOICE, default alloy
 	SummaryModel        string // SUMMARY_MODEL, default gpt-5.5 (swap for a cheaper variant if available)
-	TranscribeModel     string // TRANSCRIBE_MODEL, default gpt-realtime-whisper. TODO(verify) against docs/vendor.
+	TranscribeModel     string // TRANSCRIBE_MODEL, default gpt-realtime-whisper (named throughout docs/vendor)
 	SafetyID            string // SAFETY_IDENTIFIER, sent as OpenAI-Safety-Identifier (single user, static)
 
 	// --- hermes ---

@@ -3,6 +3,13 @@
 Log of the design iteration that produced this repo, 2026-07-08/09.
 Kept terse; the reasoning that matters for maintenance.
 
+**This is a dated record, not current documentation.** It captures why v0.4 looks
+the way it does; several decisions below have since been superseded, and the
+notes mark those inline. For current behaviour read
+[`architecture/reliability-boundaries.md`](architecture/reliability-boundaries.md)
+(durable state, authority, query bounds) and [`ci-security.md`](ci-security.md)
+(trust lanes, promotion, allowlist).
+
 ## Topology
 
 - **Sideband pattern** (v0.2): browser WebRTC directly to OpenAI for
@@ -54,6 +61,14 @@ Kept terse; the reasoning that matters for maintenance.
   answer, cancel, rename, park, wait_for_user): agent outputs flowing
   into the realtime context can at worst spawn or cancel a job. The
   dangerous capabilities live in Hermes on isolated fleet VMs.
+  - **Superseded.** The toolset later gained `resolve_approval` and
+    `resume_job`, so "at worst spawn or cancel" no longer bounds it: the desk
+    can now convey an authority decision that lets a Hermes command run. That
+    is why the approval path is brokered rather than trusted to the model —
+    one-use ID/nonce, FIFO correlation, exact-pattern scope, and a prompt that
+    requires explicit words. See
+    [`architecture/reliability-boundaries.md`](architecture/reliability-boundaries.md)
+    and [`operational-issues/voice-approvals-and-run-lifetime.md`](operational-issues/voice-approvals-and-run-lifetime.md).
 - Proactivity v1: lifecycle announcements + needs_input relay only,
   injected as system messages at lulls, ≥10s apart, single-writer turn
   loop. Interjection *feel* is experiment E5.
@@ -79,6 +94,11 @@ Kept terse; the reasoning that matters for maintenance.
   odd sideband topology), plain CSS, WebAudio earcons.
 - Postgres 17; schema is four tables (jobs, event_log, summaries,
   usage_ledger).
+  - **Superseded.** Now PostgreSQL 18.4, and the embedded schema declares ten
+    tables: the original four plus `approval_denials`, `approval_allows`,
+    `deployment_control`, `attention_events`, `push_subscriptions`, and
+    `push_deliveries` — approvals, the deploy drain, durable attention, and the
+    Web Push outbox all arrived after v0.4. River owns its own tables besides.
 
 ## Deliberately deferred (experiments)
 
