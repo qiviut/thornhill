@@ -149,6 +149,12 @@ func Check(root string) error {
 	if err := checkDependabotApproval(root); err != nil {
 		return err
 	}
+	if err := checkDependabotMerge(root); err != nil {
+		return err
+	}
+	if err := checkPinnedWorkflowActions(root); err != nil {
+		return err
+	}
 	if err := checkScorecard(root); err != nil {
 		return err
 	}
@@ -355,13 +361,6 @@ func checkDependabotApproval(root string) error {
 		`repos/${REPOSITORY}/pulls/${pull_request}/reviews`,
 		"-f event=APPROVE",
 		`-f "commit_id=${head_sha}"`,
-		// Unattended merging must stay delegated to Dependabot's own credentials
-		// and stay bound to the CI-tested SHA. The workflow-level permission
-		// assertion above already denies this lane `contents: write`, so it can
-		// request a merge but can never write to the protected branch itself.
-		"@dependabot squash and merge",
-		`merge_marker="Requested squash merge for ${head_sha}."`,
-		`repos/${REPOSITORY}/issues/${pull_request}/comments`,
 	} {
 		if !strings.Contains(lane.String(), required) {
 			return fmt.Errorf("%s approval lane must include %q", relative, required)
@@ -370,12 +369,96 @@ func checkDependabotApproval(root string) error {
 	return nil
 }
 
-// checkScorecard pins the measurement lane. It is the only workflow that holds
-// `security-events: write`, so that grant must stay confined to one job, the
-// workflow default must stay read-only, and the escalation must not quietly grow
-// an `id-token` for result publication. Scorecard is advisory by design: it must
-// never become the required check, which the single-context assertion above
-// already enforces.
+// checkDependabotMerge pins the one lane that can write to the protected branch.
+// The grant must stay confined to a single job whose workflow default is
+// read-only, the lane must run no actions at all so nothing third-party executes
+// with that token, and it must re-derive its own guards from the workflow_run
+// metadata rather than trusting the review lane. The merge must name the
+// CI-tested SHA so a rebase landing between qualification and this request is
+// refused instead of merged.
+func checkDependabotMerge(root string) error {
+	relative := ".github/workflows/dependabot-auto-merge.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if strings.Contains(text, "secrets.") || strings.Contains(text, "actions/checkout@") ||
+		strings.Contains(text, "pull_request_target") {
+		return fmt.Errorf("%s must not access secrets, check out code, or use pull_request_target", relative)
+	}
+
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	if len(wf.On) != 1 || wf.On["workflow_run"] == nil {
+		return fmt.Errorf("%s must trigger only from workflow_run", relative)
+	}
+	wantDefaults := map[string]string{"actions": "read", "contents": "read"}
+	if len(wf.Permissions) != len(wantDefaults) {
+		return fmt.Errorf("%s must default to exactly the documented read-only permissions", relative)
+	}
+	for name, access := range wantDefaults {
+		if wf.Permissions[name] != access {
+			return fmt.Errorf("%s default permission %s must be %s", relative, name, access)
+		}
+	}
+
+	merge, ok := wf.Jobs["merge"]
+	if len(wf.Jobs) != 1 || !ok || merge.If != "github.event.workflow_run.conclusion == 'success'" {
+		return fmt.Errorf("%s must contain only the success-gated merge job", relative)
+	}
+	wantJob := map[string]string{"contents": "write", "pull-requests": "write", "actions": "read"}
+	if len(merge.Permissions) != len(wantJob) {
+		return fmt.Errorf("%s merge job must hold exactly the documented narrow permissions", relative)
+	}
+	for name, access := range wantJob {
+		if merge.Permissions[name] != access {
+			return fmt.Errorf("%s merge job permission %s must be %s", relative, name, access)
+		}
+	}
+
+	var lane strings.Builder
+	for _, step := range merge.Steps {
+		if step.Uses != "" {
+			return fmt.Errorf("%s merge job must not run external actions", relative)
+		}
+		lane.WriteString(step.Run)
+		lane.WriteByte('\n')
+	}
+	for _, required := range []string{
+		".actor.login",
+		".head_repository.full_name",
+		".head_branch",
+		".head_sha",
+		`"${actor}" != 'dependabot[bot]'`,
+		`"${source_repository}" != "${REPOSITORY}"`,
+		`"${head_branch}" != dependabot/*`,
+		`.user.login == "dependabot[bot]"`,
+		`.head.repo.full_name == .base.repo.full_name`,
+		`.base.ref == "main"`,
+		`.head.sha == $sha`,
+		`repos/${REPOSITORY}/pulls/${pull_request}/merge`,
+		// Bind the merge to the qualified revision, and keep linear history.
+		`-f "sha=${head_sha}"`,
+		"-f merge_method=squash",
+	} {
+		if !strings.Contains(lane.String(), required) {
+			return fmt.Errorf("%s merge lane must include %q", relative, required)
+		}
+	}
+	return nil
+}
+
+// checkScorecard pins the measurement lane. It is the only workflow holding
+// `security-events: write`, so that grant must stay confined to one job while the
+// workflow default stays read-only, and it must not quietly grow an `id-token` for
+// result publication. Scorecard is advisory by design and must never become the
+// required check, which the single-required-context assertion above enforces.
+//
+// SHA pinning is not re-checked here; checkPinnedWorkflowActions covers every
+// workflow, including this one.
 func checkScorecard(root string) error {
 	relative := ".github/workflows/scorecard.yml"
 	data, err := os.ReadFile(filepath.Join(root, relative))
@@ -423,12 +506,52 @@ func checkScorecard(root string) error {
 			return fmt.Errorf("%s analysis job permission %s must be %s", relative, name, access)
 		}
 	}
-	for _, step := range analyze.Steps {
-		if step.Uses == "" {
-			continue
+	return nil
+}
+
+// checkPinnedWorkflowActions requires every `uses:` reference in every workflow to
+// name a full commit SHA. GitHub's repository-level action allowlist enforces the
+// same rule remotely and rejects the workflow at startup otherwise, which is a
+// slow way to learn about a mutable reference: the run reports
+// `startup_failure` with no jobs and no logs. Asserting it here fails the required
+// check on the pull request instead, next to the reason.
+//
+// The allowlist also restricts *which* actions may run — currently GitHub-authored
+// ones plus an explicitly vetted `gitleaks/gitleaks-action@*`. That list lives in
+// repository settings rather than in this repository, so it cannot be asserted
+// here; adding a workflow that uses anything else requires widening it first.
+func checkPinnedWorkflowActions(root string) error {
+	pattern := filepath.Join(root, ".github/workflows/*.yml")
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return fmt.Errorf("no workflows found at %s", pattern)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
 		}
-		if _, pinned := pinnedActionSHA(step.Uses); !pinned {
-			return fmt.Errorf("%s uses unpinned action %q", relative, step.Uses)
+		var wf workflow
+		if err := yaml.Unmarshal(data, &wf); err != nil {
+			return fmt.Errorf("decode %s: %w", path, err)
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			relative = path
+		}
+		for id, job := range wf.Jobs {
+			for _, step := range job.Steps {
+				if step.Uses == "" {
+					continue
+				}
+				if _, pinned := pinnedActionSHA(step.Uses); !pinned {
+					return fmt.Errorf("%s job %s uses unpinned action %q", relative, id, step.Uses)
+				}
+			}
 		}
 	}
 	return nil

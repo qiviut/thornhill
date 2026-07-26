@@ -1,4 +1,4 @@
-name: Approve and merge green Dependabot pull requests
+name: Approve green Dependabot pull requests
 
 on:
   workflow_run:
@@ -8,10 +8,9 @@ on:
 # This workflow never checks out or executes pull-request code. Its write token is
 # used only after the exact same-repository Dependabot SHA has passed CI.
 #
-# It deliberately still does NOT hold `contents: write`. Merging is delegated to
-# Dependabot's own credentials through a squash-merge comment command, so
-# unattended promotion never becomes an Actions token that can write to the
-# protected branch. Branch protection remains the only merge gate.
+# It holds no write access to the protected branch. Merging is a separate lane
+# (dependabot-auto-merge.yml) so the only grant able to write to `main` stays
+# isolated from the lane that reviews.
 permissions:
   actions: read
   contents: read
@@ -23,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Approve and queue the exact Dependabot revision CI tested
+      - name: Approve the exact Dependabot revision CI tested
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -78,24 +77,3 @@ jobs:
               -f "commit_id=${head_sha}" \
               -f "body=Approved automatically after CI succeeded for ${head_sha}."
           fi
-
-          # Delegate the merge to Dependabot itself. The request names this exact
-          # revision: a force-pushed rebase produces a new SHA that must earn its
-          # own CI run, approval, and merge request. Branch protection (strict
-          # required check, linear history) still decides whether and when the
-          # squash lands, so a queued command cannot merge untested code.
-          merge_marker="Requested squash merge for ${head_sha}."
-          if gh api --method GET "repos/${REPOSITORY}/issues/${pull_request}/comments" \
-            -f per_page=100 \
-            | jq -e --arg marker "${merge_marker}" '
-                any(.[];
-                  .user.login == "github-actions[bot]" and
-                  (.body | contains($marker))
-                )
-              ' >/dev/null; then
-            echo "A squash merge was already requested for the CI-tested revision."
-            exit 0
-          fi
-
-          gh api --method POST "repos/${REPOSITORY}/issues/${pull_request}/comments" \
-            -f "body=$(printf '@dependabot squash and merge\n\n%s' "${merge_marker}")"

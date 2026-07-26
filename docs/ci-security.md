@@ -48,23 +48,63 @@ Only the exact revision that passed the required check may merge to `main`. Depe
 
 That job also requests unattended promotion, so routine dependency currency does not depend on a human noticing a green PR. A stale queue of open Dependabot PRs is a breakage signal, not a maintenance backlog.
 
-The merge is deliberately **not** performed by the Actions token. The job posts `@dependabot squash and merge` naming the CI-tested SHA, and Dependabot merges under its own credentials. This preserves the property that no GitHub Actions lane in this repository holds `contents: write` on the protected branch: the lane can *request* promotion but cannot write to `main`, so compromising it cannot land code. `cipolicy` asserts both halves — the absent `contents: write` and the delegated, SHA-bound merge request — and `TestCheckRejectsUnsafeDependabotApproval` fails if either is replaced with a direct `gh pr merge`.
+Reviewing and merging are two lanes, and only the second can write to the branch.
 
-Auto-merge does not relax the promotion invariant, because the bot approval was never the gate. `required_approving_review_count` is `0`, so `required_status_checks.strict` on `Go, web, and image build` is what decides; a queued merge request simply waits for it. `required_linear_history` means the request must be a squash — a plain merge commit would be rejected. If Dependabot force-pushes a rebase, the new SHA earns its own CI run, approval, and merge request; the marker comment is SHA-bound so a queued command cannot carry over to untested code.
+Delegating the merge to Dependabot's own credentials was tried first, because it would have meant no Actions lane ever holding `contents: write`. **It does not work.** A `@dependabot squash and merge` comment authored by `github-actions[bot]` is silently ignored: that actor has no write access to the repository (`author_association: NONE`), so Dependabot never acknowledges the command. Observed on three pull requests whose required check had gone green — approval was created, the comment was posted, and the PRs sat open and unacknowledged. The failure mode was inert rather than unsafe, which is why it was worth attempting, but it does not deliver unattended promotion.
+
+`.github/workflows/dependabot-auto-merge.yml` therefore holds the grant, and its containment is the point:
+
+- `contents: write` and `pull-requests: write` exist on one job; the workflow default stays read-only.
+- It **runs no actions at all**. Every step is a `run:` step against the pre-installed `gh` CLI, so nothing third-party executes with a token that can write to `main`.
+- It re-derives every guard — event, actor, source repository, branch prefix, base branch, and head SHA — from the `workflow_run` metadata rather than trusting the review lane, so neither lane can widen the other.
+- The merge request names the CI-tested SHA. A rebase landing between qualification and the request changes the SHA, and GitHub refuses rather than merging untested code.
+- A refusal exits zero. Under a strict required check every merge leaves the other open branches out of date, so Dependabot rebases them and the replacement revision earns its own run and its own attempt; treating that convergence as failure would manufacture noise.
+
+Branch protection remains the decider in both cases: the required check must have passed and the branch must be up to date, and squash is the only method linear history permits.
+
+`cipolicy` pins both lanes. `checkDependabotApproval` keeps the review lane free of branch write access, `checkDependabotMerge` pins the merge lane's triggers, both permission sets, its single job, its absence of external actions, its independently derived guards, and the SHA-bound squash. `TestApprovalLaneCannotMerge` additionally fails if merge capability ever returns to the reviewing lane, since that would put the write grant and the review authority back in one file.
+
+Unattended merging does not relax the promotion invariant, because the bot approval was never the gate. `required_approving_review_count` is `0`, so `required_status_checks.strict` on `Go, web, and image build` is what decides. `required_linear_history` means the merge must be a squash — a plain merge commit is rejected. If Dependabot force-pushes a rebase, the new SHA earns its own CI run, approval, and merge attempt; the request is SHA-bound so it cannot carry over to untested code.
 
 Because promotion is unattended, two settings outside this repository become load-bearing and must stay enabled:
 
 - **Dependabot security updates** and **Dependabot alerts**. `dependabot.yml` configures *version* updates only. Without the security-update toggle, a published advisory produces no pull request until a routine version bump happens to carry the fix — which is how `postcss` sat on GHSA-r28c-9q8g-f849 while the `npm audit` gate went red.
-- **Allow squash merging**, so the delegated merge has a permitted method under linear history.
+- **Allow squash merging**, the only method linear history permits and the one the merge lane requests.
 
 There is deliberately no cooldown on version updates: the operator's stated preference is fastest possible patching, with supply-chain risk absorbed by the secretless qualification lane, `--ignore-scripts` installs, digest-pinned bases, and the image/vulnerability gates rather than by delaying releases. Updates are grouped per ecosystem because `strict` invalidates every other open branch on each merge, so batching converges in far fewer full CI cycles.
 
-If Dependabot does not honour a command authored by `github-actions[bot]`, the failure mode is inert: PRs stay open and approved. The documented fallback is a separate `workflow_run` job holding `contents: write` plus `pull-requests: write` that runs `gh pr merge --auto --squash`, with `cipolicy` extended to pin that job's permissions in isolation. Prefer the delegated form; adopt the fallback only after confirming the delegated form does not work.
+If unattended promotion ever needs to be withdrawn, delete `dependabot-auto-merge.yml` along with `checkDependabotMerge` and its test. The review lane keeps working on its own and the repository returns to approve-only, where a stale queue of open Dependabot PRs means a human has not looked yet rather than that something is broken.
 
-### 2b. Measurement: advisory, never a gate
+### 2b. The action allowlist
+
+A repository-level Actions policy restricts which actions may run at all: those
+owned by this account, those authored by GitHub, and explicitly vetted exceptions —
+currently `gitleaks/gitleaks-action@*` and `ossf/scorecard-action@*`. It
+**additionally** requires every reference to be a full-length commit SHA. Those two
+conditions are independent, which is what makes a wildcard entry narrower than it
+first appears: it admits any *pinned commit* of that one repository, never a mutable
+tag or branch.
+
+The policy is enforced before a workflow starts, so a violation surfaces as a
+`startup_failure` run with **no jobs and no logs** — a uniquely unhelpful signal, and
+one that a workflow which does not run on pull requests will only produce after
+merge. `cipolicy.checkPinnedWorkflowActions` therefore asserts the SHA-pinning half
+locally, so a mutable reference fails the required check on the pull request next to
+its reason. The *which actions* half lives in repository settings and cannot be
+asserted from here; adding a workflow that uses anything else requires widening the
+allowlist first, and a lane added without that step will silently never run.
+
+The wildcard form is a deliberate balance for this project rather than an oversight.
+An exact-SHA entry would be tighter, but it has to be paired with a Dependabot
+`ignore` for that action: otherwise an auto-merged bump introduces a SHA the
+allowlist does not admit, and the lane reverts to a logless startup failure while
+the bump's own CI stays green. That trade buys little for an advisory check and costs
+a two-place manual update on every version.
+
+### 2c. Measurement: advisory, never a gate
 
 `.github/workflows/scorecard.yml` scores this repository's own supply-chain posture
-weekly, on pushes to `main`, and on demand, and files regressions as code-scanning
+weekly, on pushes to `main`, and on demand, filing regressions as code-scanning
 alerts beside the CodeQL analyses. It never runs on `pull_request`: Scorecard
 evaluates the default branch, and a contributor-triggered run must not reach a lane
 holding a write grant.
@@ -78,8 +118,7 @@ to one job while the workflow default stays `contents: read`. Result publication
 disabled on purpose: `publish_results: true` requires `id-token: write`, and an OIDC
 token is a materially larger grant than this measurement justifies. The cost is only
 the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
-both permission sets, the single job, the absence of publication, and that every
-action is referenced by a full commit SHA rather than a mutable tag.
+both permission sets, the single job, and the absence of publication.
 
 Read two sub-scores with context rather than at face value:
 
