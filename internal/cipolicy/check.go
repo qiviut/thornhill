@@ -152,7 +152,7 @@ func Check(root string) error {
 	if err := checkDependabotMerge(root); err != nil {
 		return err
 	}
-	if err := checkScorecard(root); err != nil {
+	if err := checkPinnedWorkflowActions(root); err != nil {
 		return err
 	}
 	if err := checkPinnedImages(root); err != nil {
@@ -448,65 +448,49 @@ func checkDependabotMerge(root string) error {
 	return nil
 }
 
-// checkScorecard pins the measurement lane. It is the only workflow that holds
-// `security-events: write`, so that grant must stay confined to one job, the
-// workflow default must stay read-only, and the escalation must not quietly grow
-// an `id-token` for result publication. Scorecard is advisory by design: it must
-// never become the required check, which the single-context assertion above
-// already enforces.
-func checkScorecard(root string) error {
-	relative := ".github/workflows/scorecard.yml"
-	data, err := os.ReadFile(filepath.Join(root, relative))
+// checkPinnedWorkflowActions requires every `uses:` reference in every workflow to
+// name a full commit SHA. GitHub's repository-level action allowlist enforces the
+// same rule remotely and rejects the workflow at startup otherwise, which is a
+// slow way to learn about a mutable reference: the run reports
+// `startup_failure` with no jobs and no logs. Asserting it here fails the required
+// check on the pull request instead, next to the reason.
+//
+// The allowlist also restricts *which* actions may run — currently GitHub-authored
+// ones plus an explicitly vetted `gitleaks/gitleaks-action@*`. That list lives in
+// repository settings rather than in this repository, so it cannot be asserted
+// here; adding a workflow that uses anything else requires widening it first.
+func checkPinnedWorkflowActions(root string) error {
+	pattern := filepath.Join(root, ".github/workflows/*.yml")
+	paths, err := filepath.Glob(pattern)
 	if err != nil {
 		return err
 	}
-	text := string(data)
-	if strings.Contains(text, "secrets.") || strings.Contains(text, "pull_request_target") {
-		return fmt.Errorf("%s must not access secrets or use pull_request_target", relative)
+	if len(paths) == 0 {
+		return fmt.Errorf("no workflows found at %s", pattern)
 	}
-	// Publication is what would require an OIDC token; the permission assertions
-	// below are what actually deny one, at both the workflow and job level.
-	if !strings.Contains(text, "publish_results: false") {
-		return fmt.Errorf("%s must explicitly disable result publication", relative)
-	}
-
-	var wf workflow
-	if err := yaml.Unmarshal(data, &wf); err != nil {
-		return fmt.Errorf("decode %s: %w", relative, err)
-	}
-	gotTriggers := make([]string, 0, len(wf.On))
-	for trigger := range wf.On {
-		gotTriggers = append(gotTriggers, trigger)
-	}
-	sort.Strings(gotTriggers)
-	// Never pull_request: Scorecard evaluates the default branch, and a
-	// contributor-triggered run must not reach a lane holding a write grant.
-	if want := []string{"push", "schedule", "workflow_dispatch"}; strings.Join(gotTriggers, ",") != strings.Join(want, ",") {
-		return fmt.Errorf("%s triggers = %v, want %v", relative, gotTriggers, want)
-	}
-	if len(wf.Permissions) != 1 || wf.Permissions["contents"] != "read" {
-		return fmt.Errorf("%s must default to exactly contents: read", relative)
-	}
-
-	analyze, ok := wf.Jobs["analyze"]
-	if len(wf.Jobs) != 1 || !ok {
-		return fmt.Errorf("%s must contain only the analysis job", relative)
-	}
-	wantJobPermissions := map[string]string{"security-events": "write", "actions": "read", "contents": "read"}
-	if len(analyze.Permissions) != len(wantJobPermissions) {
-		return fmt.Errorf("%s analysis job must hold exactly the documented narrow permissions", relative)
-	}
-	for name, access := range wantJobPermissions {
-		if analyze.Permissions[name] != access {
-			return fmt.Errorf("%s analysis job permission %s must be %s", relative, name, access)
+	sort.Strings(paths)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
 		}
-	}
-	for _, step := range analyze.Steps {
-		if step.Uses == "" {
-			continue
+		var wf workflow
+		if err := yaml.Unmarshal(data, &wf); err != nil {
+			return fmt.Errorf("decode %s: %w", path, err)
 		}
-		if _, pinned := pinnedActionSHA(step.Uses); !pinned {
-			return fmt.Errorf("%s uses unpinned action %q", relative, step.Uses)
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			relative = path
+		}
+		for id, job := range wf.Jobs {
+			for _, step := range job.Steps {
+				if step.Uses == "" {
+					continue
+				}
+				if _, pinned := pinnedActionSHA(step.Uses); !pinned {
+					return fmt.Errorf("%s job %s uses unpinned action %q", relative, id, step.Uses)
+				}
+			}
 		}
 	}
 	return nil

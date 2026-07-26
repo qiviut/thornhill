@@ -3,6 +3,7 @@ package cipolicy
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -89,7 +90,6 @@ func policyFixture(t *testing.T) string {
 		".github/workflows/dependabot-auto-merge.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
-		".github/workflows/scorecard.yml",
 		"Dockerfile",
 		"Dockerfile.postgres",
 		"docs/rollback-compatibility.json",
@@ -360,68 +360,40 @@ func TestApprovalLaneCannotMerge(t *testing.T) {
 	}
 }
 
-func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
-	tests := []struct {
-		name    string
-		old     string
-		new     string
-		contain string
+// A mutable action reference is rejected remotely by the repository's action
+// allowlist, but only at workflow startup: the run reports startup_failure with no
+// jobs and no logs, which is an expensive way to find out. This must fail the
+// required check on the pull request instead, next to the reason.
+func TestCheckRejectsUnpinnedWorkflowActions(t *testing.T) {
+	// Derive the pin from the fixture rather than hardcoding a SHA: these are
+	// exactly the references Dependabot rewrites, so a literal would rot on the
+	// next bump and fail for the wrong reason.
+	pinned := regexp.MustCompile(`(uses: \S+)@[0-9a-f]{40}`)
+	for _, tc := range []struct {
+		name        string
+		replacement string
 	}{
-		{
-			name:    "workflow default is not read-only",
-			old:     "permissions:\n  contents: read\n",
-			new:     "permissions:\n  contents: write\n",
-			contain: "must default to exactly contents: read",
-		},
-		{
-			name:    "escalates to an OIDC token",
-			old:     "      security-events: write\n",
-			new:     "      security-events: write\n      id-token: write\n",
-			contain: "narrow permissions",
-		},
-		{
-			name:    "publishes results",
-			old:     "publish_results: false",
-			new:     "publish_results: true",
-			contain: "must explicitly disable result publication",
-		},
-		{
-			name:    "contributor-triggered entry point",
-			old:     "  workflow_dispatch:\n",
-			new:     "  pull_request:\n",
-			contain: "triggers",
-		},
-		{
-			name:    "unpinned action reference",
-			old:     "ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4",
-			new:     "ossf/scorecard-action@v2.4.4",
-			contain: "unpinned action",
-		},
-		{
-			name:    "secret access",
-			old:     "          results_file: scorecard.sarif\n",
-			new:     "          token: ${{ secrets.SCORECARD_TOKEN }}\n",
-			contain: "must not access secrets",
-		},
-	}
-	for _, tc := range tests {
+		{name: "tag reference", replacement: "${1}@v7"},
+		{name: "branch reference", replacement: "${1}@main"},
+		{name: "abbreviated sha", replacement: "${1}@9c091bb"},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := policyFixture(t)
-			path := filepath.Join(root, ".github/workflows/scorecard.yml")
+			path := filepath.Join(root, ".github/workflows/ci.yml")
 			data, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			changed := strings.Replace(string(data), tc.old, tc.new, 1)
-			if changed == string(data) {
-				t.Fatalf("fixture did not contain %q", tc.old)
+			if !pinned.Match(data) {
+				t.Fatal("fixture contains no SHA-pinned action to unpin")
 			}
-			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+			changed := pinned.ReplaceAll(data, []byte(tc.replacement))
+			if err := os.WriteFile(path, changed, 0o600); err != nil {
 				t.Fatal(err)
 			}
 			err = Check(root)
-			if err == nil || !strings.Contains(err.Error(), tc.contain) {
-				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			if err == nil || !strings.Contains(err.Error(), "unpinned action") {
+				t.Fatalf("Check() error = %v, want an unpinned-action error", err)
 			}
 		})
 	}
