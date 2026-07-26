@@ -1,0 +1,92 @@
+name: Merge green Dependabot pull requests
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+# This is the only lane in this repository that can write to the protected
+# branch, so its surface is deliberately minimal:
+#
+#   * it never checks out or executes pull-request code;
+#   * it runs no actions at all, so nothing third-party executes with this token;
+#   * it re-derives every guard from the workflow_run metadata itself rather than
+#     trusting the review lane, so neither lane can widen the other;
+#   * branch protection still decides. The merge request is refused unless the
+#     required check passed and the branch is up to date, and the merge method is
+#     squash because linear history is enforced.
+#
+# Delegating this to Dependabot's own credentials was tried first and does not
+# work: a `@dependabot` command from `github-actions[bot]` is ignored because that
+# actor has no write access (author_association NONE), so the comment sat
+# unacknowledged while PRs stayed open. See docs/ci-security.md.
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  merge:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Landing the squash commit on the protected branch.
+      contents: write
+      # Reading the pull request and issuing its merge.
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Merge the exact Dependabot revision CI tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          source_run=$(gh api "repos/${REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}")
+          event=$(jq -r '.event' <<<"${source_run}")
+          actor=$(jq -r '.actor.login // empty' <<<"${source_run}")
+          source_repository=$(jq -r '.head_repository.full_name // empty' <<<"${source_run}")
+          head_branch=$(jq -r '.head_branch' <<<"${source_run}")
+          head_sha=$(jq -r '.head_sha' <<<"${source_run}")
+
+          if [[ "${event}" != 'pull_request' ||
+                "${actor}" != 'dependabot[bot]' ||
+                "${source_repository}" != "${REPOSITORY}" ||
+                "${head_branch}" != dependabot/* ]]; then
+            echo 'Successful CI run is not a same-repository Dependabot PR; nothing is merged.'
+            exit 0
+          fi
+
+          repository_owner=${REPOSITORY%%/*}
+          pull_request=$(gh api --method GET "repos/${REPOSITORY}/pulls" \
+            -f state=open \
+            -f "head=${repository_owner}:${head_branch}" \
+            | jq -er --arg sha "${head_sha}" '
+                [ .[]
+                  | select(.user.login == "dependabot[bot]")
+                  | select(.head.repo.full_name == .base.repo.full_name)
+                  | select(.base.ref == "main")
+                  | select(.head.sha == $sha)
+                ]
+                | if length == 1 then .[0].number
+                  else error("expected one open Dependabot pull request at the CI-tested SHA")
+                  end
+              ')
+
+          # Bind the merge to the tested commit. If Dependabot force-pushes a
+          # rebase between CI finishing and this request, the SHA no longer
+          # matches and GitHub refuses rather than landing untested code.
+          if gh api --method PUT "repos/${REPOSITORY}/pulls/${pull_request}/merge" \
+            -f "sha=${head_sha}" \
+            -f merge_method=squash; then
+            echo "Merged pull request #${pull_request} at ${head_sha}."
+            exit 0
+          fi
+
+          # A refusal is normal and not a failure: under a strict required check
+          # every merge leaves the other open branches out of date, so Dependabot
+          # rebases them and the replacement revision earns its own CI run and its
+          # own attempt. Failing here would turn routine convergence into noise.
+          echo "GitHub declined to merge #${pull_request} at ${head_sha}; leaving it for the next qualified revision."

@@ -221,17 +221,21 @@ Dependabot checks Go tools/modules, npm packages and Biome rules, Dockerfiles,
 production and scanner Compose images/rule engines, and GitHub Actions daily,
 grouped into one pull request per ecosystem. A privileged `workflow_run` lane may
 approve only an open, same-repository `dependabot[bot]` PR to `main` at the exact
-SHA that read-only CI passed; it never checks out PR code. That lane then asks
-Dependabot to squash-merge that same SHA, so dependency currency is unattended.
-The merge is delegated to Dependabot's own credentials rather than performed by
-the Actions token: no workflow in this repository holds `contents: write` on the
-protected branch, and branch protection remains the only merge gate. Open
+SHA that read-only CI passed; it never checks out PR code. A second lane then
+squash-merges that same SHA, so dependency currency is unattended. Reviewing and
+merging are separated so only the merge lane can write to the protected branch,
+and that lane runs no third-party actions, re-derives its own guards, and binds
+the request to the tested commit; branch protection remains the decider. Open
 Dependabot PRs therefore indicate breakage rather than pending review.
 
 A separate weekly lane scores the repository's own supply-chain posture with
 OpenSSF Scorecard and files regressions as code-scanning alerts. It is advisory
 by design: branch protection still requires exactly one check, and result
-publication is disabled so the lane needs no OIDC token.
+publication is disabled so the lane needs no OIDC token. A repository-level
+Actions policy admits only GitHub-authored actions plus explicitly vetted
+exceptions and requires full-SHA pinning; `cipolicy` asserts the pinning half
+locally, so a mutable reference fails review rather than failing a workflow at
+startup after merge.
 
 PR CI is intentionally secretless. The checked-in branch-protection policy,
 publication procedure, future trusted-promotion rules, randomized-test policy,
