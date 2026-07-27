@@ -32,7 +32,7 @@ RUN mkdir -p /out/data \
 # --- runtime ---
 # Chainguard static supplies CA certificates and a non-root identity without a
 # shell or package manager, keeping the runtime surface deliberately small.
-FROM cgr.dev/chainguard/static:latest@sha256:60582b2ae6074f641094af0f370d4ab241aab271858a66223dcde7eee9f51638
+FROM cgr.dev/chainguard/static:latest@sha256:399c8cb4858f05aaa33f43f02a2e75f28d40f016c0f86e5ba6075769e3303791
 ARG THORNHILL_REVISION=unknown
 ARG THORNHILL_SOURCE=https://github.com/qiviut/thornhill
 LABEL org.opencontainers.image.title="Thornhill" \
