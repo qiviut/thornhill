@@ -73,6 +73,12 @@ recovery_prefix=${controller%%"timeout 60s git fetch"*}
   printf 'Credential transition recovery must run before network/CI selection\n' >&2
   exit 1
 }
+[[ "${controller}" == *'--json databaseId,headSha,status,conclusion,event,url,createdAt'* && \
+  "${controller}" == *'(.event == "push" or .event == "workflow_dispatch")'* && \
+  "${controller}" != *'--event push'* ]] || {
+  printf 'Deployer must accept only trusted push or protected-main workflow_dispatch CI runs\n' >&2
+  exit 1
+}
 
 compose_password=$(printf '%064d' 0)
 if THORNHILL_ENV_FILE=.env.example docker compose --env-file /dev/null config --quiet >/dev/null 2>&1; then

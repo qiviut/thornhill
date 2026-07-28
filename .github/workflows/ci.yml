@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact protected-main revision this run must qualify
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,7 +21,9 @@ env:
   GIT_CONFIG_VALUE_0: main
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep normal pushes convergent while isolating exact-SHA dispatches. A stale
+  # dispatch must never cancel newer push CI before its SHA mismatch is rejected.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.expected_sha || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -31,6 +38,16 @@ jobs:
       go: ${{ steps.toolchains.outputs.go }}
       node: ${{ steps.toolchains.outputs.node }}
     steps:
+      - name: Verify dispatched protected-main revision
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF}" == 'refs/heads/main' ]]
+          [[ "${EXPECTED_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${GITHUB_SHA}" == "${EXPECTED_SHA}" ]]
+
       - name: Check out source and history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -78,23 +78,24 @@ Delegating the merge to Dependabot's own credentials was tried first, because it
 
 `.github/workflows/dependabot-auto-merge.yml` therefore holds the grant, and its containment is the point:
 
-- `contents: write` and `pull-requests: write` exist on one job; the workflow default stays read-only.
+- `contents: write`, `pull-requests: write`, and `actions: write` exist on one job; the workflow default stays read-only.
 - It **runs no actions at all**. Every step is a `run:` step against the pre-installed `gh` CLI, so nothing third-party executes with a token that can write to `main`.
 - It re-derives every guard — event, actor, source repository, branch prefix, base branch, and head SHA — from the `workflow_run` metadata rather than trusting the review lane, so neither lane can widen the other.
 - The merge request names the CI-tested SHA. A rebase landing between qualification and the request changes the SHA, and GitHub refuses rather than merging untested code.
 - A refusal exits zero. Under a strict required check every merge leaves the other open branches out of date, so Dependabot rebases them and the replacement revision earns its own run and its own attempt; treating that convergence as failure would manufacture noise.
+- A successful squash reads the landed `main` SHA back from GitHub and dispatches full `CI` using the required `expected_sha` input. GitHub's API accepts a branch or tag ref rather than a raw commit, so CI preflight rejects the run before checkout unless `main`, the resolved run SHA, and `expected_sha` all match. The merge lane also reads back the created run ID and cancels a race that resolved to a newer revision. CI concurrency separates push runs from SHA-keyed dispatch runs, so cancelling that stale dispatch cannot cancel qualification already running for newer `main`. This explicit dispatch is required because GitHub suppresses recursive `push` workflows for commits created with `GITHUB_TOKEN`.
+- The merge/dispatch transition is restart-safe. A rerun revalidates the original pull-request number and exact tested head, recognizes an already merged squash through its immutable `merge_commit_sha`, and reuses queued, running, or successful qualification for that landed SHA. Only a missing, failed, or cancelled qualification is dispatched again.
 
-One correspondence gap remains in this revision: GitHub deliberately suppresses
-ordinary `push` workflow runs for commits created with the merge lane's
-`GITHUB_TOKEN`, while the host deployer accepts only successful `push` CI runs.
-An unattended squash therefore cannot become the deployment candidate until a
-later protected-main push earns a full run. The merge lane needs an explicit,
-recursion-safe post-merge CI dispatch and the host selector must recognize that
-trusted event without accepting pull-request runs.
+The host deployer treats only normal `push` CI and exact-SHA protected-main
+`workflow_dispatch` CI as promotion evidence. The merge lane normally emits the
+dispatch, but an authorized manual dispatch is deliberately equivalent because
+the required preflight binds it to the current protected-main SHA before
+checkout. Pull-request and non-main runs remain ineligible, and exact-SHA/current-main
+checks remain load-bearing.
 
 Branch protection remains the decider in both cases: the required check must have passed and the branch must be up to date, and squash is the only method linear history permits.
 
-`cipolicy` pins both lanes. `checkDependabotApproval` keeps the review lane free of branch write access, `checkDependabotMerge` pins the merge lane's triggers, both permission sets, its single job, its absence of external actions, its independently derived guards, and the SHA-bound squash. `TestApprovalLaneCannotMerge` additionally fails if merge capability ever returns to the reviewing lane, since that would put the write grant and the review authority back in one file.
+`cipolicy` pins both lanes. `checkDependabotApproval` keeps the review lane free of branch write access, `checkDependabotMerge` pins the merge lane's triggers, both permission sets, its single job, its absence of external actions, its independently derived guards, the SHA-bound squash, and the exact landed-SHA CI dispatch. `TestApprovalLaneCannotMerge` additionally fails if merge capability ever returns to the reviewing lane, since that would put the write grant and the review authority back in one file.
 
 Unattended merging does not relax the promotion invariant, because the bot approval was never the gate. `required_approving_review_count` is `0`, so `required_status_checks.strict` on `Go, web, and image build` is what decides. `required_linear_history` means the merge must be a squash — a plain merge commit is rejected. If Dependabot force-pushes a rebase, the new SHA earns its own CI run, approval, and merge attempt; the request is SHA-bound so it cannot carry over to untested code.
 
@@ -140,7 +141,7 @@ Read two sub-scores with context rather than at face value:
 
 If a live OpenAI/Hermes canary or deployment workflow is added, trigger it from a completed successful `CI` run and fail closed unless all of these are true:
 
-1. the source run event was `push`, not `pull_request`;
+1. the source run event was `push` or the protected-main post-merge `workflow_dispatch`, never `pull_request`;
 2. the source repository is exactly this repository;
 3. the branch is exactly `main`;
 4. the source run SHA still equals the protected `main` SHA selected for promotion;
@@ -155,7 +156,8 @@ No secret-bearing GitHub lane exists today. Promotion remains host-local, so Git
 
 The host-side `thornhill-ci-deploy.timer` is the promotion boundary. It has no
 PR trigger and never executes a pull-request checkout. It selects the newest
-successful `push` CI run for `main`, verifies that SHA is an ancestor of current
+successful trusted-main CI run (`push`, or the explicit protected-main
+post-merge `workflow_dispatch`), verifies that SHA is an ancestor of current
 `origin/main`, builds from a detached worktree at that exact revision, and
 injects the full SHA into the binary and OCI image label. Once the build is
 ready, a PostgreSQL transaction atomically sets the dispatch pause. A database
@@ -173,7 +175,7 @@ an operator explicitly sets `RETRY_FAILED=1`.
 This preserves a directly inspectable chain:
 
 ```text
-GitHub push CI run → head SHA → detached source worktree → revision-tagged app
+GitHub trusted-main CI run → head SHA → detached source worktree → revision-tagged app
   and PostgreSQL images → OCI app revision label → linked binary commit
   → live /api/status and PostgreSQL hardening checks → deployed.json receipt
 ```
