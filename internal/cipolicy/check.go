@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -17,7 +18,13 @@ import (
 type workflow struct {
 	On          map[string]any         `yaml:"on"`
 	Permissions map[string]string      `yaml:"permissions"`
+	Concurrency workflowConcurrency    `yaml:"concurrency"`
 	Jobs        map[string]workflowJob `yaml:"jobs"`
+}
+
+type workflowConcurrency struct {
+	Group            string `yaml:"group"`
+	CancelInProgress bool   `yaml:"cancel-in-progress"`
 }
 
 type workflowJob struct {
@@ -29,8 +36,11 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
-	Uses string `yaml:"uses"`
-	Run  string `yaml:"run"`
+	Name string            `yaml:"name"`
+	If   string            `yaml:"if"`
+	Env  map[string]string `yaml:"env"`
+	Uses string            `yaml:"uses"`
+	Run  string            `yaml:"run"`
 }
 
 type dependabotConfig struct {
@@ -221,6 +231,9 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 	if !ok {
 		return fmt.Errorf("CI must include history and policy preflight")
 	}
+	if err := checkCIDispatchContract(wf, preflight); err != nil {
+		return err
+	}
 	if err := requireLaneSteps("CI preflight", preflight, []string{
 		"gitleaks/gitleaks-action@",
 		"scripts/check-ci-policy.sh",
@@ -272,6 +285,48 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 	if len(verify.Steps) != 1 || !strings.Contains(verify.Steps[0].Run, "needs.source.result") ||
 		!strings.Contains(verify.Steps[0].Run, "needs.image.result") {
 		return fmt.Errorf("CI verify job must explicitly require source and image success")
+	}
+	return nil
+}
+
+// checkCIDispatchContract binds every explicit CI dispatch to one exact
+// protected-main revision. The dispatch API accepts only a branch or tag ref,
+// so the caller supplies the landed SHA as a required input and preflight checks
+// GitHub's resolved SHA before any checkout or contributor-controlled command.
+func checkCIDispatchContract(wf workflow, preflight workflowJob) error {
+	dispatch, ok := wf.On["workflow_dispatch"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("CI workflow_dispatch must define the exact-SHA input contract")
+	}
+	inputs, ok := dispatch["inputs"].(map[string]any)
+	if !ok || len(inputs) != 1 {
+		return fmt.Errorf("CI workflow_dispatch must define only expected_sha")
+	}
+	expected, ok := inputs["expected_sha"].(map[string]any)
+	if !ok || expected["required"] != true || expected["type"] != "string" {
+		return fmt.Errorf("CI workflow_dispatch expected_sha must be a required string")
+	}
+	const dispatchGroup = "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.expected_sha || '' }}"
+	if wf.Concurrency.Group != dispatchGroup || !wf.Concurrency.CancelInProgress {
+		return fmt.Errorf("CI concurrency must isolate pushes from exact-SHA dispatches while cancelling duplicates")
+	}
+
+	if len(preflight.Steps) == 0 || preflight.Steps[0].Name != "Verify dispatched protected-main revision" {
+		return fmt.Errorf("CI preflight must verify the dispatched protected-main revision as its first step")
+	}
+	step := preflight.Steps[0]
+	if step.If != "github.event_name == 'workflow_dispatch'" ||
+		len(step.Env) != 1 || step.Env["EXPECTED_SHA"] != "${{ inputs.expected_sha }}" {
+		return fmt.Errorf("CI dispatch verification step must be isolated to workflow_dispatch and bind expected_sha")
+	}
+	for _, required := range []string{
+		`[[ "${GITHUB_REF}" == 'refs/heads/main' ]]`,
+		`[[ "${EXPECTED_SHA}" =~ ^[0-9a-f]{40}$ ]]`,
+		`[[ "${GITHUB_SHA}" == "${EXPECTED_SHA}" ]]`,
+	} {
+		if !strings.Contains(step.Run, required) {
+			return fmt.Errorf("CI dispatch verification step must include %q", required)
+		}
 	}
 	return nil
 }
@@ -375,7 +430,9 @@ func checkDependabotApproval(root string) error {
 // with that token, and it must re-derive its own guards from the workflow_run
 // metadata rather than trusting the review lane. The merge must name the
 // CI-tested SHA so a rebase landing between qualification and this request is
-// refused instead of merged.
+// refused instead of merged. Since GITHUB_TOKEN-created commits suppress push
+// workflows, the lane must also dispatch full CI on protected main after a
+// successful landing so the deployed revision earns post-merge proof.
 func checkDependabotMerge(root string) error {
 	relative := ".github/workflows/dependabot-auto-merge.yml"
 	data, err := os.ReadFile(filepath.Join(root, relative))
@@ -409,7 +466,7 @@ func checkDependabotMerge(root string) error {
 	if len(wf.Jobs) != 1 || !ok || merge.If != "github.event.workflow_run.conclusion == 'success'" {
 		return fmt.Errorf("%s must contain only the success-gated merge job", relative)
 	}
-	wantJob := map[string]string{"contents": "write", "pull-requests": "write", "actions": "read"}
+	wantJob := map[string]string{"contents": "write", "pull-requests": "write", "actions": "write"}
 	if len(merge.Permissions) != len(wantJob) {
 		return fmt.Errorf("%s merge job must hold exactly the documented narrow permissions", relative)
 	}
@@ -427,6 +484,36 @@ func checkDependabotMerge(root string) error {
 		lane.WriteString(step.Run)
 		lane.WriteByte('\n')
 	}
+	laneText := lane.String()
+	mergeEndpoint := `repos/${REPOSITORY}/pulls/${pull_request}/merge`
+	dispatchEndpoint := `repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches`
+	if strings.Count(laneText, mergeEndpoint) != 1 || strings.Count(laneText, dispatchEndpoint) != 1 {
+		return fmt.Errorf("%s must contain exactly one SHA-bound merge and one exact-main CI dispatch", relative)
+	}
+	if strings.Count(laneText, "gh api --method PUT") != 1 || strings.Count(laneText, "gh api --method POST") != 3 {
+		return fmt.Errorf("%s must contain only the one merge mutation and three documented Actions mutations", relative)
+	}
+	for _, forbidden := range []string{
+		"gh api -X", "gh api --method=", "gh pr merge", "gh workflow run", "curl ", "wget ",
+	} {
+		if strings.Contains(laneText, forbidden) {
+			return fmt.Errorf("%s must not use an alternate network mutation form %q", relative, forbidden)
+		}
+	}
+	for _, line := range strings.Split(laneText, "\n") {
+		if strings.Contains(line, "/pulls/") && strings.Contains(line, "/merge") &&
+			!strings.Contains(line, mergeEndpoint) {
+			return fmt.Errorf("%s contains an unrecognized pull-request merge endpoint", relative)
+		}
+		if strings.Contains(line, "/actions/workflows/") && strings.Contains(line, "/dispatches") &&
+			!strings.Contains(line, dispatchEndpoint) {
+			return fmt.Errorf("%s contains an unrecognized workflow dispatch endpoint", relative)
+		}
+	}
+	boundMerge := regexp.MustCompile(`(?m)if merge_response=\$\(gh api --method PUT "repos/\$\{REPOSITORY\}/pulls/\$\{pull_request\}/merge" \\\n\s+-f "sha=\$\{head_sha\}" \\\n\s+-f merge_method=squash\) &&`)
+	if !boundMerge.MatchString(laneText) {
+		return fmt.Errorf("%s merge call must bind the qualified SHA and squash method in one command", relative)
+	}
 	for _, required := range []string{
 		".actor.login",
 		".head_repository.full_name",
@@ -437,14 +524,35 @@ func checkDependabotMerge(root string) error {
 		`"${head_branch}" != dependabot/*`,
 		`.user.login == "dependabot[bot]"`,
 		`.head.repo.full_name == .base.repo.full_name`,
+		`.base.repo.full_name == $repository`,
 		`.base.ref == "main"`,
+		`.head.ref == $branch`,
 		`.head.sha == $sha`,
+		`.pull_requests[0].number`,
+		`-f state=all`,
+		`.merge_commit_sha`,
+		`gh run list --repo`,
+		`.status == "queued"`,
+		`.status == "in_progress"`,
+		`.conclusion == "success"`,
 		`repos/${REPOSITORY}/pulls/${pull_request}/merge`,
 		// Bind the merge to the qualified revision, and keep linear history.
 		`-f "sha=${head_sha}"`,
 		"-f merge_method=squash",
+		`.merged == true`,
+		`repos/${REPOSITORY}/git/ref/heads/main`,
+		`"${main_sha}" == "${landed_sha}"`,
+		`'{ref:"main", inputs:{expected_sha:$expected_sha}}'`,
+		`X-GitHub-Api-Version: 2026-03-10`,
+		`repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches`,
+		`.workflow_run_id`,
+		`repos/${REPOSITORY}/actions/runs/${dispatch_run_id}`,
+		`"${dispatch_event}" != 'workflow_dispatch'`,
+		`"${dispatch_branch}" != 'main'`,
+		`"${dispatch_sha}" != "${landed_sha}"`,
+		`repos/${REPOSITORY}/actions/runs/${dispatch_run_id}/cancel`,
 	} {
-		if !strings.Contains(lane.String(), required) {
+		if !strings.Contains(laneText, required) {
 			return fmt.Errorf("%s merge lane must include %q", relative, required)
 		}
 	}

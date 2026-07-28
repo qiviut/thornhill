@@ -697,11 +697,14 @@ if [[ -f "${transition_file}" ]]; then
 fi
 timeout 60s git fetch --quiet --prune origin main
 remote_main=$(git rev-parse origin/main)
-runs=$(gh run list --repo "${REPOSITORY}" --workflow CI --branch main --event push --limit 50 \
-  --json databaseId,headSha,status,conclusion,url,createdAt)
-passed=$(jq -c '[.[] | select(.status == "completed" and .conclusion == "success")][0] // empty' <<<"${runs}")
+runs=$(gh run list --repo "${REPOSITORY}" --workflow CI --branch main --limit 50 \
+  --json databaseId,headSha,status,conclusion,event,url,createdAt)
+passed=$(jq -c '[.[] | select(
+  (.event == "push" or .event == "workflow_dispatch") and
+  .status == "completed" and .conclusion == "success"
+)][0] // empty' <<<"${runs}")
 if [[ -z "${passed}" ]]; then
-  echo "No successful main push CI run found" >&2
+  echo "No successful trusted main CI run found" >&2
   exit 1
 fi
 revision=$(jq -r .headSha <<<"${passed}")

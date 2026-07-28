@@ -151,9 +151,12 @@ PUBLIC_STATUS_URL=https://your-host.your-tailnet.ts.net:8787/api/status \
   ./scripts/install-ci-autodeploy.sh
 ```
 
-The timer polls GitHub every 15 minutes for the newest successful
-**push-to-main** CI run and builds
-that exact commit from a detached temporary worktree. Immediately before
+The timer polls GitHub every 15 minutes for the newest successful trusted-main
+CI run (`push`, or an exact-main `workflow_dispatch`, normally emitted after a
+`GITHUB_TOKEN` Dependabot merge). An authorized manual dispatch is also valid
+promotion evidence, but it must supply the exact protected-main SHA and pass the
+same pre-checkout binding. The deployer builds that exact commit
+from a detached temporary worktree. Immediately before
 replacement it atomically pauses new dispatches in PostgreSQL and rechecks that
 no work is active. It then recreates the revision-pinned app and PostgreSQL
 services. PostgreSQL receives its fast clean-shutdown signal (`SIGINT`) with a
@@ -176,12 +179,6 @@ may be stopped. Polls against a modified or revision-mismatched deployment
 controller defer safely, write `deferred.json` under the deployment state
 directory, and do not generate failed systemd units. Direct script execution
 continues to fail closed.
-
-Current limitation: Dependabot squashes landed by the merge lane's
-`GITHUB_TOKEN` do not emit a recursive `push` CI run, so those commits are not
-deployment candidates until a later protected-main push receives full CI. The
-promotion lane still fails closed; this is a convergence gap, not a path around
-qualification.
 
 The current correspondence is independently checked with:
 

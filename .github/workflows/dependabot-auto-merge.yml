@@ -14,7 +14,11 @@ on:
 #     trusting the review lane, so neither lane can widen the other;
 #   * branch protection still decides. The merge request is refused unless the
 #     required check passed and the branch is up to date, and the merge method is
-#     squash because linear history is enforced.
+#     squash because linear history is enforced;
+#   * after landing, it explicitly dispatches CI on `main`. GitHub suppresses
+#     ordinary push workflows for commits created with GITHUB_TOKEN, so this is
+#     what gives the landed SHA its own deployable full-CI proof. Reruns recover
+#     an already merged SHA and reuse any viable qualification run.
 #
 # Delegating this to Dependabot's own credentials was tried first and does not
 # work: a `@dependabot` command from `github-actions[bot]` is ignored because that
@@ -34,7 +38,8 @@ jobs:
       contents: write
       # Reading the pull request and issuing its merge.
       pull-requests: write
-      actions: read
+      # Read the triggering run and dispatch post-merge CI on protected main.
+      actions: write
     steps:
       - name: Merge the exact Dependabot revision CI tested
         env:
@@ -60,33 +65,140 @@ jobs:
           fi
 
           repository_owner=${REPOSITORY%%/*}
-          pull_request=$(gh api --method GET "repos/${REPOSITORY}/pulls" \
-            -f state=open \
-            -f "head=${repository_owner}:${head_branch}" \
-            | jq -er --arg sha "${head_sha}" '
-                [ .[]
-                  | select(.user.login == "dependabot[bot]")
-                  | select(.head.repo.full_name == .base.repo.full_name)
-                  | select(.base.ref == "main")
-                  | select(.head.sha == $sha)
-                ]
-                | if length == 1 then .[0].number
-                  else error("expected one open Dependabot pull request at the CI-tested SHA")
-                  end
-              ')
+          pull_request_from_run=$(jq -r '.pull_requests[0].number // empty' <<<"${source_run}")
+          if [[ "${pull_request_from_run}" =~ ^[0-9]+$ ]]; then
+            pull_request_json=$(gh api "repos/${REPOSITORY}/pulls/${pull_request_from_run}")
+          else
+            # Older workflow_run payloads can omit pull_requests. Search all states
+            # so a rerun after the merge can recover the already-landed revision.
+            pull_request_json=$(gh api --method GET "repos/${REPOSITORY}/pulls" \
+              -f state=all \
+              -f "head=${repository_owner}:${head_branch}" \
+              | jq -ec --arg sha "${head_sha}" '
+                  [ .[]
+                    | select(.user.login == "dependabot[bot]")
+                    | select(.head.repo.full_name == .base.repo.full_name)
+                    | select(.base.ref == "main")
+                    | select(.head.sha == $sha)
+                  ]
+                  | if length == 1 then .[0]
+                    else error("expected one Dependabot pull request at the CI-tested SHA")
+                    end
+                ')
+          fi
 
-          # Bind the merge to the tested commit. If Dependabot force-pushes a
-          # rebase between CI finishing and this request, the SHA no longer
-          # matches and GitHub refuses rather than landing untested code.
-          if gh api --method PUT "repos/${REPOSITORY}/pulls/${pull_request}/merge" \
-            -f "sha=${head_sha}" \
-            -f merge_method=squash; then
-            echo "Merged pull request #${pull_request} at ${head_sha}."
+          if ! jq -e \
+            --arg repository "${REPOSITORY}" \
+            --arg branch "${head_branch}" \
+            --arg sha "${head_sha}" '
+              .user.login == "dependabot[bot]" and
+              .head.repo.full_name == $repository and
+              .base.repo.full_name == $repository and
+              .base.ref == "main" and
+              .head.ref == $branch and
+              .head.sha == $sha
+            ' <<<"${pull_request_json}" >/dev/null; then
+            echo 'Pull-request metadata no longer matches the qualified Dependabot revision.' >&2
+            exit 1
+          fi
+          pull_request=$(jq -er '.number' <<<"${pull_request_json}")
+
+          if [[ $(jq -r '.merged' <<<"${pull_request_json}") == 'true' ]]; then
+            landed_sha=$(jq -er '
+              .merge_commit_sha
+              | select(type == "string" and test("^[0-9a-f]{40}$"))
+            ' <<<"${pull_request_json}")
+            echo "Recovering post-merge qualification for #${pull_request} at ${landed_sha}."
+          elif [[ $(jq -r '.state' <<<"${pull_request_json}") == 'open' ]]; then
+            # Bind the merge to the tested commit. If Dependabot force-pushes a
+            # rebase between CI finishing and this request, the SHA no longer
+            # matches and GitHub refuses rather than landing untested code.
+            if merge_response=$(gh api --method PUT "repos/${REPOSITORY}/pulls/${pull_request}/merge" \
+              -f "sha=${head_sha}" \
+              -f merge_method=squash) &&
+              landed_sha=$(jq -er '
+                if .merged == true and (.sha | test("^[0-9a-f]{40}$"))
+                then .sha
+                else error("merge API declined the qualified revision")
+                end
+              ' <<<"${merge_response}"); then
+              :
+            else
+              # The response can be lost after GitHub lands the merge. Re-read
+              # the PR before treating this as normal strict-branch convergence.
+              pull_request_json=$(gh api "repos/${REPOSITORY}/pulls/${pull_request}")
+              if ! jq -e --arg sha "${head_sha}" '
+                .merged == true and
+                .head.sha == $sha and
+                (.merge_commit_sha | type == "string" and test("^[0-9a-f]{40}$"))
+              ' <<<"${pull_request_json}" >/dev/null; then
+                echo "GitHub declined to merge #${pull_request} at ${head_sha}; leaving it for the next qualified revision."
+                exit 0
+              fi
+              landed_sha=$(jq -er '.merge_commit_sha' <<<"${pull_request_json}")
+            fi
+          else
+            echo "Dependabot pull request #${pull_request} is closed without a merge; nothing to qualify."
             exit 0
           fi
 
-          # A refusal is normal and not a failure: under a strict required check
-          # every merge leaves the other open branches out of date, so Dependabot
-          # rebases them and the replacement revision earns its own CI run and its
-          # own attempt. Failing here would turn routine convergence into noise.
-          echo "GitHub declined to merge #${pull_request} at ${head_sha}; leaving it for the next qualified revision."
+          main_sha=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          echo "Qualified pull request #${pull_request}; protected main is ${main_sha}."
+
+          # A rerun after a transient post-merge failure must be idempotent. A
+          # queued/running exact-main proof, or an already successful one, owns
+          # qualification; failed/cancelled attempts may be retried.
+          qualification_run=$(gh run list --repo "${REPOSITORY}" --workflow CI --branch main --limit 50 \
+            --json databaseId,headSha,status,conclusion,event,url,createdAt \
+            | jq -c --arg sha "${landed_sha}" '
+                [ .[]
+                  | select(.headSha == $sha)
+                  | select(.event == "push" or .event == "workflow_dispatch")
+                  | select(
+                      .status == "queued" or
+                      .status == "in_progress" or
+                      (.status == "completed" and .conclusion == "success")
+                    )
+                ][0] // empty
+              ')
+          if [[ -n "${qualification_run}" ]]; then
+            qualification_run_id=$(jq -r '.databaseId' <<<"${qualification_run}")
+            qualification_url=$(jq -r '.url' <<<"${qualification_run}")
+            echo "CI qualification ${qualification_run_id} already owns landed revision ${landed_sha}: ${qualification_url}"
+            exit 0
+          fi
+
+          # GITHUB_TOKEN-created commits do not emit another push workflow run.
+          # workflow_dispatch is the documented recursion-safe exception. The
+          # API accepts a branch or tag ref, not a raw commit, so CI also receives
+          # the landed SHA as a required input and fails before checkout unless
+          # GitHub resolved `main` to that exact revision.
+          if [[ "${main_sha}" == "${landed_sha}" ]]; then
+            dispatch_payload=$(jq -cn --arg expected_sha "${landed_sha}" \
+              '{ref:"main", inputs:{expected_sha:$expected_sha}}')
+            dispatch_response=$(gh api --method POST \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches" \
+              --input - <<<"${dispatch_payload}")
+            dispatch_run_id=$(jq -er '.workflow_run_id | select(type == "number")' \
+              <<<"${dispatch_response}")
+            dispatch_run=$(gh api "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}")
+            dispatch_event=$(jq -r '.event' <<<"${dispatch_run}")
+            dispatch_branch=$(jq -r '.head_branch' <<<"${dispatch_run}")
+            dispatch_sha=$(jq -r '.head_sha' <<<"${dispatch_run}")
+
+            if [[ "${dispatch_event}" != 'workflow_dispatch' ||
+                  "${dispatch_branch}" != 'main' ]]; then
+              gh api --method POST "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}/cancel"
+              echo "Dispatch ${dispatch_run_id} resolved outside protected main; cancelled."
+              exit 1
+            fi
+            if [[ "${dispatch_sha}" != "${landed_sha}" ]]; then
+              gh api --method POST "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}/cancel"
+              echo "Main advanced from ${landed_sha} to ${dispatch_sha} during dispatch; the newer revision owns qualification."
+              exit 0
+            fi
+            echo "Dispatched full CI run ${dispatch_run_id} for landed main revision ${landed_sha}."
+          else
+            echo "Main advanced from ${landed_sha} to ${main_sha}; the newer revision owns qualification."
+          fi

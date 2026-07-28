@@ -223,6 +223,79 @@ func TestCheckRejectsPrivilegedJobAndUnsafeTrigger(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsUnboundCIDispatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		old     string
+		new     string
+		contain string
+	}{
+		{
+			name:    "dispatch shares push concurrency",
+			old:     `group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.expected_sha || '' }}`,
+			new:     `group: ${{ github.workflow }}-${{ github.ref }}`,
+			contain: "CI concurrency must isolate pushes from exact-SHA dispatches",
+		},
+		{
+			name:    "dispatch duplication is not cancelled",
+			old:     "cancel-in-progress: true",
+			new:     "cancel-in-progress: false",
+			contain: "CI concurrency must isolate pushes from exact-SHA dispatches",
+		},
+		{
+			name:    "verification is not first",
+			old:     "    steps:\n      - name: Verify dispatched protected-main revision\n",
+			new:     "    steps:\n      - name: Harmless pre-step\n        run: 'true'\n      - name: Verify dispatched protected-main revision\n",
+			contain: "CI preflight must verify the dispatched protected-main revision as its first step",
+		},
+		{
+			name:    "expected SHA is optional",
+			old:     "        required: true\n",
+			new:     "        required: false\n",
+			contain: "expected_sha must be a required string",
+		},
+		{
+			name:    "expected SHA has the wrong type",
+			old:     "        type: string\n",
+			new:     "        type: choice\n",
+			contain: "expected_sha must be a required string",
+		},
+		{
+			name:    "dispatch may target another branch",
+			old:     `[[ "${GITHUB_REF}" == 'refs/heads/main' ]]`,
+			new:     `[[ -n "${GITHUB_REF}" ]]`,
+			contain: "dispatch verification step must include",
+		},
+		{
+			name:    "dispatch does not compare the resolved SHA",
+			old:     `[[ "${GITHUB_SHA}" == "${EXPECTED_SHA}" ]]`,
+			new:     `[[ -n "${GITHUB_SHA}" ]]`,
+			contain: "dispatch verification step must include",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/ci.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), tc.contain) {
+				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
+			}
+		})
+	}
+}
+
 func TestCheckRejectsMissingScannerUpdateCoverage(t *testing.T) {
 	root := policyFixture(t)
 	path := filepath.Join(root, ".github/dependabot.yml")
@@ -285,12 +358,101 @@ func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
 			name:    "merge is not bound to the tested revision",
 			old:     "            -f \"sha=${head_sha}\" \\\n",
 			new:     "",
-			contain: "merge lane must include",
+			contain: "merge call must bind the qualified SHA",
+		},
+		{
+			name: "extra unbound merge call",
+			old:  "            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			new: "            gh api --method PUT \"repos/${REPOSITORY}/pulls/${pull_request}/merge\" \\\n" +
+				"              --input - <<<'{\"merge_method\":\"squash\"}'\n" +
+				"            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			contain: "exactly one SHA-bound merge",
+		},
+		{
+			name: "indirect extra unbound merge call",
+			old:  "            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			new: "            unbound_merge_endpoint=\"repos/${REPOSITORY}/pulls/${pull_request}/\"\"merge\"\n" +
+				"            gh api --method PUT \"${unbound_merge_endpoint}\" -f merge_method=squash\n" +
+				"            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			contain: "one merge mutation and three documented Actions mutations",
+		},
+		{
+			name: "attached short-method extra merge call",
+			old:  "            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			new: "            unbound_merge_endpoint=\"repos/${REPOSITORY}/pulls/${pull_request}/\"\"merge\"\n" +
+				"            gh api -XPUT \"${unbound_merge_endpoint}\" -f merge_method=squash\n" +
+				"            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			contain: "alternate network mutation form",
+		},
+		{
+			name: "high-level extra merge call",
+			old:  "            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			new: "            gh pr merge \"${pull_request}\" --squash\n" +
+				"            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
+			contain: "alternate network mutation form",
 		},
 		{
 			name:    "merge method breaks linear history",
 			old:     "-f merge_method=squash",
 			new:     "-f merge_method=merge",
+			contain: "merge call must bind the qualified SHA",
+		},
+		{
+			name:    "cannot dispatch landed main CI",
+			old:     "      actions: write\n",
+			new:     "      actions: read\n",
+			contain: "merge job permission actions must be write",
+		},
+		{
+			name:    "omits post-merge CI dispatch",
+			old:     `repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches`,
+			new:     `repos/${REPOSITORY}/actions/workflows/disabled.yml/dispatches`,
+			contain: "exactly one SHA-bound merge and one exact-main CI dispatch",
+		},
+		{
+			name: "extra unbound CI dispatch",
+			old:  "          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			new: "          gh api --method POST \"repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches\" -f ref=${head_branch}\n" +
+				"          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			contain: "exactly one SHA-bound merge and one exact-main CI dispatch",
+		},
+		{
+			name: "indirect extra unbound CI dispatch",
+			old:  "          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			new: "          unbound_dispatch_endpoint=\"repos/${REPOSITORY}/actions/workflows/ci.yml/\"\"dispatches\"\n" +
+				"          gh api --method POST \"${unbound_dispatch_endpoint}\" -f ref=${head_branch}\n" +
+				"          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			contain: "one merge mutation and three documented Actions mutations",
+		},
+		{
+			name: "high-level extra CI dispatch",
+			old:  "          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			new: "          gh workflow run ci.yml --ref \"${head_branch}\"\n" +
+				"          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			contain: "alternate network mutation form",
+		},
+		{
+			name:    "dispatches an arbitrary branch",
+			old:     `'{ref:"main", inputs:{expected_sha:$expected_sha}}'`,
+			new:     `'{ref:$head_branch, inputs:{expected_sha:$expected_sha}}'`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "dispatch omits the exact landed revision",
+			old:     `inputs:{expected_sha:$expected_sha}`,
+			new:     `inputs:{}`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "dispatch response is not bound to a run",
+			old:     `.workflow_run_id`,
+			new:     `.run_id`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "dispatched revision is not rechecked",
+			old:     `"${dispatch_sha}" != "${landed_sha}"`,
+			new:     `"${dispatch_sha}" == "${landed_sha}"`,
 			contain: "merge lane must include",
 		},
 		{
@@ -300,9 +462,27 @@ func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
 			contain: "merge lane must include",
 		},
 		{
-			name:    "base branch guard removed",
-			old:     `                  | select(.base.ref == "main")`,
-			new:     `                  | select(.base.ref != "")`,
+			name:    "base repository guard removed",
+			old:     `.base.repo.full_name == $repository`,
+			new:     `.base.repo.full_name != ""`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "rerun cannot recover a merged pull request",
+			old:     "              -f state=all \\\n",
+			new:     "              -f state=open \\\n",
+			contain: "merge lane must include",
+		},
+		{
+			name:    "rerun ignores source pull request identity",
+			old:     `.pull_requests[0].number`,
+			new:     `.pull_requests[0].id`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "rerun duplicates an active qualification",
+			old:     `gh run list --repo`,
+			new:     `gh run view --repo`,
 			contain: "merge lane must include",
 		},
 		{
