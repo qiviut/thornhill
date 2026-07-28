@@ -218,7 +218,7 @@ job.
 The rolling summary is context, not an acknowledgment ledger. Every transition
 to `done`, `failed`, `needs_input`, `needs_approval`, or `parked_approval` inserts
 an immutable attention row in the same PostgreSQL transaction as the job update.
-A unique `(job_id, state_version, kind)` key makes replay idempotent.
+A unique `(job_id, job_version, kind)` key makes replay idempotent.
 
 On call start, one Desk instance leases unspoken rows with `SKIP LOCKED`, injects
 their text under an explicit quoted/untrusted-data envelope, and asks the model
@@ -248,10 +248,17 @@ disabled audit row.
 - There is no generic application-level checkpoint protocol for pausing arbitrary
   external resources; failed-job resume relies on durable history, artifacts,
   progress evidence, and verification before repeat.
-- Public OpenAI documentation and model catalogs do not establish a
-  `gpt-live-1` model. The documented Realtime family remains the supported
-  integration target unless authenticated account visibility and full protocol
-  acceptance prove otherwise.
+- `gpt-live-1` is announced but not yet available in the API. OpenAI publishes an
+  access request form for it ([`gpt-live-1` in the
+  API](https://openai.com/form/gpt-live-1-in-the-api/), [introducing
+  GPT-Live](https://openai.com/index/introducing-gpt-live/)), while the API model
+  catalog, changelog, and Realtime guide carry no `gpt-live-1` entry and no `live`
+  endpoint — rechecked 2026-07-26. The documented Realtime family therefore
+  remains the supported integration target. Do not repoint `REALTIME_MODEL` at it
+  before the API exposes it: an unknown model ID fails the sideband dial and drops
+  every call onto the L1/L2 error ladder. Re-evaluate when the API surface and its
+  protocol are published, since the announcement suggests a session model that may
+  not match the current `/v1/realtime/calls` plus sideband topology.
 - UI component expiry is platform behavior, not consent expiry; operators may
   need to use a text command after a button is disabled.
 - Web Push delivery is platform/provider best effort, not a completion receipt.

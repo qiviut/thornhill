@@ -175,8 +175,15 @@ SHA is quarantined instead of being retried. During active development the timer
 may be stopped. Polls against a modified or revision-mismatched deployment
 controller defer safely, write `deferred.json` under the deployment state
 directory, and do not generate failed systemd units. Direct script execution
-continues to fail closed. The current
-correspondence is independently checked with:
+continues to fail closed.
+
+Current limitation: Dependabot squashes landed by the merge lane's
+`GITHUB_TOKEN` do not emit a recursive `push` CI run, so those commits are not
+deployment candidates until a later protected-main push receives full CI. The
+promotion lane still fails closed; this is a convergence gap, not a path around
+qualification.
+
+The current correspondence is independently checked with:
 
 ```sh
 CHECK_ONLY=1 ./scripts/deploy-passed-main.sh
@@ -402,24 +409,37 @@ docs/vendor/         the exact API docs this code was written against
 
 ## Verify on first contact (marked TODO(verify) in code)
 
-1. Hermes hook payload shape (`/hooks/hermes` ingests anything, tags it
-   `hermes.hook`).
-2. `TRANSCRIBE_MODEL` and `TTS_MODEL` names against current docs.
-3. Truncation field path in `session.update`
-   (`truncation.retention_ratio`, per
-   [`realtime-costs.md`](docs/vendor/openai/realtime-costs.md)).
-4. Needs-input intent remains a trailing-question heuristic; approvals and
-   tool progress are structured Runs events.
+Confirmed against primary sources on 2026-07-26:
+
+- `TRANSCRIBE_MODEL` — `gpt-realtime-whisper` is named throughout the vendored
+  Realtime docs and the current model catalog.
+- `TTS_MODEL` — `gpt-4o-mini-tts` is the documented current model ID and the
+  configured default; no successor is recommended. The vendored set is
+  Realtime-only, so this one is checked against the live docs.
+- Truncation field path — `session.truncation.{type, retention_ratio}` matches
+  [`realtime-costs.md`](docs/vendor/openai/realtime-costs.md) exactly. Thornhill
+  omits the optional `token_limits.post_instructions`, which that doc also
+  documents as a cost lever.
+
+Deliberate runtime contracts rather than missing upstream facts:
+
+- Hermes documents lifecycle-hook context keys, but `/hooks/hermes` is generic
+  intake for hook and cron producers. It intentionally accepts size-bounded
+  JSON and tags it `hermes.hook` rather than coupling ingestion to one producer's
+  schema.
+- Needs-input intent remains a trailing-question heuristic. Approvals and tool
+  progress are structured Runs events; only this one intent is inferred from
+  prose, and that is a design choice rather than an unverified fact.
 
 ## Notes
 
 - Tailnet-only by deployment: bind `LISTEN_ADDR` (or the compose port
   mapping) to the host's tailscale address. The gateway itself does no
   auth — the tailnet is the perimeter, and there is exactly one user.
-- Budget breaker: `DAILY_BUDGET_USD` gates new calls on the day's
-  estimated spend from the usage ledger (estimates currently logged at
-  zero cost; wire rates from [`pricing.md`](docs/vendor/openai/pricing.md) when it
-  matters).
+- Budget breaker is not an effective spend cap yet: `DAILY_BUDGET_USD` compares
+  against the day's usage ledger, but current estimates are logged at zero cost.
+  Wire rates from [`pricing.md`](docs/vendor/openai/pricing.md) before relying on
+  this control.
 - A process restart fail-closes in-flight Hermes work: Thornhill stops known
   running run IDs, preserves already parked `needs_input` questions for a later
   durable answer, parks a sole pending approval unresolved, and reclaims stale

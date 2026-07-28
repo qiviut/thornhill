@@ -88,7 +88,19 @@ The single serial qualification job is now a fail-closed DAG:
 
 This preserves the existing no-mutable-cache policy for public pull requests,
 the no-cache PostgreSQL security refresh, and every prior quality/security
-step. This prediction was validated by [PR #8 CI run 29471282705](https://github.com/qiviut/thornhill/actions/runs/29471282705): every preserved check passed, preflight took 14 seconds, source/fuzz took 181 seconds, image/security took 105 seconds in parallel, and the fail-closed aggregator took 3 seconds. End-to-end elapsed time was **207 seconds**, saving **58 seconds (21.9%)** against the prior 265-second median. Runner scheduling and variable upstream scan/download timing make this a measured sample, not a guaranteed SLA.
+step.
+
+[PR #8 CI run 29471282705](https://github.com/qiviut/thornhill/actions/runs/29471282705)
+validated the prediction. Every preserved check passed, at:
+
+- preflight, 14 seconds;
+- source analysis and fuzzing, 181 seconds;
+- image build and security, 105 seconds, in parallel with the above;
+- fail-closed aggregator, 3 seconds.
+
+End-to-end elapsed time was **207 seconds**, saving **58 seconds (21.9%)**
+against the prior 265-second median. Runner scheduling and variable upstream
+scan/download timing make this a measured sample, not a guaranteed SLA.
 
 The CI policy harness now verifies this topology explicitly. It rejects a
 missing preflight dependency, omitted image security scan, or a non-fail-closed
@@ -98,7 +110,10 @@ aggregator.
 
 - **Database indexes/query rewrites:** current plans and table sizes show no
   bottleneck. Revisit with production measurements after meaningful data
-  growth.
+  growth. (Since superseded for a different reason: `event_log` later gained
+  `(kind, ts)` and partial `(job_id, ts)` indexes to serve decision-corpus
+  analysis reads, not to fix a measured latency problem. The reasoning above
+  still holds for speculative *performance* indexing.)
 - **Fuzz duration and full image scans:** they account for real assurance and
   stay in PR qualification; scheduled fuzzing remains longer at two minutes.
 - **Untrusted PR dependency/build caches:** they remain disabled intentionally.
