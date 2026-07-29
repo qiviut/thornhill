@@ -9,6 +9,10 @@ Thank you for helping improve Thornhill.
 - Never commit credentials, personal data, private hostnames, deployment URLs, local absolute paths, database dumps, logs, or generated runtime state.
 - Keep pull-request code secretless. Tests must not call live OpenAI, Hermes, Tailnet, or deployment services.
 - Preserve fail-closed approval, interruption, and recovery semantics.
+- Read [`docs/security-model.md`](docs/security-model.md) before adding or changing
+  a gateway route, caller boundary, authority path, retained data class, or
+  deployment exposure. Route registration and its generated inventory must change
+  together.
 
 Run the same core checks used by CI:
 

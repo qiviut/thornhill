@@ -3,7 +3,10 @@
 Read this before changing job state, Hermes run ownership, approvals, browser
 protocol parsing, or deployment. These decisions are deliberately load-bearing;
 local simplifications can otherwise create duplicate work, implied consent, or a
-deployment that cannot safely roll back.
+deployment that cannot safely roll back. Read
+[`security-model.md`](../security-model.md) alongside it for caller identity,
+route authority, exposure assumptions, retained-data inventory, and security claim
+status.
 
 ## Durable job and run ownership
 

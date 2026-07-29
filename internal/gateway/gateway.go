@@ -176,19 +176,110 @@ func canonicalHTTPOrigin(scheme, hostport string) (string, bool) {
 	return scheme + "://" + host, true
 }
 
+// routeSecurity makes every HTTP surface state its expected principal and actual
+// enforcement boundary next to the registration that grants access. These fields
+// are documentation, not middleware: the supported deployment intentionally uses
+// operator-only Tailnet reachability as identity. routes_test.go renders the same
+// records into docs/security-model.md so a new route cannot silently skip review.
+type routeSecurity struct {
+	Pattern   string
+	Caller    string
+	Boundary  string
+	Data      string
+	Authority string
+}
+
+type routeSpec struct {
+	Security routeSecurity
+	Handler  http.Handler
+}
+
+func (g *Gateway) routeSpecs() []routeSpec {
+	return []routeSpec{
+		{
+			Security: routeSecurity{
+				Pattern: "GET /api/status", Caller: "Tailnet-admitted observer",
+				Boundary: "Tailnet perimeter", Data: "Health and exact source revision", Authority: "Read-only",
+			},
+			Handler: http.HandlerFunc(g.handleStatus),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "GET /api/push/config", Caller: "Operator browser",
+				Boundary: "Tailnet perimeter", Data: "Push enablement and public VAPID key", Authority: "Read-only",
+			},
+			Handler: http.HandlerFunc(g.handlePushConfig),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "POST /api/push/subscriptions", Caller: "Operator browser",
+				Boundary: "Tailnet plus exact same browser origin", Data: "Push endpoint and capability keys",
+				Authority: "Create or replace a notification capability",
+			},
+			Handler: http.HandlerFunc(g.handlePushSubscription),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "DELETE /api/push/subscriptions", Caller: "Operator browser",
+				Boundary: "Tailnet plus exact same browser origin", Data: "Push endpoint capability",
+				Authority: "Revoke a notification capability",
+			},
+			Handler: http.HandlerFunc(g.handlePushSubscription),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "POST /offer", Caller: "Operator browser or deliberate non-browser client",
+				Boundary: "Tailnet plus browser Origin policy; no-Origin clients accepted",
+				Data:     "SDP and current spend admission state", Authority: "Create a billable provider call and replace the active desk",
+			},
+			Handler: http.HandlerFunc(g.handleOffer),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "GET /ws", Caller: "Operator browser or deliberate non-browser client",
+				Boundary: "Tailnet plus browser Origin policy; no-Origin clients accepted",
+				Data:     "Recent events, transcripts, jobs, and client state", Authority: "Inject operator intent and control the active desk",
+			},
+			Handler: http.HandlerFunc(g.handleWS),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "GET /events", Caller: "Tailnet-admitted observer",
+				Boundary: "Tailnet perimeter", Data: "Recent and live events, including transcripts and job state",
+				Authority: "Read-only observation",
+			},
+			Handler: http.HandlerFunc(g.handleSSE),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "POST /hooks/hermes", Caller: "Server-side hook or cron producer",
+				Boundary: "Tailnet plus cross-origin browser rejection; no-Origin clients accepted",
+				Data:     "Size-bounded producer JSON", Authority: "Append non-authoritative hook telemetry",
+			},
+			Handler: http.HandlerFunc(g.guardHooks(g.Hooks)),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "GET /audio/prebaked/", Caller: "Operator browser",
+				Boundary: "Tailnet perimeter", Data: "Prebaked public application audio", Authority: "Read-only",
+			},
+			Handler: http.StripPrefix("/audio/prebaked/", http.FileServer(http.Dir(g.Cfg.PrebakeDir))),
+		},
+		{
+			Security: routeSecurity{
+				Pattern: "GET /", Caller: "Operator browser",
+				Boundary: "Tailnet perimeter", Data: "Static application shell and assets", Authority: "Read-only",
+			},
+			Handler: staticHandler(g.Cfg.StaticDir),
+		},
+	}
+}
+
 func (g *Gateway) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/status", g.handleStatus)
-	mux.HandleFunc("GET /api/push/config", g.handlePushConfig)
-	mux.HandleFunc("POST /api/push/subscriptions", g.handlePushSubscription)
-	mux.HandleFunc("DELETE /api/push/subscriptions", g.handlePushSubscription)
-	mux.HandleFunc("POST /offer", g.handleOffer)
-	mux.HandleFunc("GET /ws", g.handleWS)
-	mux.HandleFunc("GET /events", g.handleSSE)
-	mux.HandleFunc("POST /hooks/hermes", g.guardHooks(g.Hooks))
-	mux.Handle("GET /audio/prebaked/", http.StripPrefix("/audio/prebaked/",
-		http.FileServer(http.Dir(g.Cfg.PrebakeDir))))
-	mux.Handle("GET /", staticHandler(g.Cfg.StaticDir))
+	for _, route := range g.routeSpecs() {
+		mux.Handle(route.Security.Pattern, route.Handler)
+	}
 	return withLogging(withSecurityHeaders(mux), g.Log)
 }
 

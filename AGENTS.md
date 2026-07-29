@@ -16,6 +16,11 @@ Thornhill is a tailnet-deployed, single-operator voice desk for Hermes Agent wor
   [`docs/architecture/reliability-boundaries.md`](docs/architecture/reliability-boundaries.md).
   It records the invariants that preserve explicit consent, durable ownership,
   complete operator visibility, and rollback safety.
+- Before adding or changing an HTTP route, caller boundary, data exposure,
+  retained data class, or security claim, read
+  [`docs/security-model.md`](docs/security-model.md). Every gateway route must be
+  registered through its code-backed security classification; its generated
+  documentation block is enforced by tests.
 
 ## Verification
 
