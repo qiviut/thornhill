@@ -428,15 +428,29 @@ Deliberate runtime contracts rather than missing upstream facts:
   progress are structured Runs events; only this one intent is inferred from
   prose, and that is a design choice rather than an unverified fact.
 
+## Security and trust model
+
+Thornhill supports one operator behind an operator-only Tailnet grant. The
+gateway intentionally performs no application-level user authentication: Tailnet
+reachability is the identity boundary, while browser `Origin` checks only prevent
+cross-site use and do not authenticate people or devices. Shared-tailnet,
+multi-user, and public deployments require an application identity layer first.
+
+The canonical [`security-model.md`](docs/security-model.md) classifies every HTTP
+route by expected caller, enforced boundary, data, and authority; distinguishes
+model-mediated approval intent from broker-enforced execution; records dependency
+and permanent-policy assumptions; and inventories retained data and backup status.
+The route inventory is generated from the registration records and checked by Go
+tests so new routes cannot silently skip classification.
+
 ## Notes
 
-- Tailnet-only by deployment: bind `LISTEN_ADDR` (or the compose port
-  mapping) to the host's tailscale address. The gateway itself does no
-  auth — the tailnet is the perimeter, and there is exactly one user.
-- Budget breaker is not an effective spend cap yet: `DAILY_BUDGET_USD` compares
-  against the day's usage ledger, but current estimates are logged at zero cost.
-  Wire rates from [`pricing.md`](docs/vendor/openai/pricing.md) before relying on
-  this control.
+- Budget admission is **not an effective spend cap yet**: `DAILY_BUDGET_USD`
+  compares against the day's usage ledger, but current estimates are logged at
+  zero cost. Wire modality, caching, transcription, and model rates from
+  [`pricing.md`](docs/vendor/openai/pricing.md) before relying on this control;
+  hard containment also needs reservation/concurrency semantics or an upstream
+  provider budget.
 - A process restart fail-closes in-flight Hermes work: Thornhill stops known
   running run IDs, preserves already parked `needs_input` questions for a later
   durable answer, parks a sole pending approval unresolved, and reclaims stale
