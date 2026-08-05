@@ -7,8 +7,8 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/oklog/ulid/v2 v2.1.2
-	github.com/riverqueue/river v0.41.1
-	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.41.1
+	github.com/riverqueue/river v0.42.0
+	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.42.0
 	go.yaml.in/yaml/v3 v3.0.5
 )
 
@@ -28,9 +28,9 @@ require (
 	github.com/mattn/go-shellwords v1.0.12 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rhysd/actionlint v1.7.12 // indirect
-	github.com/riverqueue/river/riverdriver v0.41.1 // indirect
-	github.com/riverqueue/river/rivershared v0.41.1 // indirect
-	github.com/riverqueue/river/rivertype v0.41.1 // indirect
+	github.com/riverqueue/river/riverdriver v0.42.0 // indirect
+	github.com/riverqueue/river/rivershared v0.42.0 // indirect
+	github.com/riverqueue/river/rivertype v0.42.0 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tidwall/gjson v1.19.0 // indirect
