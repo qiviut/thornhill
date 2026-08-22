@@ -10,7 +10,7 @@ This is an authority and history contract, not a transcript-mirroring scheme. It
 
 ## Why this is needed
 
-Today Thornhill persists a job's Hermes session and run IDs, but its event bus has only a local sequence and job ID. The bridge's structured approval event does not carry a Hermes approval identity; Thornhill currently creates its own approval ID and decision nonce after receipt. That leaves no shared durable key for an approval request, invalidation, decision acknowledgement, or replay.
+Today Thornhill persists a job's Hermes session and run IDs. The bridge now carries a provider `request_id` when Hermes supplies one and sends that identity back with a durable local idempotency key when resolving an approval. The implementation still lacks the full attempt/approval identity envelope, monotonic sequence, invalidation/acknowledgement events, and deduplicating inbox described below; the local request ID is therefore a bounded reconciliation aid, not the completed cross-system contract.
 
 The result is an avoidable ambiguity boundary: a duplicate, delayed, restored, or cross-run approval event can look like a new actionable request even when its Hermes wait is gone. The design below removes that ambiguity rather than trying to infer linkage from timestamps, titles, command text, descriptions, or event order observed by one transport.
 

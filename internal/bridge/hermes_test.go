@@ -1545,3 +1545,80 @@ func TestApprovalNonceSurvivesPersistenceButNeverPublication(t *testing.T) {
 		t.Fatal("Redacted mutated the source approval")
 	}
 }
+
+func TestHandleApprovalRequestPersistsProviderRequestID(t *testing.T) {
+	const jobID = "job-provider-request"
+	const runID = "run-provider-request"
+	fs := &fakeStore{jobs: map[string]store.Job{
+		jobID: {
+			ID: jobID, DisplayName: "Provider request", Task: "test", Status: store.StatusRunning,
+			HermesRunID: runID,
+		},
+	}, permanent: map[string]bool{}}
+	h := NewHermes("http://127.0.0.1:1", "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+
+	if err := h.handleApprovalRequest(context.Background(), jobID, runID, runEvent{
+		RequestID:   "approval_1",
+		Command:     "systemctl restart demo",
+		PatternKeys: []string{"service restart"},
+	}); err != nil {
+		t.Fatalf("handle approval request: %v", err)
+	}
+	j, err := fs.ResolveJob(context.Background(), jobID)
+	if err != nil || len(j.Approvals) != 1 {
+		t.Fatalf("persisted approvals = %+v, err=%v", j.Approvals, err)
+	}
+	if got := j.Approvals[0].ProviderRequestID; got != "approval_1" {
+		t.Fatalf("provider request ID = %q", got)
+	}
+}
+
+func TestPostApprovalSendsCorrelationAndIdempotencyKey(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/runs/run_1/approval" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode approval payload: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"resolved": 1, "request_id": "approval_1", "idempotency_key": "local_1"})
+	}))
+	defer server.Close()
+
+	h := NewHermes(server.URL, "", "hermes-agent", &fakeStore{}, events.NewBus(nil, testLog()), testLog())
+	if err := h.postApproval(context.Background(), "run_1", "once", false, "approval_1", "local_1"); err != nil {
+		t.Fatalf("post approval: %v", err)
+	}
+	if payload["request_id"] != "approval_1" || payload["idempotency_key"] != "local_1" {
+		t.Fatalf("approval payload = %#v", payload)
+	}
+}
+
+func TestDoJSONPreservesHermesAPIErrorEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code": "approval_conflict", "message": "approval already resolved",
+				"details": map[string]any{"request_id": "approval_1"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	h := NewHermes(server.URL, "", "hermes-agent", &fakeStore{}, events.NewBus(nil, testLog()), testLog())
+	err := h.doJSON(context.Background(), http.MethodPost, "/v1/runs/run_1/approval", map[string]any{"choice": "once"}, nil)
+	apiErr, ok := err.(*hermesAPIError)
+	if !ok {
+		t.Fatalf("error type = %T, want *hermesAPIError", err)
+	}
+	if apiErr.StatusCode != http.StatusConflict || apiErr.Code != "approval_conflict" || apiErr.Message != "approval already resolved" {
+		t.Fatalf("structured API error = %+v", apiErr)
+	}
+	if apiErr.Details["request_id"] != "approval_1" {
+		t.Fatalf("API error details = %#v", apiErr.Details)
+	}
+}

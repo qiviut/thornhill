@@ -43,6 +43,24 @@ func (e *noRetryError) Unwrap() error { return e.err }
 func (e *noRetryError) NoRetry()      {}
 func noRetry(err error) error         { return &noRetryError{err: err} }
 
+// hermesAPIError preserves the structured error code and reconciliation
+// details returned by the Runs API. Callers must use the code only to choose a
+// safe local disposition; an approval error is never permission to retry a
+// decision automatically.
+type hermesAPIError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Details    map[string]any
+}
+
+func (e *hermesAPIError) Error() string {
+	if e.Code == "" {
+		return fmt.Sprintf("Hermes http %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("Hermes http %d (%s): %s", e.StatusCode, e.Code, e.Message)
+}
+
 type approvalLock struct {
 	mu   sync.Mutex
 	refs int
@@ -174,6 +192,7 @@ type sessionMessages struct {
 type runEvent struct {
 	Event          string   `json:"event"`
 	RunID          string   `json:"run_id"`
+	RequestID      string   `json:"request_id"`
 	Tool           string   `json:"tool"`
 	Preview        string   `json:"preview"`
 	Delta          string   `json:"delta"`
@@ -909,7 +928,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		keys = []string{ev.PatternKey}
 	}
 	approval := store.Approval{
-		ID: store.NewULID(), DecisionNonce: store.NewULID(), State: store.ApprovalStatePending,
+		ID: store.NewULID(), ProviderRequestID: ev.RequestID, DecisionNonce: store.NewULID(), State: store.ApprovalStatePending,
 		Command: ev.Command, Description: ev.Description, PatternKeys: keys,
 		AllowPermanent: ev.AllowPermanent, RequestedAt: time.Now().UTC(),
 	}
@@ -919,7 +938,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		return err
 	}
 	if len(existing.Approvals) > 0 {
-		denyErr := h.postApproval(ctx, runID, "deny", true)
+		denyErr := h.postApproval(ctx, runID, "deny", true, "", "")
 		h.stopRun(runID)
 		transitioned := false
 		j, _ := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
@@ -940,7 +959,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 	}
 
 	if matched := h.matchesSessionDenial(jobID, keys); matched != "" {
-		if err := h.postApproval(ctx, runID, "deny", true); err != nil {
+		if err := h.postApproval(ctx, runID, "deny", true, ev.RequestID, ev.RequestID); err != nil {
 			h.stopRun(runID)
 			return noRetry(fmt.Errorf("automatic session deny was indeterminate; run stopped: %w", err))
 		}
@@ -954,7 +973,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		return err
 	}
 	if matched != "" {
-		if err := h.postApproval(ctx, runID, "deny", true); err != nil {
+		if err := h.postApproval(ctx, runID, "deny", true, ev.RequestID, ev.RequestID); err != nil {
 			h.stopRun(runID)
 			return noRetry(fmt.Errorf("automatic permanent deny was indeterminate; run stopped: %w", err))
 		}
@@ -964,7 +983,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		return nil
 	}
 	if matched := h.matchesSessionAllow(jobID, keys); matched != "" {
-		if err := h.postApproval(ctx, runID, "once", false); err != nil {
+		if err := h.postApproval(ctx, runID, "once", false, ev.RequestID, ev.RequestID); err != nil {
 			h.stopRun(runID)
 			return noRetry(fmt.Errorf("automatic session allow was indeterminate; run stopped and will not retry: %w", err))
 		}
@@ -982,7 +1001,7 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		if !ev.AllowPermanent {
 			// The current request explicitly forbids permanent grants; do not
 			// reuse a standing allow even when its exact pattern set matches.
-		} else if err := h.postApproval(ctx, runID, "once", false); err != nil {
+		} else if err := h.postApproval(ctx, runID, "once", false, ev.RequestID, ev.RequestID); err != nil {
 			h.stopRun(runID)
 			return noRetry(fmt.Errorf("automatic permanent allow was indeterminate; run stopped and will not retry: %w", err))
 		} else {
@@ -1143,19 +1162,65 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	// deny-session/always records future policy locally; it must not deny an
 	// unseen concurrent request. Collision handling is the only deny-all path.
 	approvalRunID := j.HermesRunID
-	if err := h.postApproval(ctx, approvalRunID, apiChoice, false); err != nil {
-		h.stopRun(approvalRunID)
+	if resolutionErr := h.postApproval(ctx, approvalRunID, apiChoice, false, current.ProviderRequestID, current.ID); resolutionErr != nil {
+		var apiErr *hermesAPIError
+		_ = errors.As(resolutionErr, &apiErr)
+		runTerminal := false
+		if apiErr != nil {
+			if status, ok := apiErr.Details["run_status"].(string); ok {
+				runTerminal = status == "completed" || status == "failed" || status == "cancelled"
+			}
+		}
+		var stopErr error
+		if !runTerminal {
+			stopErr = h.stopRun(approvalRunID)
+		}
+		stopConfirmed := runTerminal || stopErr == nil
+		if !stopConfirmed {
+			var stopAPI *hermesAPIError
+			if errors.As(stopErr, &stopAPI) && stopAPI.Code == "run_not_found" {
+				// A disappeared upstream run is already unable to execute the
+				// unacknowledged decision; clearing the cleanup handle is safe.
+				stopConfirmed = true
+			}
+		}
+
+		message := "approval response was indeterminate; no allow/deny decision was inferred or retried, and the run was stopped. Resume this job to inspect current state and request a fresh approval"
+		if apiErr != nil && (apiErr.Code == "approval_not_pending" || apiErr.Code == "approval_request_mismatch") {
+			message = "Hermes reported that this approval was no longer pending; this attempt was not acknowledged, no allow/deny decision was inferred or retried, and the run was stopped. Resume this job to inspect current state and request a fresh approval"
+		}
+		if runTerminal {
+			message = "Hermes reported that this approval was no longer pending and the upstream run was already terminal; no allow/deny decision was inferred or retried. Resume this job to inspect current state and request a fresh approval"
+		}
+		message += ": " + resolutionErr.Error()
+		if stopErr != nil && !stopConfirmed {
+			message += "; upstream stop could not be confirmed and the retained run ID remains a cleanup obligation: " + stopErr.Error()
+		}
+
 		transitioned := false
-		j, _ = h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
+		updated, updateErr := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
 			if runOwnsState(x, approvalRunID) {
 				x.Status = store.StatusFailed
-				x.Error = "approval response was indeterminate; the run was stopped and the decision will not be retried: " + err.Error()
+				x.Error = message
+				x.Progress = &store.Progress{
+					Tool:      "approval",
+					State:     store.ApprovalStateIndeterminate,
+					Label:     "approval outcome was not acknowledged; no decision was retried; resume requires fresh approval",
+					UpdatedAt: time.Now().UTC(),
+				}
+				if stopConfirmed {
+					x.HermesRunID = ""
+				}
 				if len(x.Approvals) > 0 {
 					x.Approvals[0].State = store.ApprovalStateIndeterminate
 				}
 				transitioned = true
 			}
 		})
+		if updateErr != nil {
+			return j, fmt.Errorf("persist indeterminate approval outcome: %w", updateErr)
+		}
+		j = updated
 		if transitioned {
 			h.Bus.Publish(events.KindJobFailed, jobID, j)
 		} else {
@@ -1222,7 +1287,7 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	return j, nil
 }
 
-func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolveAll bool) error {
+func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolveAll bool, requestID, idempotencyKey string) error {
 	controlTimeout := h.ApprovalControlTimeout
 	if controlTimeout <= 0 {
 		controlTimeout = defaultApprovalControlTimeout
@@ -1230,11 +1295,21 @@ func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolve
 	controlCtx, cancel := context.WithTimeout(ctx, controlTimeout)
 	defer cancel()
 	var out struct {
-		Resolved int `json:"resolved"`
+		Resolved       int    `json:"resolved"`
+		RequestID      string `json:"request_id"`
+		IdempotencyKey string `json:"idempotency_key"`
+		Replayed       bool   `json:"replayed"`
+	}
+	payload := map[string]any{"choice": choice, "resolve_all": resolveAll}
+	if requestID != "" {
+		payload["request_id"] = requestID
+	}
+	if idempotencyKey != "" {
+		payload["idempotency_key"] = idempotencyKey
 	}
 	if err := h.doJSON(controlCtx, http.MethodPost,
 		"/v1/runs/"+url.PathEscape(runID)+"/approval",
-		map[string]any{"choice": choice, "resolve_all": resolveAll}, &out); err != nil {
+		payload, &out); err != nil {
 		return fmt.Errorf("resolve Hermes approval: %w", err)
 	}
 	if out.Resolved != 1 && !resolveAll {
@@ -1277,7 +1352,20 @@ func (h *Hermes) doJSON(ctx context.Context, method, path string, body any, out 
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("Hermes http %d: %s", resp.StatusCode, string(b))
+		apiErr := &hermesAPIError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(b))}
+		var envelope struct {
+			Error struct {
+				Code    string         `json:"code"`
+				Message string         `json:"message"`
+				Details map[string]any `json:"details"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(b, &envelope) == nil && envelope.Error.Message != "" {
+			apiErr.Code = envelope.Error.Code
+			apiErr.Message = envelope.Error.Message
+			apiErr.Details = envelope.Error.Details
+		}
+		return apiErr
 	}
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {

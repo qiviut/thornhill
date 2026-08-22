@@ -212,18 +212,20 @@ type PushDelivery struct {
 }
 
 // Approval is a redacted, user-visible authority request from Hermes. The
-// Runs API resolves approvals FIFO, so callers may decide only the first entry.
+// provider request ID binds a local record to one in-memory Hermes wait; the
+// durable local ID is also used as the client idempotency key when resolving it.
 type Approval struct {
-	ID             string     `json:"id"`
-	DecisionNonce  string     `json:"decision_nonce"`
-	State          string     `json:"state"` // pending|sending|parked|indeterminate
-	Command        string     `json:"command,omitempty"`
-	Description    string     `json:"description,omitempty"`
-	PatternKeys    []string   `json:"pattern_keys,omitempty"`
-	AllowPermanent bool       `json:"allow_permanent"`
-	RequestedAt    time.Time  `json:"requested_at"`
-	ParkedAt       *time.Time `json:"parked_at,omitempty"`
-	ParkReason     string     `json:"park_reason,omitempty"`
+	ID                string     `json:"id"`
+	ProviderRequestID string     `json:"provider_request_id,omitempty"`
+	DecisionNonce     string     `json:"decision_nonce"`
+	State             string     `json:"state"` // pending|sending|parked|indeterminate
+	Command           string     `json:"command,omitempty"`
+	Description       string     `json:"description,omitempty"`
+	PatternKeys       []string   `json:"pattern_keys,omitempty"`
+	AllowPermanent    bool       `json:"allow_permanent"`
+	RequestedAt       time.Time  `json:"requested_at"`
+	ParkedAt          *time.Time `json:"parked_at,omitempty"`
+	ParkReason        string     `json:"park_reason,omitempty"`
 }
 
 // Redacted returns a copy safe to publish on the bus and into the durable event
