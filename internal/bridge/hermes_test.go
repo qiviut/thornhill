@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -420,6 +421,80 @@ func TestNeedsInputResumeCannotDeleteNewHermesOwnership(t *testing.T) {
 	got, _ := fs.ResolveJob(context.Background(), jobID)
 	if got.Status != store.StatusCancelled {
 		t.Fatalf("cancellation was overwritten: %+v", got)
+	}
+}
+
+func TestCancelAndRunIDPublicationUseSameOwnershipLock(t *testing.T) {
+	const jobID = "cancel-run-id-publication"
+	stopEntered := make(chan struct{})
+	releaseStop := make(chan struct{})
+	var stopOnce sync.Once
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/runs/run-1/stop" {
+			http.NotFound(w, r)
+			return
+		}
+		stopOnce.Do(func() { close(stopEntered) })
+		<-releaseStop
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusRunning, HermesRunID: "run-1",
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	owner := &hermesRunOwner{cancel: runCancel, runID: "run-1"}
+	h.mu.Lock()
+	h.cancels[jobID] = owner
+	h.runIDs[jobID] = "run-1"
+	h.mu.Unlock()
+
+	cancelDone := make(chan struct{})
+	go func() {
+		h.Cancel(context.Background(), jobID)
+		close(cancelDone)
+	}()
+	select {
+	case <-stopEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not reach provider stop")
+	}
+
+	setterDone := make(chan struct{})
+	go func() {
+		defer close(setterDone)
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			default:
+			}
+			if !h.setRunID(jobID, owner, "run-1") {
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	close(releaseStop)
+
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not reach the current owner")
+	}
+	select {
+	case <-cancelDone:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not return")
+	}
+	select {
+	case <-setterDone:
+	case <-time.After(time.Second):
+		t.Fatal("run-ID publisher did not stop")
 	}
 }
 

@@ -1665,14 +1665,21 @@ func (h *Hermes) ReleaseRun(ctx context.Context, jobID, runID string) error {
 	if err := h.stopAndConfirmTerminal(controlCtx, runID); err != nil {
 		return err
 	}
-	h.mu.Lock()
-	owner, owned := h.cancels[jobID]
-	owned = owned && owner.runID == runID && h.runIDs[jobID] == runID
-	h.mu.Unlock()
-	if owned && owner != nil {
-		owner.cancel()
-	}
+	h.cancelOwnedRun(jobID, runID)
 	return nil
+}
+
+func (h *Hermes) cancelOwnedRun(jobID, runID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	owner := h.cancels[jobID]
+	ownedRunID := h.runIDs[jobID]
+	if owner == nil || owner.runID != ownedRunID || (runID != "" && ownedRunID != runID) {
+		return
+	}
+	// Keep the ownership predicate and the cancellation side effect in one
+	// critical section. setRunID and deferred cleanup use the same lock.
+	owner.cancel()
 }
 
 func (h *Hermes) Cancel(ctx context.Context, jobID string) {
@@ -1687,18 +1694,12 @@ func (h *Hermes) Cancel(ctx context.Context, jobID string) {
 	unlockApproval := h.lockApproval(jobID, runID)
 	defer unlockApproval()
 
-	h.mu.Lock()
-	ownedRunID := h.runIDs[jobID]
-	owner := h.cancels[jobID]
-	h.mu.Unlock()
 	if runID != "" {
 		stopCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = h.doJSON(stopCtx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil)
 		done()
 	}
-	if owner != nil && owner.runID == ownedRunID && (runID == "" || ownedRunID == runID) {
-		owner.cancel()
-	}
+	h.cancelOwnedRun(jobID, runID)
 }
 
 // HooksHandler ingests optional Hermes lifecycle hooks and mirrors them onto
