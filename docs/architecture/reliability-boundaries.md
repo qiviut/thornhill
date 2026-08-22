@@ -6,7 +6,9 @@ local simplifications can otherwise create duplicate work, implied consent, or a
 deployment that cannot safely roll back. Read
 [`security-model.md`](../security-model.md) alongside it for caller identity,
 route authority, exposure assumptions, retained-data inventory, and security claim
-status.
+status. The proposed future cross-system correlation contract is in
+[`hermes-session-correlation.md`](hermes-session-correlation.md); it is design-only
+and does not describe current runtime behavior.
 
 ## Durable job and run ownership
 
