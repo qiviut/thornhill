@@ -108,6 +108,42 @@ type fakeStore struct {
 	allows    map[string]bool
 }
 
+type failedSnapshotStore struct {
+	*fakeStore
+}
+
+// staleOrphanSnapshotStore models a cancellation winning after ActiveJobs
+// returned but before the reconciliation update acquired the row lock.
+type staleOrphanSnapshotStore struct {
+	*fakeStore
+}
+
+func (s *staleOrphanSnapshotStore) UpdateJob(ctx context.Context, id string, mut func(*store.Job)) (store.Job, error) {
+	s.mu.Lock()
+	if j, ok := s.jobs[id]; ok {
+		j.Status = store.StatusCancelled
+		j.StateVersion++
+		s.jobs[id] = j
+	}
+	s.mu.Unlock()
+	return s.fakeStore.UpdateJob(ctx, id, mut)
+}
+
+func (s *failedSnapshotStore) UpdateJob(ctx context.Context, id string, mut func(*store.Job)) (store.Job, error) {
+	j, err := s.fakeStore.UpdateJob(ctx, id, mut)
+	if err != nil || j.Status != store.StatusFailed {
+		return j, err
+	}
+	// Model a failure snapshot that still carries an in-flight authority record.
+	// The durable row is intentionally not changed; this isolates the event-bus
+	// redaction boundary from the worker's state transition.
+	j.Approvals = []store.Approval{{
+		ID: "approval-failure-snapshot", DecisionNonce: "nonce-must-not-be-published",
+		State: store.ApprovalStateSending,
+	}}
+	return j, nil
+}
+
 type initialResolveBarrierStore struct {
 	*fakeStore
 	mu      sync.Mutex
@@ -282,6 +318,127 @@ func TestCompletedEventCannotOverwriteCommittedCancellation(t *testing.T) {
 	}
 }
 
+func receiveFailedJobEvent(t *testing.T, ch <-chan events.Event, jobID string) store.Job {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case e := <-ch:
+			if e.Kind != events.KindJobFailed || e.JobID != jobID {
+				continue
+			}
+			var j store.Job
+			if err := json.Unmarshal(e.Payload, &j); err != nil {
+				t.Fatalf("decode failed job event: %v", err)
+			}
+			return j
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for failed job event for %s", jobID)
+			return store.Job{}
+		}
+	}
+}
+
+func assertRedactedFailureApproval(t *testing.T, failed store.Job) {
+	t.Helper()
+	if len(failed.Approvals) != 1 || failed.Approvals[0].State != store.ApprovalStateSending ||
+		failed.Approvals[0].DecisionNonce != "" {
+		t.Fatalf("failed event retained authority nonce: %+v", failed.Approvals)
+	}
+}
+
+func TestRunGenericFailureEventRedactsSendingApproval(t *testing.T) {
+	const jobID = "generic-failure-redaction"
+	streamClosed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			_, _ = io.WriteString(w, `{"run_id":"run-generic-failure-redaction","status":"started"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-generic-failure-redaction/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			close(streamClosed)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-generic-failure-redaction/stop":
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	bus := events.NewBus(nil, testLog())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventCh := bus.Subscribe(ctx, false)
+	fs := &failedSnapshotStore{fakeStore: &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Generic failure redaction", Task: "fail safely", Status: store.StatusQueued,
+	}}}}
+	h := NewHermes(server.URL, "", "m", fs, bus, testLog())
+	h.StreamIdleAfter = 15 * time.Millisecond
+	if err := h.Run(context.Background(), jobID); err == nil || !strings.Contains(err.Error(), "event stream silent") {
+		t.Fatalf("Run error = %v, want generic stream failure", err)
+	}
+	select {
+	case <-streamClosed:
+	case <-time.After(time.Second):
+		t.Fatal("generic-failure SSE response was not closed")
+	}
+	assertRedactedFailureApproval(t, receiveFailedJobEvent(t, eventCh, jobID))
+}
+
+func TestRunCancellationFailureEventRedactsSendingApproval(t *testing.T) {
+	const jobID = "cancel-failure-redaction"
+	started := make(chan struct{})
+	var startOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			_, _ = io.WriteString(w, `{"run_id":"run-cancel-failure-redaction","status":"started"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-cancel-failure-redaction/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			startOnce.Do(func() { close(started) })
+			<-r.Context().Done()
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-cancel-failure-redaction/stop":
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	bus := events.NewBus(nil, testLog())
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	eventCh := bus.Subscribe(eventCtx, false)
+	fs := &failedSnapshotStore{fakeStore: &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Cancellation failure redaction", Task: "cancel safely", Status: store.StatusQueued,
+	}}}}
+	h := NewHermes(server.URL, "", "m", fs, bus, testLog())
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- h.Run(runCtx, jobID) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Hermes event stream did not start")
+	}
+	cancelRun()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "context ended") {
+			t.Fatalf("Run error = %v, want cancellation failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled Run did not return")
+	}
+	assertRedactedFailureApproval(t, receiveFailedJobEvent(t, eventCh, jobID))
+}
+
 func TestSilentEventStreamStopsRunAndReleasesResources(t *testing.T) {
 	const jobID = "silent-stream"
 	streamClosed := make(chan struct{})
@@ -377,6 +534,18 @@ func (s *fakeStore) ActiveJobs(_ context.Context) ([]store.Job, error) {
 	out := make([]store.Job, 0, len(s.jobs))
 	for _, j := range s.jobs {
 		if j.Status == store.StatusQueued || j.Status == store.StatusRunning || j.Status == store.StatusNeedsInput || j.Status == store.StatusNeedsApproval || j.Status == store.StatusParkedApproval {
+			out = append(out, cloneJob(j))
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) UnresolvedRunJobs(_ context.Context) ([]store.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]store.Job, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		if j.Status == store.StatusFailed && j.HermesRunID != "" {
 			out = append(out, cloneJob(j))
 		}
 	}
@@ -732,7 +901,7 @@ func TestSilentApprovalParksWithoutDecisionAndReleasesExecutionResources(t *test
 	const jobID = "job-silent-approval"
 	streamClosed := make(chan struct{})
 	var mu sync.Mutex
-	var approvalCalls, stopCalls int
+	var approvalCalls, stopCalls, statusCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
@@ -744,6 +913,14 @@ func TestSilentApprovalParksWithoutDecisionAndReleasesExecutionResources(t *test
 			w.(http.Flusher).Flush()
 			<-r.Context().Done()
 			close(streamClosed)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-silent":
+			w.Header().Set("Content-Type", "application/json")
+			statusCalls++
+			if statusCalls == 1 {
+				_, _ = io.WriteString(w, `{"run_id":"run-silent","status":"running","last_event":"tool.started"}`)
+			} else {
+				_, _ = io.WriteString(w, `{"run_id":"run-silent","status":"cancelled","last_event":"run.cancelled"}`)
+			}
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/approval"):
 			mu.Lock()
 			approvalCalls++
@@ -802,16 +979,22 @@ func TestSilentApprovalParksWithoutDecisionAndReleasesExecutionResources(t *test
 func TestPermanentDenyAutoResolvesExactPattern(t *testing.T) {
 	const jobID = "job-deny"
 	var gotChoice string
+	var gotResolveAll bool
+	var gotRequestID string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/runs/run_deny/approval" {
 			http.NotFound(w, r)
 			return
 		}
 		var body struct {
-			Choice string `json:"choice"`
+			Choice     string `json:"choice"`
+			ResolveAll bool   `json:"resolve_all"`
+			RequestID  string `json:"request_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		gotChoice = body.Choice
+		gotResolveAll = body.ResolveAll
+		gotRequestID = body.RequestID
 		_, _ = io.WriteString(w, `{"resolved":1}`)
 	}))
 	defer server.Close()
@@ -820,17 +1003,150 @@ func TestPermanentDenyAutoResolvesExactPattern(t *testing.T) {
 	bus := events.NewBus(nil, testLog())
 	h := NewHermes(server.URL, "", "hermes-agent", fs, bus, testLog())
 	err := h.handleApprovalRequest(context.Background(), jobID, "run_deny", runEvent{
-		Command: "rm -rf build", Description: "delete build", PatternKeys: []string{"recursive delete"},
+		RequestID: "provider-deny-1", Command: "rm -rf build", Description: "delete build", PatternKeys: []string{"recursive delete"},
 	})
 	if err != nil {
 		t.Fatalf("handle approval: %v", err)
 	}
-	if gotChoice != "deny" {
-		t.Fatalf("choice = %q, want deny", gotChoice)
+	if gotChoice != "deny" || gotResolveAll || gotRequestID != "provider-deny-1" {
+		t.Fatalf("automatic denial payload = choice:%q resolve_all:%t request_id:%q", gotChoice, gotResolveAll, gotRequestID)
 	}
 	j, _ := fs.ResolveJob(context.Background(), jobID)
 	if j.Status != store.StatusRunning || len(j.Approvals) != 0 {
 		t.Fatalf("auto-denied request became pending: %+v", j)
+	}
+}
+
+func TestAutomaticDenialFailureReconcilesTerminalWithoutStop(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		decision string
+		setup    func(*Hermes, *fakeStore, string, string)
+	}{
+		{
+			name:     "session",
+			decision: DecisionDenySession,
+			setup: func(h *Hermes, _ *fakeStore, jobID, patternHash string) {
+				h.mu.Lock()
+				h.sessionDenials[jobID] = map[string]struct{}{patternHash: {}}
+				h.mu.Unlock()
+			},
+		},
+		{
+			name:     "permanent",
+			decision: DecisionDenyAlways,
+			setup: func(_ *Hermes, fs *fakeStore, _ string, patternHash string) {
+				fs.permanent[patternHash] = true
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const jobID = "job-auto-terminal"
+			const runID = "run-auto-terminal"
+			var approvalCalls, stopCalls, statusCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/"+runID+"/approval":
+					approvalCalls.Add(1)
+					http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/"+runID:
+					statusCalls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"run_id":"`+runID+`","status":"completed","last_event":"run.completed"}`)
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/"+runID+"/stop":
+					stopCalls.Add(1)
+					_, _ = io.WriteString(w, `{}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			keys := []string{"automatic-risk"}
+			patternHash := store.ApprovalPatternHash(keys)
+			fs := &fakeStore{
+				jobs: map[string]store.Job{jobID: {
+					ID: jobID, DisplayName: "Automatic terminal race", Status: store.StatusRunning,
+					HermesRunID: runID,
+				}},
+				permanent: map[string]bool{},
+			}
+			h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+			if tc.name == "permanent" {
+				patternHash = store.ApprovalPatternHash([]string{"@hermes-instance:" + server.URL, "automatic-risk"})
+			}
+			tc.setup(h, fs, jobID, patternHash)
+
+			err := h.handleApprovalRequest(context.Background(), jobID, runID, runEvent{
+				RequestID: "provider-auto-terminal", Command: "controlled action", PatternKeys: keys,
+			})
+			if err == nil || !strings.Contains(err.Error(), "indeterminate") || !strings.Contains(err.Error(), "no allow or deny was inferred") {
+				t.Fatalf("error = %v", err)
+			}
+			if approvalCalls.Load() != 1 || statusCalls.Load() != 1 || stopCalls.Load() != 0 {
+				t.Fatalf("calls approval=%d status=%d stop=%d", approvalCalls.Load(), statusCalls.Load(), stopCalls.Load())
+			}
+			got, _ := fs.ResolveJob(context.Background(), jobID)
+			if got.Status != store.StatusFailed || got.HermesRunID != "" || len(got.Approvals) != 1 ||
+				got.Approvals[0].State != store.ApprovalStateIndeterminate || got.Approvals[0].Decision != tc.decision ||
+				got.Approvals[0].ProviderRequestID != "provider-auto-terminal" {
+				t.Fatalf("durable automatic outcome = %+v", got)
+			}
+		})
+	}
+}
+
+func TestAutomaticCollisionFailureDoesNotInferDenial(t *testing.T) {
+	t.Parallel()
+	const (
+		jobID = "job-auto-collision"
+		runID = "run-auto-collision"
+	)
+	var approvalCalls, statusCalls, stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/"+runID+"/approval":
+			approvalCalls.Add(1)
+			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/"+runID:
+			statusCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run_id":"`+runID+`","status":"completed","last_event":"run.completed"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/"+runID+"/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Automatic collision", Status: store.StatusRunning, HermesRunID: runID,
+		Approvals: []store.Approval{
+			{ID: "existing-1", ProviderRequestID: "provider-1", DecisionNonce: "nonce-1", State: store.ApprovalStatePending},
+			{ID: "existing-2", ProviderRequestID: "provider-2", DecisionNonce: "nonce-2", State: store.ApprovalStatePending},
+		},
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	err := h.handleApprovalRequest(context.Background(), jobID, runID, runEvent{
+		RequestID: "provider-3", Command: "concurrent action", PatternKeys: []string{"automatic-collision"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "indeterminate") || !strings.Contains(err.Error(), "no allow or deny was inferred") {
+		t.Fatalf("error = %v", err)
+	}
+	if approvalCalls.Load() != 1 || statusCalls.Load() != 1 || stopCalls.Load() != 0 {
+		t.Fatalf("calls approval=%d status=%d stop=%d", approvalCalls.Load(), statusCalls.Load(), stopCalls.Load())
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusFailed || got.HermesRunID != "" || len(got.Approvals) != 2 {
+		t.Fatalf("durable collision outcome = %+v", got)
+	}
+	for _, approval := range got.Approvals {
+		if approval.State != store.ApprovalStateIndeterminate || approval.Decision != DecisionDenyAlways {
+			t.Fatalf("collision approval was not fenced: %+v", approval)
+		}
 	}
 }
 
@@ -852,11 +1168,22 @@ func TestReconcileOrphansPreservesDurableNeedsInput(t *testing.T) {
 
 func TestReconcileOrphansReleasesStaleNeedsInputRun(t *testing.T) {
 	t.Parallel()
-	var stopCalls int
+	var stopCalls, statusCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/stop") {
-			stopCalls++
-			w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-stale-input" {
+			statusCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if statusCalls.Load() == 1 {
+				_, _ = io.WriteString(w, `{"run_id":"run-stale-input","status":"running","last_event":"input.request"}`)
+			} else {
+				_, _ = io.WriteString(w, `{"run_id":"run-stale-input","status":"cancelled","last_event":"run.cancelled"}`)
+			}
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stale-input/stop" {
+			stopCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run_id":"run-stale-input","status":"stopping"}`)
 			return
 		}
 		http.NotFound(w, r)
@@ -875,15 +1202,307 @@ func TestReconcileOrphansReleasesStaleNeedsInputRun(t *testing.T) {
 	if got.Status != store.StatusNeedsInput || got.Question != "Which target?" || got.HermesRunID != "" {
 		t.Fatalf("stale input cleanup changed durable state: %+v", got)
 	}
-	if stopCalls != 1 {
-		t.Fatalf("stop calls = %d, want 1", stopCalls)
+	if stopCalls.Load() != 1 || statusCalls.Load() != 2 {
+		t.Fatalf("stop calls = %d, status calls = %d, want stop=1 status=2", stopCalls.Load(), statusCalls.Load())
+	}
+}
+
+func TestReconcileOrphansSkipsStopForTerminalNeedsInputRun(t *testing.T) {
+	t.Parallel()
+	var stopCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-terminal-input" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run_id":"run-terminal-input","status":"completed","last_event":"run.completed"}`)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-terminal-input/stop" {
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	const jobID = "01J0000000000000000000000NT"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusNeedsInput, Question: "Which target?", HermesRunID: "run-terminal-input",
+	}}}
+	h := NewHermes(srv.URL, "", "m", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusNeedsInput || got.Question != "Which target?" || got.HermesRunID != "" {
+		t.Fatalf("terminal input cleanup changed durable state: %+v", got)
+	}
+	if stopCalls.Load() != 0 {
+		t.Fatalf("terminal run received %d redundant stop calls", stopCalls.Load())
+	}
+}
+
+func TestReconcileOrphansRequiresTerminalProofForActiveRun(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		initial      string
+		final        string
+		stopStatus   int
+		wantStops    int32
+		wantStatuses int32
+		wantRunID    string
+		wantEvidence string
+	}{
+		{name: "live cleanup confirmed", initial: "running", final: "completed", stopStatus: http.StatusOK, wantStops: 1, wantStatuses: 2, wantEvidence: "cleanup was confirmed"},
+		{name: "already terminal", initial: "completed", stopStatus: http.StatusOK, wantStatuses: 1, wantEvidence: "cleanup was confirmed"},
+		{name: "stop failure retains handle", initial: "running", final: "running", stopStatus: http.StatusBadGateway, wantStops: 1, wantStatuses: 2, wantRunID: "run-orphan-proof", wantEvidence: "cleanup was not confirmed"},
+		{name: "nonterminal followup retains handle", initial: "running", final: "stopping", stopStatus: http.StatusOK, wantStops: 1, wantStatuses: 2, wantRunID: "run-orphan-proof", wantEvidence: "cleanup was not confirmed"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var stopCalls, statusCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-orphan-proof" {
+					call := statusCalls.Add(1)
+					status := tc.initial
+					if call > 1 && tc.final != "" {
+						status = tc.final
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"run_id":"run-orphan-proof","status":%q,"last_event":"run.state"}`, status)
+					return
+				}
+				if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-orphan-proof/stop" {
+					stopCalls.Add(1)
+					if tc.stopStatus != http.StatusOK {
+						w.WriteHeader(tc.stopStatus)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"run_id":"run-orphan-proof","status":"stopping"}`)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+
+			const jobID = "job-orphan-proof"
+			fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+				ID: jobID, Status: store.StatusRunning, HermesRunID: "run-orphan-proof",
+			}}}
+			h := NewHermes(server.URL, "", "m", fs, events.NewBus(nil, testLog()), testLog())
+			if err := h.ReconcileOrphans(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := fs.ResolveJob(context.Background(), jobID)
+			if got.Status != store.StatusFailed || got.HermesRunID != tc.wantRunID || !strings.Contains(got.Error, tc.wantEvidence) {
+				t.Fatalf("orphan cleanup outcome = %+v", got)
+			}
+			if stopCalls.Load() != tc.wantStops || statusCalls.Load() != tc.wantStatuses {
+				t.Fatalf("stop calls = %d, status calls = %d, want stop=%d status=%d", stopCalls.Load(), statusCalls.Load(), tc.wantStops, tc.wantStatuses)
+			}
+		})
+	}
+}
+
+func TestReconcileOrphansRetriesFailedRetainedRun(t *testing.T) {
+	t.Parallel()
+	var statusCalls, stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-failed-retained" {
+			call := statusCalls.Add(1)
+			status := "running"
+			if call > 2 {
+				status = "completed"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"run_id":"run-failed-retained","status":%q}`, status)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-failed-retained/stop" {
+			stopCalls.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	const jobID = "job-failed-retained"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusFailed, HermesRunID: "run-failed-retained",
+	}}}
+	h := NewHermes(server.URL, "", "m", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := fs.ResolveJob(context.Background(), jobID)
+	if first.Status != store.StatusFailed || first.HermesRunID != "run-failed-retained" {
+		t.Fatalf("failed cleanup obligation was cleared prematurely: %+v", first)
+	}
+
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := fs.ResolveJob(context.Background(), jobID)
+	if second.Status != store.StatusFailed || second.HermesRunID != "" {
+		t.Fatalf("terminal proof did not clear failed cleanup handle: %+v", second)
+	}
+	if statusCalls.Load() != 3 || stopCalls.Load() != 1 {
+		t.Fatalf("status calls = %d, stop calls = %d, want status=3 stop=1", statusCalls.Load(), stopCalls.Load())
+	}
+}
+
+func TestAutomaticCollisionCleanupFailureRetainsRunForReconciliation(t *testing.T) {
+	t.Parallel()
+	const (
+		jobID = "job-auto-collision-cleanup"
+		runID = "run-auto-collision-cleanup"
+	)
+	var statusCalls, stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/"+runID+"/approval":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"resolved":2}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/"+runID:
+			call := statusCalls.Add(1)
+			status := "running"
+			if call > 2 {
+				status = "completed"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"run_id":%q,"status":%q}`, runID, status)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/"+runID+"/stop":
+			stopCalls.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Automatic collision", Status: store.StatusRunning, HermesRunID: runID,
+		Approvals: []store.Approval{
+			{ID: "existing-1", ProviderRequestID: "provider-1", DecisionNonce: "nonce-1", State: store.ApprovalStatePending},
+			{ID: "existing-2", ProviderRequestID: "provider-2", DecisionNonce: "nonce-2", State: store.ApprovalStatePending},
+		},
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.handleApprovalRequest(context.Background(), jobID, runID, runEvent{RequestID: "provider-3"}); err == nil || !strings.Contains(err.Error(), "cleanup was not confirmed") {
+		t.Fatalf("collision cleanup error = %v", err)
+	}
+	failed, _ := fs.ResolveJob(context.Background(), jobID)
+	if failed.Status != store.StatusFailed || failed.HermesRunID != runID || len(failed.Approvals) != 0 {
+		t.Fatalf("collision failure lost cleanup handle: %+v", failed)
+	}
+
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, _ := fs.ResolveJob(context.Background(), jobID)
+	if cleaned.HermesRunID != "" || statusCalls.Load() != 3 || stopCalls.Load() != 1 {
+		t.Fatalf("collision cleanup was not recovered: job=%+v status_calls=%d stop_calls=%d", cleaned, statusCalls.Load(), stopCalls.Load())
+	}
+}
+
+func TestReconcileOrphansDoesNotOverwriteNewerCancellation(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-stale-snapshot" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run_id":"run-stale-snapshot","status":"completed","last_event":"run.completed"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	const jobID = "job-stale-orphan-snapshot"
+	fs := &staleOrphanSnapshotStore{fakeStore: &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusRunning, HermesRunID: "run-stale-snapshot", StateVersion: 7,
+	}}}}
+	bus := events.NewBus(nil, testLog())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventCh := bus.Subscribe(ctx, false)
+	h := NewHermes(server.URL, "", "m", fs, bus, testLog())
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusCancelled {
+		t.Fatalf("newer cancellation was overwritten: %+v", got)
+	}
+	select {
+	case event := <-eventCh:
+		t.Fatalf("stale reconciliation published an event: %+v", event)
+	default:
+	}
+}
+
+func TestReconcileOrphansRedactsSendingApprovalEvent(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-redacted-orphan" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run_id":"run-redacted-orphan","status":"completed","last_event":"run.completed"}`)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-redacted-orphan/stop" {
+			t.Errorf("terminal orphan received redundant stop")
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	const jobID = "job-redacted-orphan"
+	const nonce = "nonce-must-not-be-published"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusRunning, HermesRunID: "run-redacted-orphan",
+		Approvals: []store.Approval{{ID: "approval-redacted", DecisionNonce: nonce, State: store.ApprovalStateSending}},
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bus := events.NewBus(nil, testLog())
+	eventCh := bus.Subscribe(ctx, false)
+	h := NewHermes(server.URL, "", "m", fs, bus, testLog())
+	if err := h.ReconcileOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e := <-eventCh
+	if e.Kind != events.KindJobFailed || e.JobID != jobID {
+		t.Fatalf("event = %+v", e)
+	}
+	var published store.Job
+	if err := json.Unmarshal(e.Payload, &published); err != nil {
+		t.Fatalf("decode published job: %v", err)
+	}
+	if len(published.Approvals) != 1 || published.Approvals[0].DecisionNonce != "" {
+		t.Fatalf("published job retained approval nonce: %+v", published.Approvals)
+	}
+	stored, _ := fs.ResolveJob(context.Background(), jobID)
+	if stored.Approvals[0].DecisionNonce != nonce || stored.Approvals[0].State != store.ApprovalStateIndeterminate {
+		t.Fatalf("durable approval was not preserved separately: %+v", stored.Approvals)
 	}
 }
 
 func TestReconcileOrphansFinishesParkedRunCleanupWithoutChangingDecision(t *testing.T) {
 	t.Parallel()
-	var stopCalls int
+	var stopCalls, statusCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-cleanup" {
+			w.Header().Set("Content-Type", "application/json")
+			statusCalls++
+			if statusCalls == 1 {
+				_, _ = io.WriteString(w, `{"run_id":"run-cleanup","status":"running","last_event":"approval.request"}`)
+			} else {
+				_, _ = io.WriteString(w, `{"run_id":"run-cleanup","status":"cancelled","last_event":"run.cancelled"}`)
+			}
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/stop") {
 			stopCalls++
 			w.Header().Set("Content-Type", "application/json")
@@ -914,8 +1533,18 @@ func TestReconcileOrphansFinishesParkedRunCleanupWithoutChangingDecision(t *test
 
 func TestReconcileOrphansParksApprovalAndReclaimsRiverDelivery(t *testing.T) {
 	t.Parallel()
-	var stopCalls int
+	var stopCalls, statusCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-restart" {
+			w.Header().Set("Content-Type", "application/json")
+			statusCalls++
+			if statusCalls == 1 {
+				_, _ = io.WriteString(w, `{"run_id":"run-restart","status":"running","last_event":"approval.request"}`)
+			} else {
+				_, _ = io.WriteString(w, `{"run_id":"run-restart","status":"cancelled","last_event":"run.cancelled"}`)
+			}
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/stop") {
 			stopCalls++
 		}
@@ -1123,8 +1752,18 @@ func TestLoadSessionHistoryKeepsNewestMessagesWithinByteBound(t *testing.T) {
 
 func TestOrphanedApprovalDecisionParksWithoutAuthorityCall(t *testing.T) {
 	t.Parallel()
-	var approvalCalls, stopCalls int
+	var approvalCalls, stopCalls, statusCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-orphan" {
+			w.Header().Set("Content-Type", "application/json")
+			statusCalls++
+			if statusCalls == 1 {
+				_, _ = io.WriteString(w, `{"run_id":"run-orphan","status":"running","last_event":"approval.request"}`)
+			} else {
+				_, _ = io.WriteString(w, `{"run_id":"run-orphan","status":"cancelled","last_event":"run.cancelled"}`)
+			}
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/approval") {
 			approvalCalls++
 		}
@@ -1303,6 +1942,309 @@ func TestApprovalDecisionFailClosedOnIndeterminatePOST(t *testing.T) {
 	defer mu.Unlock()
 	if calls["/v1/runs/run-indeterminate/approval"] != 1 || calls["/v1/runs/run-indeterminate/stop"] != 1 {
 		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestIndeterminatePOSTDoesNotStopAlreadyTerminalRun(t *testing.T) {
+	t.Parallel()
+	var stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-terminal-indeterminate/approval":
+			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-terminal-indeterminate":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"run_id":"run-terminal-indeterminate","status":"completed","last_event":"run.completed"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-terminal-indeterminate/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	const jobID = "job-terminal-indeterminate"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusNeedsApproval, HermesRunID: "run-terminal-indeterminate",
+		Approvals: []store.Approval{{ID: "approval-terminal", DecisionNonce: "nonce-terminal", State: store.ApprovalStatePending}},
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	ownRun(h, jobID, "run-terminal-indeterminate")
+	_, err := h.DecideApproval(context.Background(), jobID, "approval-terminal", "nonce-terminal", DecisionAllowOnce)
+	if err == nil || !strings.Contains(err.Error(), "indeterminate") {
+		t.Fatalf("error = %v", err)
+	}
+	if stopCalls.Load() != 0 {
+		t.Fatalf("terminal run received %d redundant stop calls", stopCalls.Load())
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.HermesRunID != "" || len(got.Approvals) != 1 || got.Approvals[0].State != store.ApprovalStateIndeterminate ||
+		!strings.Contains(got.Error, "upstream was already terminal, so no stop was sent") {
+		t.Fatalf("terminal indeterminate job = %+v", got)
+	}
+}
+
+func TestIndeterminatePOSTStopAttemptTerminalAudit(t *testing.T) {
+	t.Parallel()
+	var stopCalls, statusCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stop-audit/approval":
+			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-stop-audit":
+			call := statusCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if call == 1 {
+				_, _ = io.WriteString(w, `{"run_id":"run-stop-audit","status":"running","last_event":"tool.started"}`)
+			} else {
+				_, _ = io.WriteString(w, `{"run_id":"run-stop-audit","status":"completed","last_event":"run.completed"}`)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stop-audit/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{"run_id":"run-stop-audit","status":"stopping"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	const jobID = "job-stop-audit"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusNeedsApproval, HermesRunID: "run-stop-audit",
+		Approvals: []store.Approval{{ID: "approval-stop-audit", DecisionNonce: "nonce-stop-audit", State: store.ApprovalStatePending}},
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	ownRun(h, jobID, "run-stop-audit")
+	_, err := h.DecideApproval(context.Background(), jobID, "approval-stop-audit", "nonce-stop-audit", DecisionAllowOnce)
+	if err == nil || !strings.Contains(err.Error(), "indeterminate") {
+		t.Fatalf("error = %v", err)
+	}
+	if stopCalls.Load() != 1 || statusCalls.Load() != 2 {
+		t.Fatalf("stop calls = %d, status calls = %d", stopCalls.Load(), statusCalls.Load())
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.HermesRunID != "" || !strings.Contains(got.Error, "stop request was accepted and terminal status was confirmed") || strings.Contains(got.Error, "upstream stop confirmed") {
+		t.Fatalf("stop-attempt audit = %+v", got)
+	}
+}
+
+func TestApprovalNotPendingReconcilesTerminalRunWithoutStoppingOrInferringDecision(t *testing.T) {
+	t.Parallel()
+	var approvalBody map[string]any
+	var stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stale/approval":
+			if err := json.NewDecoder(r.Body).Decode(&approvalBody); err != nil {
+				t.Errorf("decode approval body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"message":"Run has no pending approval","code":"approval_not_pending","details":{"run_status":"completed","last_event":"run.completed"}}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-stale":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":"hermes.run","run_id":"run-stale","status":"completed","last_event":"run.completed","output":"finished"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stale/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	const jobID = "job-terminal-stale-approval"
+	approval := store.Approval{
+		ID: "approval-stale", ProviderRequestID: "provider-request-7", DecisionNonce: "nonce-stale",
+		State: store.ApprovalStatePending, Description: "controlled action",
+	}
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Terminal stale approval", Status: store.StatusNeedsApproval,
+		HermesRunID: "run-stale", Approvals: []store.Approval{approval},
+	}}}
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	bus := events.NewBus(nil, testLog())
+	eventCh := bus.Subscribe(eventCtx, false)
+	h := NewHermes(server.URL, "", "hermes-agent", fs, bus, testLog())
+	ownRun(h, jobID, "run-stale")
+
+	_, err := h.DecideApproval(context.Background(), jobID, approval.ID, approval.DecisionNonce, DecisionAllowOnce)
+	if err == nil || !strings.Contains(err.Error(), "indeterminate") || !strings.Contains(err.Error(), "fresh authority") {
+		t.Fatalf("stale approval error = %v", err)
+	}
+	failedEvent := <-eventCh
+	if failedEvent.Kind != events.KindJobFailed {
+		t.Fatalf("indeterminate event kind = %q", failedEvent.Kind)
+	}
+	var outcome struct {
+		Decision  string         `json:"decision"`
+		Attempted store.Approval `json:"attempted_approval"`
+	}
+	if err := json.Unmarshal(failedEvent.Payload, &outcome); err != nil {
+		t.Fatalf("decode indeterminate event: %v", err)
+	}
+	if outcome.Decision != DecisionAllowOnce || outcome.Attempted.ID != approval.ID || outcome.Attempted.Decision != DecisionAllowOnce || outcome.Attempted.DecisionNonce != "" {
+		t.Fatalf("indeterminate audit outcome = %+v", outcome)
+	}
+	if approvalBody["request_id"] != approval.ProviderRequestID || approvalBody["idempotency_key"] != approval.ID {
+		t.Fatalf("approval correlation body = %#v", approvalBody)
+	}
+	if got := stopCalls.Load(); got != 0 {
+		t.Fatalf("terminal Hermes run received %d redundant stop calls", got)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusFailed || got.HermesRunID != "" || len(got.Approvals) != 1 ||
+		got.Approvals[0].State != store.ApprovalStateIndeterminate || got.Progress == nil ||
+		got.Progress.State != store.ApprovalStateIndeterminate ||
+		!strings.Contains(got.Error, "allow_once") || !strings.Contains(got.Error, "run status=completed") {
+		t.Fatalf("reconciled terminal stale approval = %+v", got)
+	}
+}
+
+func TestApprovalNotPendingStopsNonTerminalRunAndRetainsIntent(t *testing.T) {
+	t.Parallel()
+	var stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-live/approval":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"message":"approval already gone","code":"approval_not_pending"}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-live":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":"hermes.run","run_id":"run-live","status":"running","last_event":"tool.started"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-live/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{"run_id":"run-live","status":"stopping"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	const jobID = "job-live-stale-approval"
+	approval := store.Approval{
+		ID: "approval-live", ProviderRequestID: "provider-live", DecisionNonce: "nonce-live",
+		State: store.ApprovalStatePending,
+	}
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Live stale approval", Status: store.StatusNeedsApproval,
+		HermesRunID: "run-live", Approvals: []store.Approval{approval},
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	ownRun(h, jobID, "run-live")
+
+	_, err := h.DecideApproval(context.Background(), jobID, approval.ID, approval.DecisionNonce, DecisionDenyOnce)
+	if err == nil || !strings.Contains(err.Error(), "indeterminate") || !strings.Contains(err.Error(), "upstream stop was not confirmed") {
+		t.Fatalf("live stale approval error = %v", err)
+	}
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop calls = %d, want exactly one", got)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusFailed || got.HermesRunID != "run-live" || len(got.Approvals) != 1 ||
+		got.Approvals[0].State != store.ApprovalStateIndeterminate || got.Approvals[0].Decision != DecisionDenyOnce ||
+		!strings.Contains(got.Error, "deny_once") || !strings.Contains(got.Error, "upstream stop was not confirmed") {
+		t.Fatalf("reconciled live stale approval = %+v", got)
+	}
+}
+
+func TestStopAndConfirmTerminalRequiresTerminalStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		initialStatus string
+		finalStatus   string
+		stopError     bool
+		wantError     bool
+		wantStop      bool
+	}{
+		{name: "terminal", initialStatus: "cancelled"},
+		{name: "stop races terminal", initialStatus: "running", finalStatus: "completed", stopError: true, wantStop: true},
+		{name: "still stopping", initialStatus: "running", finalStatus: "stopping", wantError: true, wantStop: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statusCalls := 0
+			stopCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stop/stop" {
+					stopCalls++
+					if tc.stopError {
+						w.WriteHeader(http.StatusConflict)
+						return
+					}
+					_, _ = io.WriteString(w, `{"run_id":"run-stop","status":"stopping"}`)
+					return
+				}
+				if r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-stop" {
+					statusCalls++
+					w.Header().Set("Content-Type", "application/json")
+					status := tc.initialStatus
+					if statusCalls > 1 {
+						status = tc.finalStatus
+					}
+					_, _ = fmt.Fprintf(w, `{"run_id":"run-stop","status":%q}`, status)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+
+			h := NewHermes(server.URL, "", "hermes-agent", &fakeStore{jobs: map[string]store.Job{}}, events.NewBus(nil, testLog()), testLog())
+			err := h.stopAndConfirmTerminal(context.Background(), "run-stop")
+			if (err != nil) != tc.wantError {
+				t.Fatalf("stop confirmation error = %v, wantError=%v", err, tc.wantError)
+			}
+			if (stopCalls > 0) != tc.wantStop {
+				t.Fatalf("stop calls = %d, wantStop=%v", stopCalls, tc.wantStop)
+			}
+		})
+	}
+}
+
+func TestStopAndConfirmTerminalRejectsMismatchedRunStatus(t *testing.T) {
+	var stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-identity":
+			_, _ = io.WriteString(w, `{"run_id":"different-run","status":"completed"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-identity/stop":
+			stopCalls.Add(1)
+			_, _ = io.WriteString(w, `{"run_id":"run-identity","status":"stopping"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	h := NewHermes(server.URL, "", "hermes-agent", &fakeStore{jobs: map[string]store.Job{}}, events.NewBus(nil, testLog()), testLog())
+	err := h.stopAndConfirmTerminal(context.Background(), "run-identity")
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("mismatched status was accepted: %v", err)
+	}
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop calls = %d, want one fail-closed stop", got)
+	}
+}
+
+func TestApprovalEventPersistsHermesProviderRequestID(t *testing.T) {
+	const jobID = "job-provider-request"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Provider correlation", Status: store.StatusRunning,
+		HermesRunID: "run-provider-request",
+	}}}
+	h := NewHermes("http://127.0.0.1:1", "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.handleApprovalRequest(context.Background(), jobID, "run-provider-request", runEvent{
+		Event: "approval.request", RunID: "run-provider-request", RequestID: "provider-request-8",
+		Description: "approval", PatternKeys: []string{"shell"},
+	}); err != nil {
+		t.Fatalf("handle approval request: %v", err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if len(got.Approvals) != 1 || got.Approvals[0].ProviderRequestID != "provider-request-8" {
+		t.Fatalf("provider request ID was not persisted: %+v", got.Approvals)
 	}
 }
 

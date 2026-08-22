@@ -71,6 +71,8 @@ type IgnoredEventKind = (typeof INTENTIONALLY_IGNORED_EVENT_KINDS)[number];
 
 export interface Approval {
   id: string;
+  provider_request_id?: string;
+  decision?: string;
   state: "pending" | "sending" | "parked" | "indeterminate";
   description?: string;
   command?: string;

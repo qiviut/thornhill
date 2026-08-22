@@ -74,7 +74,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, name, task string) (store.Job
 	if err := tx.Commit(ctx); err != nil {
 		return store.Job{}, fmt.Errorf("commit dispatch: %w", err)
 	}
-	d.bus.Publish(events.KindJobQueued, j.ID, j)
+	publishQueuedJob(d.bus, j)
 	d.log.Info("job dispatched", "id", j.ID, "name", name)
 	return j, nil
 }
@@ -85,6 +85,14 @@ func (d *Dispatcher) Resolve(ctx context.Context, ref string) (store.Job, error)
 
 func (d *Dispatcher) Active(ctx context.Context) ([]store.Job, error) {
 	return d.store.ActiveJobs(ctx)
+}
+
+func publishCancelledJob(bus *events.Bus, j store.Job) {
+	bus.Publish(events.KindJobCancelled, j.ID, j.Redacted())
+}
+
+func publishQueuedJob(bus *events.Bus, j store.Job) {
+	bus.Publish(events.KindJobQueued, j.ID, j.Redacted())
 }
 
 func (d *Dispatcher) Cancel(ctx context.Context, ref string) (store.Job, error) {
@@ -105,7 +113,7 @@ func (d *Dispatcher) Cancel(ctx context.Context, ref string) (store.Job, error) 
 	if !cancelled {
 		return j, fmt.Errorf("job %q already %s", j.DisplayName, j.Status)
 	}
-	d.bus.Publish(events.KindJobCancelled, j.ID, j)
+	publishCancelledJob(d.bus, j)
 	// Persisted cancellation is authoritative. The runner signal is best effort;
 	// stale workers are separately fenced from writing any later state.
 	d.runner.Cancel(ctx, j.ID)
@@ -146,7 +154,7 @@ func (d *Dispatcher) Answer(ctx context.Context, ref, text string) (store.Job, e
 	if err := tx.Commit(ctx); err != nil {
 		return j, err
 	}
-	d.bus.Publish(events.KindJobQueued, j.ID, j)
+	publishQueuedJob(d.bus, j)
 	return j, nil
 }
 

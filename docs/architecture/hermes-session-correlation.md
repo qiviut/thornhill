@@ -36,7 +36,8 @@ Do not overload one vague `correlation_id`. The following opaque IDs have distin
 | `start_idempotency_key` | Thornhill; one attempt-start admission | Sent only by Thornhill's trusted bridge, never derived from task content; resolves an ambiguous start without creating a replacement run. |
 | `run_id` | Hermes; bound once start is definitively acknowledged | One live Hermes run. Unique only with `hermes_endpoint_id`; never guessed after an ambiguous start. |
 | `approval_id` | Hermes; one live approval wait | Required on every approval request, heartbeat, invalidation, and decision acknowledgement. Never minted by Thornhill as a substitute. |
-| `approval_seq` | Hermes; monotonic within a run | Preserves FIFO identity and detects an unsupported concurrent approval. |
+| `provider_request_id` | Hermes; one transient approval request | Preferred exact binding for a decision. It prevents a late response from falling through to another provider-side queue entry. |
+| `approval_seq` | Hermes; monotonic within a run | Legacy/FIFO evidence and a concurrent-approval guard when an older provider cannot emit `provider_request_id`. |
 | `decision_id` | Thornhill; one operator decision attempt | Persisted before crossing the Hermes authority boundary and echoed by Hermes only in the matching acknowledgement. |
 | `decision_nonce` | Thornhill; one-use secret/control token | Bound to the current durable row and exact decision attempt. Never included in the event log, bus, UI replay, metrics, or summaries. |
 | `event_id` | event producer; immutable across replay | Idempotency key for exactly one semantic event, unique within `producer_id`. |
@@ -52,7 +53,7 @@ work_id
   -> (hermes_endpoint_id, session_id, session_generation)
   -> attempt_id
   -> run_id
-  -> approval_id / approval_seq
+  -> approval_id / provider_request_id / approval_seq
   -> decision_id
 ```
 
@@ -134,7 +135,7 @@ The protocol distinguishes durable control events from best-effort presentation 
 | `run.state` | Applies a typed, versioned non-terminal state transition. |
 | `run.heartbeat` | Proves a live stream/wait for the exact attempt; it never refreshes or decides authority by itself. |
 | `tool.progress` / `output.delta` | Presentation-only. Loss is tolerable and cannot change approval/run authority. |
-| `approval.requested` | Creates exactly one durable pending approval only after all correlation fields, digests, provenance summary, and FIFO position validate. |
+| `approval.requested` | Creates exactly one durable pending approval only after all correlation fields, digests, provenance summary, and provider request ID (or legacy FIFO position) validate. |
 | `approval.heartbeat` | Refreshes observability for the exact pending wait; it does not extend a decision token or create a second approval. |
 | `approval.decision_applied` | Confirms the exact `{approval_id, approval_seq, decision_id}` reached Hermes. It is not proof that a later tool side effect succeeded. |
 | `approval.invalidated` / `approval.expired` | Closes only the exact pending approval and its linked run state with a typed reason. |
@@ -152,9 +153,9 @@ absent -> pending -> deciding -> decision_applied
                   \-> indeterminate
 ```
 
-`pending -> deciding` is Thornhill's atomic compare-and-set and writes `decision_id` before Hermes I/O. `deciding -> decision_applied` requires the matching Hermes acknowledgement. A transport loss or exception after the authority boundary is `indeterminate`, stops/reconciles the run, and is never retried automatically. `parked`, `invalidated`, `expired`, `indeterminate`, and `decision_applied` are terminal for that `approval_id`; a subsequent attempt requires a new approval.
+`pending -> deciding` is Thornhill's atomic compare-and-set and writes `decision_id` before Hermes I/O. `deciding -> decision_applied` requires the matching Hermes acknowledgement. Hermes `409 approval_not_pending`, `approval_not_active`, or `approval_request_mismatch` is a lifecycle reconciliation signal, not proof of deny: Thornhill reads run status, avoids a redundant stop for a terminal run, stops a live run once, and records `indeterminate` with the attempted decision. A transport loss or other exception after the authority boundary follows the same fail-closed path and is never retried automatically. `parked`, `invalidated`, `expired`, `indeterminate`, and `decision_applied` are terminal for that `approval_id`; a subsequent attempt requires a new approval.
 
-If Hermes emits more than one outstanding approval for a run, or an approval whose FIFO sequence cannot be reconciled, Thornhill does not create an actionable modal or use a broad resolve-all shortcut. It quarantines the fault and stops/reconciles the run; only a documented per-item, exactly correlated denial is eligible for a safe automatic deny.
+If Hermes emits more than one outstanding approval for a run, or an approval whose provider request ID/FIFO sequence cannot be reconciled, Thornhill does not create an actionable modal or use a broad resolve-all shortcut. It quarantines the fault and stops/reconciles the run; only a documented per-item, exactly correlated denial is eligible for a safe automatic deny.
 
 ## Ordering, durability, and delivery
 

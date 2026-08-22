@@ -212,18 +212,21 @@ type PushDelivery struct {
 }
 
 // Approval is a redacted, user-visible authority request from Hermes. The
-// Runs API resolves approvals FIFO, so callers may decide only the first entry.
+// provider request ID binds this record to one in-memory Hermes wait; the
+// durable local ID is also the client idempotency key for its decision.
 type Approval struct {
-	ID             string     `json:"id"`
-	DecisionNonce  string     `json:"decision_nonce"`
-	State          string     `json:"state"` // pending|sending|parked|indeterminate
-	Command        string     `json:"command,omitempty"`
-	Description    string     `json:"description,omitempty"`
-	PatternKeys    []string   `json:"pattern_keys,omitempty"`
-	AllowPermanent bool       `json:"allow_permanent"`
-	RequestedAt    time.Time  `json:"requested_at"`
-	ParkedAt       *time.Time `json:"parked_at,omitempty"`
-	ParkReason     string     `json:"park_reason,omitempty"`
+	ID                string     `json:"id"`
+	ProviderRequestID string     `json:"provider_request_id,omitempty"`
+	DecisionNonce     string     `json:"decision_nonce"`
+	Decision          string     `json:"decision,omitempty"` // operator attempt, set before indeterminate reconciliation
+	State             string     `json:"state"`              // pending|sending|parked|indeterminate
+	Command           string     `json:"command,omitempty"`
+	Description       string     `json:"description,omitempty"`
+	PatternKeys       []string   `json:"pattern_keys,omitempty"`
+	AllowPermanent    bool       `json:"allow_permanent"`
+	RequestedAt       time.Time  `json:"requested_at"`
+	ParkedAt          *time.Time `json:"parked_at,omitempty"`
+	ParkReason        string     `json:"park_reason,omitempty"`
 }
 
 // Redacted returns a copy safe to publish on the bus and into the durable event
@@ -664,6 +667,19 @@ func collect(rows pgx.Rows) ([]Job, error) {
 func (s *Store) ActiveJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.Pool.Query(ctx, selectJob+
 		` WHERE status IN ('queued','running','needs_input','needs_approval','parked_approval') ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	return collect(rows)
+}
+
+// UnresolvedRunJobs returns terminal jobs that still retain an upstream run
+// handle. These rows are not active user work, but the handle is a durable
+// cleanup obligation that startup reconciliation must retry independently of
+// the active-job board.
+func (s *Store) UnresolvedRunJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.Pool.Query(ctx, selectJob+
+		` WHERE status = 'failed' AND hermes_run_id <> '' ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
