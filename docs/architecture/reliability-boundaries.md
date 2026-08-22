@@ -21,6 +21,9 @@ and does not describe current runtime behavior.
   claim; duplicate deliveries must return before installing or deleting the
   active owner's callback, and deferred cleanup must be owner-scoped so a newer
   resumed delivery cannot lose its cancellation handle.
+- Each Hermes.Run owns a unique in-memory generation. Publishing a provider run ID
+  and deferred cleanup must verify that generation; an older needs-input delivery
+  cannot delete a newer run's cancellation handle, run ID, or session policy maps.
 - Hermes run-start requests are not retried after an ambiguous transport result.
   Repeating a non-idempotent start can duplicate work.
 - The HTTP client bounds the wait for response headers, not the lifetime of the

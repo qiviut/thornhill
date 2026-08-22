@@ -78,6 +78,20 @@ func (h *Hermes) ownedRunID(jobID string) string {
 	return h.runIDs[jobID]
 }
 
+func (h *Hermes) setRunID(jobID string, owner *hermesRunOwner, runID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if owner != nil {
+		current, ok := h.cancels[jobID]
+		if !ok || current != owner {
+			return false
+		}
+		owner.runID = runID
+	}
+	h.runIDs[jobID] = runID
+	return true
+}
+
 const (
 	DecisionAllowOnce        = "allow_once"
 	DecisionAllowSession     = "allow_session"
@@ -101,6 +115,11 @@ type JobStore interface {
 	MatchesPermanentAllow(ctx context.Context, patternKeys []string) (string, error)
 }
 
+type hermesRunOwner struct {
+	cancel context.CancelFunc
+	runID  string
+}
+
 type Hermes struct {
 	BaseURL                string
 	APIKey                 string
@@ -114,7 +133,7 @@ type Hermes struct {
 	StreamIdleAfter        time.Duration
 
 	mu             sync.Mutex
-	cancels        map[string]context.CancelFunc
+	cancels        map[string]*hermesRunOwner
 	runIDs         map[string]string
 	approvalLocks  map[string]*approvalLock
 	sessionAllows  map[string]map[string]struct{}
@@ -129,7 +148,7 @@ func NewHermes(baseURL, apiKey, model string, st JobStore, bus *events.Bus, log 
 		ApprovalControlTimeout: defaultApprovalControlTimeout,
 		ApprovalParkAfter:      defaultApprovalParkAfter,
 		StreamIdleAfter:        defaultStreamIdleAfter,
-		cancels:                map[string]context.CancelFunc{},
+		cancels:                map[string]*hermesRunOwner{},
 		runIDs:                 map[string]string{},
 		approvalLocks:          map[string]*approvalLock{},
 		sessionAllows:          map[string]map[string]struct{}{},
@@ -383,16 +402,24 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 	}
 
 	ctx, cancel := context.WithCancel(workerCtx)
+	owner := &hermesRunOwner{cancel: cancel}
 	h.mu.Lock()
-	h.cancels[jobID] = cancel
+	h.cancels[jobID] = owner
+	delete(h.runIDs, jobID)
+	delete(h.sessionAllows, jobID)
+	delete(h.sessionDenials, jobID)
 	h.mu.Unlock()
 	defer func() {
 		cancel()
 		h.mu.Lock()
-		delete(h.cancels, jobID)
-		delete(h.runIDs, jobID)
-		delete(h.sessionAllows, jobID)
-		delete(h.sessionDenials, jobID)
+		if current, ok := h.cancels[jobID]; ok && current == owner {
+			delete(h.cancels, jobID)
+			if h.runIDs[jobID] == owner.runID {
+				delete(h.runIDs, jobID)
+			}
+			delete(h.sessionAllows, jobID)
+			delete(h.sessionDenials, jobID)
+		}
 		h.mu.Unlock()
 	}()
 	current, err := h.Store.ResolveJob(ctx, jobID)
@@ -427,7 +454,7 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 	// is the complete request. Nothing here may outlive the turn, because a
 	// process-lifetime copy would grow without bound and could not be trusted
 	// against the session Hermes actually holds.
-	reply, err := h.runTurn(ctx, j, initial, recovered)
+	reply, err := h.runTurnOwned(ctx, j, initial, recovered, owner)
 	runID := h.ownedRunID(jobID)
 	if err != nil {
 		if errors.Is(err, errApprovalParked) {
@@ -638,6 +665,10 @@ func (h *Hermes) loadSessionHistory(ctx context.Context, sessionID string) ([]ch
 }
 
 func (h *Hermes) runTurn(ctx context.Context, job store.Job, input string, history []chatMsg) (string, error) {
+	return h.runTurnOwned(ctx, job, input, history, nil)
+}
+
+func (h *Hermes) runTurnOwned(ctx context.Context, job store.Job, input string, history []chatMsg, owner *hermesRunOwner) (string, error) {
 	body := map[string]any{
 		"model":                h.Model,
 		"input":                input,
@@ -656,9 +687,10 @@ func (h *Hermes) runTurn(ctx context.Context, job store.Job, input string, histo
 		return "", noRetry(errors.New("Hermes did not return a run_id; start outcome will not be retried"))
 	}
 
-	h.mu.Lock()
-	h.runIDs[job.ID] = started.RunID
-	h.mu.Unlock()
+	if !h.setRunID(job.ID, owner, started.RunID) {
+		h.stopRun(started.RunID)
+		return "", noRetry(errRunSuperseded)
+	}
 	persisted := false
 	updated, err := h.Store.UpdateJob(ctx, job.ID, func(x *store.Job) {
 		if runOwnsState(x, "") {
@@ -1634,11 +1666,11 @@ func (h *Hermes) ReleaseRun(ctx context.Context, jobID, runID string) error {
 		return err
 	}
 	h.mu.Lock()
-	owned := h.runIDs[jobID] == runID
-	cancel := h.cancels[jobID]
+	owner, owned := h.cancels[jobID]
+	owned = owned && owner.runID == runID && h.runIDs[jobID] == runID
 	h.mu.Unlock()
-	if owned && cancel != nil {
-		cancel()
+	if owned && owner != nil {
+		owner.cancel()
 	}
 	return nil
 }
@@ -1657,15 +1689,15 @@ func (h *Hermes) Cancel(ctx context.Context, jobID string) {
 
 	h.mu.Lock()
 	ownedRunID := h.runIDs[jobID]
-	cancel := h.cancels[jobID]
+	owner := h.cancels[jobID]
 	h.mu.Unlock()
 	if runID != "" {
 		stopCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = h.doJSON(stopCtx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil)
 		done()
 	}
-	if cancel != nil && (runID == "" || ownedRunID == runID) {
-		cancel()
+	if owner != nil && owner.runID == ownedRunID && (runID == "" || ownedRunID == runID) {
+		owner.cancel()
 	}
 }
 
