@@ -17,6 +17,10 @@ and does not describe current runtime behavior.
 - A River delivery must durably claim a job and re-check cancellation before
   starting a Hermes run. Subsequent writes require the same run identity and an
   active status so an old stream cannot overwrite cancellation or a newer turn.
+  The in-process cancellation callback is installed only after that durable
+  claim; duplicate deliveries must return before installing or deleting the
+  active owner's callback, and deferred cleanup must be owner-scoped so a newer
+  resumed delivery cannot lose its cancellation handle.
 - Hermes run-start requests are not retried after an ambiguous transport result.
   Repeating a non-idempotent start can duplicate work.
 - The HTTP client bounds the wait for response headers, not the lifetime of the
