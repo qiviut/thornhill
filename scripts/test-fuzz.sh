@@ -15,5 +15,7 @@ for entry in "${targets[@]}"; do
   package=${entry%%:*}
   target=${entry#*:}
   echo "==> ${target} (${package}, ${fuzztime})"
-  go test "${package}" -run='^$' -fuzz="^${target}$" -fuzztime="${fuzztime}"
+  # One worker keeps the short per-target budget deterministic on shared CI
+  # runners; the targets still run sequentially with independent processes.
+  go test "${package}" -run='^$' -fuzz="^${target}$" -fuzztime="${fuzztime}" -parallel=1
 done
