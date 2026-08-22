@@ -475,7 +475,7 @@ export default function App() {
             {j.status === "failed" && j.approvals?.[0]?.state === "indeterminate" && (
               <div className="job-approval indeterminate" role="alert">
                 <strong>Approval outcome indeterminate</strong>
-                <p>The run was stopped. Thornhill will not retry this decision.</p>
+                <p>The upstream approval was no longer pending or its outcome could not be proven. No allow or deny decision was inferred or retried. The run was stopped; resume this job to inspect current state and request fresh approval.</p>
               </div>
             )}
             {j.status === "running" && j.progress && (
