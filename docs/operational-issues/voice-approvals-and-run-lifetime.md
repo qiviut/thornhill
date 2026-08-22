@@ -139,17 +139,24 @@ from elapsed time. Before the parking threshold, gateway heartbeats keep a
 healthy pending wait active.
 
 A decision does not make network operations unbounded. The post-decision
-approval control request has a short transport deadline, and an indeterminate
-authority response stops the run without retrying the grant. MCP similarly
+approval control request has a short transport deadline. It carries the exact
+provider request ID and a durable decision-attempt key, so a transport or proxy
+replay of the same decision is idempotent on upgraded Hermes. Thornhill itself
+does not automatically retry an ambiguous authority call: a `409
+approval_not_pending` means that the provider wait is gone or no longer matches,
+not that the operator denied the action. Thornhill records `indeterminate`,
+never synthesizes allow/deny, stops the run unless Hermes already reports it
+terminal, and exposes resume guidance for a fresh request. MCP similarly
 excludes explicit elicitation-decision time from its tool transport deadline,
 then resumes ordinary deadline accounting after the decision.
 
-Exact one-use approval IDs/nonces, FIFO correlation, collision fail-closed
-handling, and exact-pattern-set job/permanent policies remain intact. Platform
-buttons may become unusable when their UI lifetime ends, but that only disables
-the component; it does not decide the unresolved approval. Text approval and
-deny commands remain available while the request is pending; a parked request
-must instead be resumed and reissued with fresh authority if still needed.
+Exact one-use approval IDs/nonces, provider-request correlation, idempotency,
+collision fail-closed handling, and exact-pattern-set job/permanent policies
+remain intact. Platform buttons may become unusable when their UI lifetime ends,
+but that only disables the component; it does not decide the unresolved
+approval. Text approval and deny commands remain available while the request is
+pending; a stale or indeterminate request must instead be reconciled and
+reissued with fresh authority if still needed.
 
 ## Progressive approval and safer alternatives
 

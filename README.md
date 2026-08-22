@@ -339,13 +339,18 @@ one-time grant for each concrete request. Permanent allow still requires
 explicit confirmation of its pattern-wide scope.
 
 The broker accepts a decision only for the sole active pending request and
-validates a one-use approval ID/nonce. A second concurrent request triggers
-deny-all and a fail-closed stop. An allow POST is sent exactly once; an
-indeterminate response is never retried and stops the run. Approval heartbeats
-keep a healthy Hermes wait active before its resource threshold without turning
-elapsed time into a decision. The River worker has no whole-run elapsed runtime
-deadline; explicit cancel, shutdown, execution failure, and durable approval
-parking still stop or reclaim work.
+validates both the durable one-use approval ID/nonce and, when available, the
+Hermes provider request ID. A second concurrent request triggers deny-all and a
+fail-closed stop. Decision POSTs carry the provider request ID plus the durable
+approval ID as an idempotency key; Hermes replays an exact duplicate response
+without resolving another queue entry. A `409 approval_not_pending` is a
+reconciliation signal, not a denial: Thornhill records an indeterminate outcome,
+never infers or retries allow/deny, stops the run when it is not already
+terminal, and tells the operator to resume for a fresh approval. Approval
+heartbeats keep a healthy Hermes wait active before its resource threshold
+without turning elapsed time into a decision. The River worker has no whole-run
+elapsed runtime deadline; explicit cancel, shutdown, execution failure, and
+durable approval parking still stop or reclaim work.
 
 ## Job recovery and script lifecycle
 
