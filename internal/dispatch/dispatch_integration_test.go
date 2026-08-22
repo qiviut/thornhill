@@ -181,6 +181,65 @@ func TestCancelledDeliveryAndDurableAnswerCannotResurrectTerminalState(t *testin
 	}
 }
 
+func TestDuplicateDeliveryCannotStealCancellationOwner(t *testing.T) {
+	ctx := context.Background()
+	_, st := integrationDispatcher(t, &transactionalTestQueue{}, &integrationRunner{})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	bus := events.NewBus(nil, log)
+	stub := NewStubRunner(st, bus, 2*time.Second, log)
+	d := New(st, bus, &transactionalTestQueue{}, stub, log)
+
+	j, err := st.CreateJob(ctx, "duplicate-cancel-"+store.NewULID(), "must cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalDone := make(chan error, 1)
+	go func() { originalDone <- stub.Run(ctx, j.ID) }()
+	waitForStubCancellationOwner(t, stub, st, j.ID)
+
+	duplicateDone := make(chan error, 1)
+	go func() { duplicateDone <- stub.Run(ctx, j.ID) }()
+	if err := <-duplicateDone; err != nil {
+		t.Fatalf("duplicate delivery returned an error: %v", err)
+	}
+
+	if _, err := d.Cancel(ctx, j.ID); err != nil {
+		t.Fatalf("cancel after duplicate delivery: %v", err)
+	}
+	select {
+	case err := <-originalDone:
+		if err != nil {
+			t.Fatalf("original delivery returned an error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("original delivery did not observe cancellation")
+	}
+
+	got, err := st.ResolveJob(ctx, j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.StatusCancelled {
+		t.Fatalf("duplicate delivery weakened cancellation: final status=%s", got.Status)
+	}
+}
+
+func waitForStubCancellationOwner(t *testing.T, stub *StubRunner, st *store.Store, jobID string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stub.mu.Lock()
+		_, owner := stub.cancels[jobID]
+		stub.mu.Unlock()
+		job, err := st.ResolveJob(context.Background(), jobID)
+		if owner && err == nil && job.Status == store.StatusRunning {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("stub runner never installed cancellation owner for running job %s", jobID)
+}
+
 func TestCompletionWinningRowLockCannotBeOverwrittenByCancel(t *testing.T) {
 	ctx := context.Background()
 	runner := &integrationRunner{}

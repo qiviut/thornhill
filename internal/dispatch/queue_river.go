@@ -66,6 +66,10 @@ func StartRiver(ctx context.Context, pool *pgxpool.Pool, runner Runner, log *slo
 // asks one clarifying question halfway if the task contains a '?', then
 // completes. Lets the entire voice loop be exercised with only an OpenAI
 // key and no fleet.
+type stubRunOwner struct {
+	cancel context.CancelFunc
+}
+
 type StubRunner struct {
 	Store    *store.Store
 	Bus      *events.Bus
@@ -73,29 +77,18 @@ type StubRunner struct {
 	Log      *slog.Logger
 
 	mu      sync.Mutex
-	cancels map[string]context.CancelFunc
+	cancels map[string]*stubRunOwner
 }
 
 func NewStubRunner(st *store.Store, bus *events.Bus, dur time.Duration, log *slog.Logger) *StubRunner {
 	return &StubRunner{Store: st, Bus: bus, Duration: dur, Log: log,
-		cancels: map[string]context.CancelFunc{}}
+		cancels: map[string]*stubRunOwner{}}
 }
 
 func (s *StubRunner) Run(ctx context.Context, jobID string) error {
-	ctx, cancel := context.WithCancel(ctx)
-	s.mu.Lock()
-	s.cancels[jobID] = cancel
-	s.mu.Unlock()
-	defer func() {
-		cancel()
-		s.mu.Lock()
-		delete(s.cancels, jobID)
-		s.mu.Unlock()
-	}()
-
 	claimed := false
 	continuing := false
-	j, err := s.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+	_, err := s.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
 		if x.Status == store.StatusQueued {
 			continuing = x.PendingInput != ""
 			x.Status = store.StatusRunning
@@ -109,6 +102,39 @@ func (s *StubRunner) Run(ctx context.Context, jobID string) error {
 	if !claimed {
 		return nil
 	}
+
+	// Durable admission must win before a delivery can become the cancellation
+	// owner. A duplicate River delivery therefore observes running and returns
+	// without overwriting, then deleting, the active owner's callback.
+	ctx, cancel := context.WithCancel(ctx)
+	owner := &stubRunOwner{cancel: cancel}
+	s.mu.Lock()
+	s.cancels[jobID] = owner
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		// A resumed delivery may have installed a newer owner before this
+		// delivery's deferred cleanup runs. Never delete that newer owner.
+		if current, ok := s.cancels[jobID]; ok && current == owner {
+			delete(s.cancels, jobID)
+		}
+		s.mu.Unlock()
+	}()
+
+	// Cancellation can win in the small gap between the durable claim and
+	// callback registration. Reconcile against the durable state without using
+	// the worker context that an already-delivered cancellation may have ended.
+	checkCtx, checkCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	current, err := s.Store.ResolveJob(checkCtx, jobID)
+	checkCancel()
+	if err != nil {
+		return err
+	}
+	if current.Status != store.StatusRunning {
+		return nil
+	}
+	j := current
 	s.Bus.Publish(events.KindJobRunning, jobID, j)
 	s.Log.Info("stub job running", "id", jobID, "for", s.Duration)
 
@@ -162,7 +188,7 @@ func (s *StubRunner) DecideApproval(ctx context.Context, jobID, _, _, _ string) 
 func (s *StubRunner) Cancel(_ context.Context, jobID string) {
 	s.mu.Lock()
 	if c, ok := s.cancels[jobID]; ok {
-		c()
+		c.cancel()
 	}
 	s.mu.Unlock()
 }

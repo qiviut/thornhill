@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -174,6 +175,27 @@ func (s *initialResolveBarrierStore) ResolveJob(ctx context.Context, ref string)
 	return j, nil
 }
 
+type needsInputReturnBarrierStore struct {
+	*fakeStore
+	ready   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *needsInputReturnBarrierStore) UpdateJob(ctx context.Context, id string, mut func(*store.Job)) (store.Job, error) {
+	j, err := s.fakeStore.UpdateJob(ctx, id, mut)
+	if err != nil || j.Status != store.StatusNeedsInput || j.Question == "" {
+		return j, err
+	}
+	s.once.Do(func() { close(s.ready) })
+	select {
+	case <-s.release:
+		return j, nil
+	case <-ctx.Done():
+		return store.Job{}, ctx.Err()
+	}
+}
+
 func TestRunRejectsCancelledOrTerminalDeliveryBeforeHermes(t *testing.T) {
 	for _, status := range []string{store.StatusCancelled, store.StatusDone, store.StatusFailed} {
 		t.Run(status, func(t *testing.T) {
@@ -275,6 +297,204 @@ func TestDuplicateDeliveriesCannotDeleteWinningExecutionOwnership(t *testing.T) 
 	got, _ := fs.ResolveJob(context.Background(), jobID)
 	if got.Status != store.StatusDone {
 		t.Fatalf("winning delivery finished as %s", got.Status)
+	}
+}
+
+func TestNeedsInputResumeCannotDeleteNewHermesOwnership(t *testing.T) {
+	const jobID = "needs-input-overlap"
+	oldRelease := make(chan struct{})
+	oldReady := make(chan struct{})
+	secondStarted := make(chan struct{})
+	secondCancelled := make(chan struct{})
+	secondRelease := make(chan struct{})
+	var starts atomic.Int32
+	var secondStartOnce sync.Once
+	var secondCancelOnce sync.Once
+	var secondReleaseOnce sync.Once
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs":
+			n := starts.Add(1)
+			_, _ = fmt.Fprintf(w, `{"run_id":"run-%d","status":"started"}`, n)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-1/events":
+			_, _ = io.WriteString(w, "data: {\"event\":\"run.completed\",\"output\":\"Should I proceed?\"}\n\n")
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/runs/run-2/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, ": stream ready\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			secondStartOnce.Do(func() { close(secondStarted) })
+			select {
+			case <-secondRelease:
+				_, _ = io.WriteString(w, "data: {\"event\":\"run.completed\",\"output\":\"completed after answer\"}\n\n")
+			case <-r.Context().Done():
+				secondCancelOnce.Do(func() { close(secondCancelled) })
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/api/sessions/"+jobID+"/messages":
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"):
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	defer secondReleaseOnce.Do(func() { close(secondRelease) })
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Needs input overlap", Task: "original task", Status: store.StatusQueued,
+	}}}
+	barrier := &needsInputReturnBarrierStore{fakeStore: fs, ready: oldReady, release: oldRelease}
+	h := NewHermes(server.URL, "", "hermes-agent", barrier, events.NewBus(nil, testLog()), testLog())
+	results := make(chan error, 2)
+	go func() { results <- h.Run(context.Background(), jobID) }()
+
+	select {
+	case <-oldReady:
+	case <-time.After(time.Second):
+		t.Fatal("first run did not reach needs_input return barrier")
+	}
+	parked, _ := fs.ResolveJob(context.Background(), jobID)
+	if parked.Status != store.StatusNeedsInput || parked.HermesRunID != "" {
+		t.Fatalf("first run was not durably parked: %+v", parked)
+	}
+	if _, err := fs.UpdateJob(context.Background(), jobID, func(j *store.Job) {
+		j.Status = store.StatusQueued
+		j.Question = ""
+		j.PendingInput = "yes, proceed"
+	}); err != nil {
+		t.Fatalf("queue answer: %v", err)
+	}
+
+	go func() { results <- h.Run(context.Background(), jobID) }()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("resumed run did not start its event stream")
+	}
+	h.mu.Lock()
+	_, hasCancel := h.cancels[jobID]
+	gotRunID := h.runIDs[jobID]
+	h.mu.Unlock()
+	if !hasCancel || gotRunID != "run-2" {
+		t.Fatalf("resumed run did not own execution: cancel=%t run=%q", hasCancel, gotRunID)
+	}
+
+	close(oldRelease)
+	select {
+	case err := <-results:
+		if err != nil {
+			t.Fatalf("old needs_input delivery returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old needs_input delivery did not return")
+	}
+	h.mu.Lock()
+	_, hasCancel = h.cancels[jobID]
+	gotRunID = h.runIDs[jobID]
+	h.mu.Unlock()
+	if !hasCancel || gotRunID != "run-2" {
+		t.Fatalf("old cleanup deleted resumed ownership: cancel=%t run=%q", hasCancel, gotRunID)
+	}
+
+	if _, err := fs.UpdateJob(context.Background(), jobID, func(j *store.Job) {
+		j.Status = store.StatusCancelled
+	}); err != nil {
+		t.Fatalf("record cancellation: %v", err)
+	}
+	h.Cancel(context.Background(), jobID)
+	select {
+	case <-secondCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not reach resumed Hermes stream")
+	}
+	select {
+	case err := <-results:
+		if err != nil {
+			t.Fatalf("resumed delivery returned error after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resumed delivery did not return after cancellation")
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusCancelled {
+		t.Fatalf("cancellation was overwritten: %+v", got)
+	}
+}
+
+func TestCancelAndRunIDPublicationUseSameOwnershipLock(t *testing.T) {
+	const jobID = "cancel-run-id-publication"
+	stopEntered := make(chan struct{})
+	releaseStop := make(chan struct{})
+	var stopOnce sync.Once
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/runs/run-1/stop" {
+			http.NotFound(w, r)
+			return
+		}
+		stopOnce.Do(func() { close(stopEntered) })
+		<-releaseStop
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, Status: store.StatusRunning, HermesRunID: "run-1",
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	owner := &hermesRunOwner{cancel: runCancel, runID: "run-1"}
+	h.mu.Lock()
+	h.cancels[jobID] = owner
+	h.runIDs[jobID] = "run-1"
+	h.mu.Unlock()
+
+	cancelDone := make(chan struct{})
+	go func() {
+		h.Cancel(context.Background(), jobID)
+		close(cancelDone)
+	}()
+	select {
+	case <-stopEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not reach provider stop")
+	}
+
+	setterDone := make(chan struct{})
+	go func() {
+		defer close(setterDone)
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			default:
+			}
+			if !h.setRunID(jobID, owner, "run-1") {
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	close(releaseStop)
+
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not reach the current owner")
+	}
+	select {
+	case <-cancelDone:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not return")
+	}
+	select {
+	case <-setterDone:
+	case <-time.After(time.Second):
+		t.Fatal("run-ID publisher did not stop")
 	}
 }
 
