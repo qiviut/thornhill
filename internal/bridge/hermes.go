@@ -44,9 +44,8 @@ func (e *noRetryError) NoRetry()      {}
 func noRetry(err error) error         { return &noRetryError{err: err} }
 
 // hermesAPIError preserves the structured error code and reconciliation
-// details returned by the Runs API. Callers must use the code only to choose a
-// safe local disposition; an approval error is never permission to retry a
-// decision automatically.
+// details returned by the Runs API. An approval error is never permission to
+// retry a decision automatically.
 type hermesAPIError struct {
 	StatusCode int
 	Code       string
@@ -93,6 +92,7 @@ type JobStore interface {
 	UpdateJob(ctx context.Context, id string, mut func(*store.Job)) (store.Job, error)
 	ResolveJob(ctx context.Context, ref string) (store.Job, error)
 	ActiveJobs(ctx context.Context) ([]store.Job, error)
+	UnresolvedRunJobs(ctx context.Context) ([]store.Job, error)
 	ClaimApproval(ctx context.Context, jobID, approvalID, nonce string) (store.Job, error)
 	ParkApproval(ctx context.Context, jobID, approvalID, nonce, reason string, at time.Time) (store.Job, error)
 	SavePermanentDenials(ctx context.Context, patternKeys []string, sourceJobID string) error
@@ -216,6 +216,16 @@ type approvalOutcome struct {
 	Decided  *store.Approval `json:"decided_approval,omitempty"`
 }
 
+// approvalIndeterminateOutcome keeps the attempted authority choice and the
+// exact redacted approval alongside the failed job snapshot. A generic failed
+// snapshot alone would preserve only prose and make the authority boundary
+// harder to audit programmatically.
+type approvalIndeterminateOutcome struct {
+	store.Job
+	Decision  string          `json:"decision"`
+	Attempted *store.Approval `json:"attempted_approval,omitempty"`
+}
+
 func ptr[T any](v T) *T { return &v }
 
 // ReconcileOrphans reclaims runs whose in-memory SSE owner disappeared during
@@ -228,7 +238,27 @@ func (h *Hermes) ReconcileOrphans(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	failedRuns, err := h.Store.UnresolvedRunJobs(ctx)
+	if err != nil {
+		return err
+	}
+	jobs = append(jobs, failedRuns...)
 	for _, j := range jobs {
+		if j.Status == store.StatusFailed && j.HermesRunID != "" {
+			cleanupErr := h.stopAndConfirmTerminal(context.WithoutCancel(ctx), j.HermesRunID)
+			if cleanupErr != nil {
+				h.Log.Warn("failed job upstream cleanup remains unresolved", "job_id", j.ID, "run_id", j.HermesRunID, "err", cleanupErr)
+				continue
+			}
+			if _, err := h.Store.UpdateJob(context.WithoutCancel(ctx), j.ID, func(x *store.Job) {
+				if x.Status == store.StatusFailed && x.HermesRunID == j.HermesRunID {
+					x.HermesRunID = ""
+				}
+			}); err != nil {
+				return err
+			}
+			continue
+		}
 		if j.Status == store.StatusNeedsInput {
 			if j.HermesRunID != "" {
 				if err := h.ReleaseRun(context.WithoutCancel(ctx), j.ID, j.HermesRunID); err != nil {
@@ -268,12 +298,31 @@ func (h *Hermes) ReconcileOrphans(ctx context.Context) error {
 			}
 			continue
 		}
+		var cleanupErr error
 		if j.HermesRunID != "" {
-			h.stopRun(j.HermesRunID)
+			cleanupErr = h.stopAndConfirmTerminal(context.WithoutCancel(ctx), j.HermesRunID)
+			if cleanupErr != nil {
+				h.Log.Warn("orphaned Hermes run cleanup was not confirmed", "job_id", j.ID, "run_id", j.HermesRunID, "err", cleanupErr)
+			}
 		}
+		reconciled := false
 		failed, updateErr := h.Store.UpdateJob(context.WithoutCancel(ctx), j.ID, func(x *store.Job) {
+			// ActiveJobs is a snapshot. Do not let a late restart cleanup
+			// overwrite cancellation, a newer run, or another transition that
+			// happened while the provider status/stop calls were in flight.
+			if x.Status != j.Status || x.HermesRunID != j.HermesRunID || x.StateVersion != j.StateVersion {
+				return
+			}
+			reconciled = true
 			x.Status = store.StatusFailed
-			appendFailureEvidence(x, "orphaned by process restart; stale Hermes run stopped fail-closed; job can be safely resumed")
+			if cleanupErr == nil {
+				appendFailureEvidence(x, "orphaned by process restart; stale Hermes run cleanup was confirmed; job can be safely resumed")
+				if x.HermesRunID == j.HermesRunID {
+					x.HermesRunID = ""
+				}
+			} else {
+				appendFailureEvidence(x, "orphaned by process restart; stale Hermes run cleanup was not confirmed; upstream run ID was retained for reconciliation: "+cleanupErr.Error())
+			}
 			if len(x.Approvals) == 1 && x.Approvals[0].State == store.ApprovalStateSending {
 				x.Approvals[0].State = store.ApprovalStateIndeterminate
 			} else {
@@ -283,7 +332,10 @@ func (h *Hermes) ReconcileOrphans(ctx context.Context) error {
 		if updateErr != nil {
 			return updateErr
 		}
-		h.Bus.Publish(events.KindJobFailed, j.ID, failed)
+		if !reconciled {
+			continue
+		}
+		h.Bus.Publish(events.KindJobFailed, j.ID, failed.Redacted())
 	}
 	return nil
 }
@@ -412,7 +464,7 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 			if !failedTransition {
 				return nil
 			}
-			h.Bus.Publish(events.KindJobFailed, jobID, failed)
+			h.Bus.Publish(events.KindJobFailed, jobID, failed.Redacted())
 			return noRetry(errors.New(failed.Error))
 		}
 		failedTransition := false
@@ -427,7 +479,7 @@ func (h *Hermes) Run(ctx context.Context, jobID string) error {
 		if !failedTransition {
 			return nil
 		}
-		h.Bus.Publish(events.KindJobFailed, jobID, failed)
+		h.Bus.Publish(events.KindJobFailed, jobID, failed.Redacted())
 		return fmt.Errorf("hermes run: %w", err)
 	}
 
@@ -881,7 +933,7 @@ func (h *Hermes) releaseParkedRunLocked(jobID, runID string) (store.Job, error) 
 	if runID == "" {
 		return store.Job{}, nil
 	}
-	if err := h.stopRun(runID); err != nil {
+	if err := h.stopAndConfirmTerminal(context.Background(), runID); err != nil {
 		return store.Job{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -939,29 +991,37 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 	}
 	if len(existing.Approvals) > 0 {
 		denyErr := h.postApproval(ctx, runID, "deny", true, "", "")
-		h.stopRun(runID)
+		if denyErr != nil {
+			return h.failAutomaticApproval(ctx, jobID, runID, approval, DecisionDenyAlways, denyErr)
+		}
+		stopErr := h.stopAndConfirmTerminal(ctx, runID)
 		transitioned := false
 		j, _ := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
 			if runOwnsState(x, runID) {
 				x.Status = store.StatusFailed
 				x.Error = "multiple concurrent Hermes approvals could not be correlated safely; all were denied and the run was stopped"
+				if stopErr != nil {
+					x.Error += "; upstream stop was not confirmed: " + stopErr.Error()
+				}
 				x.Approvals = nil
+				if stopErr == nil && x.HermesRunID == runID {
+					x.HermesRunID = ""
+				}
 				transitioned = true
 			}
 		})
 		if transitioned {
-			h.Bus.Publish(events.KindJobFailed, jobID, j)
+			h.Bus.Publish(events.KindJobFailed, jobID, j.Redacted())
 		}
-		if denyErr != nil {
-			return noRetry(fmt.Errorf("approval collision; run stopped after deny-all failed: %w", denyErr))
+		if stopErr != nil {
+			return noRetry(fmt.Errorf("approval collision; all approvals denied but run cleanup was not confirmed: %w", stopErr))
 		}
 		return noRetry(errors.New("approval collision; all approvals denied and run stopped"))
 	}
 
 	if matched := h.matchesSessionDenial(jobID, keys); matched != "" {
-		if err := h.postApproval(ctx, runID, "deny", true, ev.RequestID, ev.RequestID); err != nil {
-			h.stopRun(runID)
-			return noRetry(fmt.Errorf("automatic session deny was indeterminate; run stopped: %w", err))
+		if err := h.postApproval(ctx, runID, "deny", false, ev.RequestID, approval.ID); err != nil {
+			return h.failAutomaticApproval(ctx, jobID, runID, approval, DecisionDenySession, err)
 		}
 		h.Bus.Publish(events.KindJobApprovalAutoDenied, jobID, map[string]any{
 			"decision": DecisionDenySession, "matched_pattern": matched, "approval": approval.Redacted(),
@@ -973,9 +1033,8 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		return err
 	}
 	if matched != "" {
-		if err := h.postApproval(ctx, runID, "deny", true, ev.RequestID, ev.RequestID); err != nil {
-			h.stopRun(runID)
-			return noRetry(fmt.Errorf("automatic permanent deny was indeterminate; run stopped: %w", err))
+		if err := h.postApproval(ctx, runID, "deny", false, ev.RequestID, approval.ID); err != nil {
+			return h.failAutomaticApproval(ctx, jobID, runID, approval, DecisionDenyAlways, err)
 		}
 		h.Bus.Publish(events.KindJobApprovalAutoDenied, jobID, map[string]any{
 			"decision": DecisionDenyAlways, "matched_pattern": matched, "approval": approval.Redacted(),
@@ -983,9 +1042,8 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		return nil
 	}
 	if matched := h.matchesSessionAllow(jobID, keys); matched != "" {
-		if err := h.postApproval(ctx, runID, "once", false, ev.RequestID, ev.RequestID); err != nil {
-			h.stopRun(runID)
-			return noRetry(fmt.Errorf("automatic session allow was indeterminate; run stopped and will not retry: %w", err))
+		if err := h.postApproval(ctx, runID, "once", false, ev.RequestID, approval.ID); err != nil {
+			return h.failAutomaticApproval(ctx, jobID, runID, approval, DecisionAllowSession, err)
 		}
 		h.Bus.Publish(events.KindJobApprovalAutoAllowed, jobID, map[string]any{
 			"decision": DecisionAllowSession, "matched_pattern": matched, "approval": approval.Redacted(),
@@ -1001,9 +1059,8 @@ func (h *Hermes) handleApprovalRequest(ctx context.Context, jobID, runID string,
 		if !ev.AllowPermanent {
 			// The current request explicitly forbids permanent grants; do not
 			// reuse a standing allow even when its exact pattern set matches.
-		} else if err := h.postApproval(ctx, runID, "once", false, ev.RequestID, ev.RequestID); err != nil {
-			h.stopRun(runID)
-			return noRetry(fmt.Errorf("automatic permanent allow was indeterminate; run stopped and will not retry: %w", err))
+		} else if err := h.postApproval(ctx, runID, "once", false, ev.RequestID, approval.ID); err != nil {
+			return h.failAutomaticApproval(ctx, jobID, runID, approval, DecisionAllowAlways, err)
 		} else {
 			h.Bus.Publish(events.KindJobApprovalAutoAllowed, jobID, map[string]any{
 				"decision": DecisionAllowAlways, "matched_pattern": matched, "approval": approval.Redacted(),
@@ -1164,69 +1221,13 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	approvalRunID := j.HermesRunID
 	if resolutionErr := h.postApproval(ctx, approvalRunID, apiChoice, false, current.ProviderRequestID, current.ID); resolutionErr != nil {
 		var apiErr *hermesAPIError
-		_ = errors.As(resolutionErr, &apiErr)
-		runTerminal := false
-		if apiErr != nil {
-			if status, ok := apiErr.Details["run_status"].(string); ok {
-				runTerminal = status == "completed" || status == "failed" || status == "cancelled"
-			}
+		if errors.As(resolutionErr, &apiErr) && apiErr.StatusCode == http.StatusConflict &&
+			(apiErr.Code == "approval_not_pending" || apiErr.Code == "approval_not_active" || apiErr.Code == "approval_request_mismatch") {
+			return h.reconcileApprovalLifecycleConflict(context.WithoutCancel(ctx), jobID, approvalRunID,
+				current, decision, apiErr)
 		}
-		var stopErr error
-		if !runTerminal {
-			stopErr = h.stopRun(approvalRunID)
-		}
-		stopConfirmed := runTerminal || stopErr == nil
-		if !stopConfirmed {
-			var stopAPI *hermesAPIError
-			if errors.As(stopErr, &stopAPI) && stopAPI.Code == "run_not_found" {
-				// A disappeared upstream run is already unable to execute the
-				// unacknowledged decision; clearing the cleanup handle is safe.
-				stopConfirmed = true
-			}
-		}
-
-		message := "approval response was indeterminate; no allow/deny decision was inferred or retried, and the run was stopped. Resume this job to inspect current state and request a fresh approval"
-		if apiErr != nil && (apiErr.Code == "approval_not_pending" || apiErr.Code == "approval_request_mismatch") {
-			message = "Hermes reported that this approval was no longer pending; this attempt was not acknowledged, no allow/deny decision was inferred or retried, and the run was stopped. Resume this job to inspect current state and request a fresh approval"
-		}
-		if runTerminal {
-			message = "Hermes reported that this approval was no longer pending and the upstream run was already terminal; no allow/deny decision was inferred or retried. Resume this job to inspect current state and request a fresh approval"
-		}
-		message += ": " + resolutionErr.Error()
-		if stopErr != nil && !stopConfirmed {
-			message += "; upstream stop could not be confirmed and the retained run ID remains a cleanup obligation: " + stopErr.Error()
-		}
-
-		transitioned := false
-		updated, updateErr := h.Store.UpdateJob(context.WithoutCancel(ctx), jobID, func(x *store.Job) {
-			if runOwnsState(x, approvalRunID) {
-				x.Status = store.StatusFailed
-				x.Error = message
-				x.Progress = &store.Progress{
-					Tool:      "approval",
-					State:     store.ApprovalStateIndeterminate,
-					Label:     "approval outcome was not acknowledged; no decision was retried; resume requires fresh approval",
-					UpdatedAt: time.Now().UTC(),
-				}
-				if stopConfirmed {
-					x.HermesRunID = ""
-				}
-				if len(x.Approvals) > 0 {
-					x.Approvals[0].State = store.ApprovalStateIndeterminate
-				}
-				transitioned = true
-			}
-		})
-		if updateErr != nil {
-			return j, fmt.Errorf("persist indeterminate approval outcome: %w", updateErr)
-		}
-		j = updated
-		if transitioned {
-			h.Bus.Publish(events.KindJobFailed, jobID, j)
-		} else {
-			return j, nil
-		}
-		return j, errors.New(j.Error)
+		return h.failIndeterminateApproval(context.WithoutCancel(ctx), jobID, approvalRunID,
+			current, decision, resolutionErr)
 	}
 	if decision == DecisionAllowAlways {
 		policyErr = h.Store.SavePermanentAllows(ctx, h.persistentPolicyKeys(current.PatternKeys), jobID)
@@ -1287,7 +1288,228 @@ func (h *Hermes) DecideApproval(ctx context.Context, jobID, approvalID, nonce, d
 	return j, nil
 }
 
-func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolveAll bool, requestID, idempotencyKey string) error {
+type hermesRunStatus struct {
+	RunID     string `json:"run_id"`
+	Status    string `json:"status"`
+	LastEvent string `json:"last_event"`
+	Output    string `json:"output"`
+	Error     string `json:"error"`
+}
+
+type terminalCleanup struct {
+	initial    hermesRunStatus
+	initialErr error
+	stopSent   bool
+	stopErr    error
+	final      hermesRunStatus
+	finalErr   error
+	terminal   bool
+}
+
+func (c terminalCleanup) err() error {
+	if c.terminal {
+		return nil
+	}
+	if c.stopErr != nil {
+		return c.stopErr
+	}
+	if c.finalErr != nil {
+		if c.initialErr != nil {
+			return fmt.Errorf("stop accepted but terminal Hermes status was not confirmed: %w (initial status: %v)", c.finalErr, c.initialErr)
+		}
+		return fmt.Errorf("stop accepted but terminal Hermes status was not confirmed: %w", c.finalErr)
+	}
+	return fmt.Errorf("stop accepted but Hermes run remains non-terminal (status=%s)", c.final.Status)
+}
+
+func (c terminalCleanup) evidence() string {
+	if !c.terminal {
+		return "; upstream stop was not confirmed: " + c.err().Error()
+	}
+	if !c.stopSent {
+		return "; upstream was already terminal, so no stop was sent"
+	}
+	if c.stopErr == nil {
+		return "; stop request was accepted and terminal status was confirmed"
+	}
+	return "; stop request outcome was not confirmed, but terminal status was confirmed after the stop attempt: " + c.stopErr.Error()
+}
+
+func terminalHermesRunStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Hermes) getRunStatus(ctx context.Context, runID string) (hermesRunStatus, error) {
+	var status hermesRunStatus
+	if err := h.doJSON(ctx, http.MethodGet, "/v1/runs/"+url.PathEscape(runID), nil, &status); err != nil {
+		return status, err
+	}
+	if status.RunID != runID {
+		return status, fmt.Errorf("Hermes run status identity mismatch: requested %q, received %q", runID, status.RunID)
+	}
+	return status, nil
+}
+
+// failAutomaticApproval applies the same fail-closed reconciliation used for an
+// operator decision to an automatic policy decision. Automatic policy is still
+// an authority action: a lost response must not be treated as a confirmed allow
+// or deny, and its attempted intent must remain auditable.
+func (h *Hermes) failAutomaticApproval(ctx context.Context, jobID, runID string,
+	approval store.Approval, decision string, cause error) error {
+	_, err := h.failIndeterminateApproval(ctx, jobID, runID, approval, decision, cause)
+	if err != nil {
+		return err
+	}
+	return noRetry(fmt.Errorf("automatic approval %q was indeterminate; no allow or deny was inferred: %w", decision, cause))
+}
+
+// failIndeterminateApproval records an authority outcome that Thornhill cannot
+// prove. It reconciles the provider run and clears the durable run handle only
+// when terminal state is proven. A retained handle is a visible reconciliation
+// obligation for restart/resume, never evidence that the run was released.
+func (h *Hermes) failIndeterminateApproval(ctx context.Context, jobID, runID string,
+	approval store.Approval, decision string, cause error) (store.Job, error) {
+	cleanup := h.stopAndConfirmTerminalOutcome(ctx, runID)
+	return h.recordIndeterminateApproval(ctx, jobID, runID, approval, decision, cause, cleanup)
+}
+
+// stopAndConfirmTerminal distinguishes an accepted stop request from proven
+// provider cleanup. Hermes normally returns status=stopping, so callers retain
+// the run ID until a follow-up status read proves a terminal state.
+func (h *Hermes) stopAndConfirmTerminal(ctx context.Context, runID string) error {
+	return h.stopAndConfirmTerminalOutcome(ctx, runID).err()
+}
+
+func (h *Hermes) stopAndConfirmTerminalOutcome(ctx context.Context, runID string) terminalCleanup {
+	if runID == "" {
+		return terminalCleanup{terminal: true}
+	}
+	outcome := terminalCleanup{}
+	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	outcome.initial, outcome.initialErr = h.getRunStatus(statusCtx, runID)
+	cancel()
+	if outcome.initialErr == nil && terminalHermesRunStatus(outcome.initial.Status) {
+		outcome.terminal = true
+		return outcome
+	}
+
+	outcome.stopSent = true
+	outcome.stopErr = h.stopRun(runID)
+	verifyCtx, verifyCancel := context.WithTimeout(ctx, 5*time.Second)
+	outcome.final, outcome.finalErr = h.getRunStatus(verifyCtx, runID)
+	verifyCancel()
+	if outcome.finalErr == nil && terminalHermesRunStatus(outcome.final.Status) {
+		outcome.terminal = true
+	}
+	return outcome
+}
+
+// reconcileApprovalLifecycleConflict treats a 409 approval_not_pending as a provider
+// lifecycle race, not as a denial. The run status is read before stopping so a
+// late response after terminal completion does not issue a redundant stop.
+func (h *Hermes) reconcileApprovalLifecycleConflict(ctx context.Context, jobID, runID string,
+	approval store.Approval, decision string, apiErr *hermesAPIError) (store.Job, error) {
+	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	status, statusErr := h.getRunStatus(statusCtx, runID)
+	cancel()
+
+	var cleanup terminalCleanup
+	if statusErr == nil && terminalHermesRunStatus(status.Status) {
+		cleanup = terminalCleanup{initial: status, terminal: true}
+	} else {
+		cleanup = h.stopAndConfirmTerminalOutcome(ctx, runID)
+	}
+	return h.recordIndeterminateApproval(ctx, jobID, runID, approval, decision, apiErr, cleanup)
+}
+
+func (h *Hermes) recordIndeterminateApproval(ctx context.Context, jobID, runID string,
+	approval store.Approval, decision string, cause error, cleanup terminalCleanup) (store.Job, error) {
+	runStatus := cleanup.initial.Status
+	statusErr := cleanup.initialErr
+	reason := fmt.Sprintf("approval outcome indeterminate: authority selected %q, but Hermes did not confirm that the decision reached the pending request; no allow or deny was inferred; resume requires a fresh authority request", decision)
+	if cause != nil {
+		reason += ": " + cause.Error()
+	}
+	if runStatus != "" {
+		reason += fmt.Sprintf("; reconciled Hermes run status=%s", runStatus)
+	}
+	if statusErr != nil {
+		reason += "; run status reconciliation failed: " + statusErr.Error()
+	}
+	if cleanup.final.Status != "" {
+		reason += fmt.Sprintf("; post-stop Hermes run status=%s", cleanup.final.Status)
+	}
+	reason += cleanup.evidence()
+
+	terminalOrStopped := cleanup.terminal
+	transitioned := false
+	j, err := h.Store.UpdateJob(ctx, jobID, func(x *store.Job) {
+		if !runOwnsState(x, runID) {
+			return
+		}
+		x.Status = store.StatusFailed
+		appendFailureEvidence(x, reason)
+		x.Progress = &store.Progress{
+			Tool:      "approval",
+			State:     store.ApprovalStateIndeterminate,
+			Label:     "approval outcome indeterminate; resume requires a fresh authority request",
+			UpdatedAt: time.Now().UTC(),
+		}
+		matchedApproval := false
+		for i := range x.Approvals {
+			if x.Approvals[i].ID == approval.ID {
+				x.Approvals[i].State = store.ApprovalStateIndeterminate
+				x.Approvals[i].Decision = decision
+				matchedApproval = true
+			}
+		}
+		if !matchedApproval {
+			if decision == DecisionDenyAlways && len(x.Approvals) > 0 {
+				// The collision path intentionally targets every currently visible
+				// approval. If that deny-all acknowledgement is lost, fence every
+				// visible entry rather than leaving a pending record after failing
+				// the job.
+				for i := range x.Approvals {
+					x.Approvals[i].State = store.ApprovalStateIndeterminate
+					x.Approvals[i].Decision = decision
+				}
+			} else if approval.ID != "" {
+				approval.State = store.ApprovalStateIndeterminate
+				approval.Decision = decision
+				x.Approvals = append(x.Approvals, approval)
+			}
+		}
+		if terminalOrStopped && x.HermesRunID == runID {
+			x.HermesRunID = ""
+		}
+		transitioned = true
+	})
+	if err != nil {
+		return j, fmt.Errorf("record indeterminate approval outcome: %w", err)
+	}
+	if !transitioned {
+		return j, nil
+	}
+	attempted := approval.Redacted()
+	attempted.Decision = decision
+	h.Bus.Publish(events.KindJobFailed, jobID, approvalIndeterminateOutcome{
+		Job:       j.Redacted(),
+		Decision:  decision,
+		Attempted: ptr(attempted),
+	})
+	h.Log.Warn("approval outcome indeterminate; fresh authority required", "job", jobID,
+		"run", runID, "approval", approval.ID, "decision", decision, "status", runStatus,
+		"status_err", statusErr, "stop_err", cleanup.stopErr)
+	return j, noRetry(errors.New(reason))
+}
+
+func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolveAll bool,
+	requestID, idempotencyKey string) error {
 	controlTimeout := h.ApprovalControlTimeout
 	if controlTimeout <= 0 {
 		controlTimeout = defaultApprovalControlTimeout
@@ -1295,21 +1517,11 @@ func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolve
 	controlCtx, cancel := context.WithTimeout(ctx, controlTimeout)
 	defer cancel()
 	var out struct {
-		Resolved       int    `json:"resolved"`
-		RequestID      string `json:"request_id"`
-		IdempotencyKey string `json:"idempotency_key"`
-		Replayed       bool   `json:"replayed"`
-	}
-	payload := map[string]any{"choice": choice, "resolve_all": resolveAll}
-	if requestID != "" {
-		payload["request_id"] = requestID
-	}
-	if idempotencyKey != "" {
-		payload["idempotency_key"] = idempotencyKey
+		Resolved int `json:"resolved"`
 	}
 	if err := h.doJSON(controlCtx, http.MethodPost,
 		"/v1/runs/"+url.PathEscape(runID)+"/approval",
-		payload, &out); err != nil {
+		approvalRequestBody(choice, resolveAll, requestID, idempotencyKey), &out); err != nil {
 		return fmt.Errorf("resolve Hermes approval: %w", err)
 	}
 	if out.Resolved != 1 && !resolveAll {
@@ -1319,6 +1531,17 @@ func (h *Hermes) postApproval(ctx context.Context, runID, choice string, resolve
 		return errors.New("Hermes reported no approval resolved")
 	}
 	return nil
+}
+
+func approvalRequestBody(choice string, resolveAll bool, requestID, idempotencyKey string) map[string]any {
+	body := map[string]any{"choice": choice, "resolve_all": resolveAll}
+	if requestID != "" {
+		body["request_id"] = requestID
+	}
+	if idempotencyKey != "" {
+		body["idempotency_key"] = idempotencyKey
+	}
+	return body
 }
 
 func (h *Hermes) stopRun(runID string) error {
@@ -1360,10 +1583,12 @@ func (h *Hermes) doJSON(ctx context.Context, method, path string, body any, out 
 				Details map[string]any `json:"details"`
 			} `json:"error"`
 		}
-		if json.Unmarshal(b, &envelope) == nil && envelope.Error.Message != "" {
+		if err := json.Unmarshal(b, &envelope); err == nil {
 			apiErr.Code = envelope.Error.Code
-			apiErr.Message = envelope.Error.Message
 			apiErr.Details = envelope.Error.Details
+			if strings.TrimSpace(envelope.Error.Message) != "" {
+				apiErr.Message = envelope.Error.Message
+			}
 		}
 		return apiErr
 	}
@@ -1405,7 +1630,7 @@ func (h *Hermes) ReleaseRun(ctx context.Context, jobID, runID string) error {
 	defer unlockApproval()
 	controlCtx, done := context.WithTimeout(ctx, 5*time.Second)
 	defer done()
-	if err := h.doJSON(controlCtx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/stop", map[string]any{}, nil); err != nil {
+	if err := h.stopAndConfirmTerminal(controlCtx, runID); err != nil {
 		return err
 	}
 	h.mu.Lock()

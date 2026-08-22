@@ -33,10 +33,11 @@ and does not describe current runtime behavior.
 - The control-call timeout starts only after an explicit decision is sent. The
   separate resource threshold parks an unresolved approval and releases its run;
   it never manufactures a decision. Resuming requires a fresh authority request.
-- Nonces, current run ownership, canonical choices, and FIFO approval order are
-  broker-enforced. Operator intent is still conveyed through the model, so the
-  UI must show the pending command/scope and the Desk prompt must continue to
-  require explicit words. Do not describe this as cryptographic proof of consent.
+- Provider request IDs (with FIFO order retained only as legacy evidence), nonces,
+  current run ownership, and canonical choices are broker-enforced. Operator
+  intent is still conveyed through the model, so the UI must show the pending
+  command/scope and the Desk prompt must continue to require explicit words.
+  Do not describe this as cryptographic proof of consent.
 
 ## Browser input is untrusted until parsed
 
@@ -54,6 +55,9 @@ type assertion, and do not leave validated application state broadly typed.
   operator board; silently hiding queued, input-blocked, or approval-bearing work
   would be a correctness failure. Keep its partial status/time index and address
   presentation growth separately if the deployment model expands.
+- Startup reconciliation separately queries failed jobs that retain a non-empty
+  `HermesRunID`; those rows are cleanup obligations, not active user work, and
+  their handles are cleared only after terminal upstream status is proven.
 - Time-range ledgers need timestamp indexes. Additive indexes are rollback-safe:
   older application images ignore them.
 
@@ -72,9 +76,11 @@ product asset and is retained indefinitely.
   outcomes, questions, authority requests, or decisions, and never replace it with
   a blanket age cutoff.
 - Nothing published on the bus or written to `event_log` may carry the one-use
-  decision nonce. `store.Approval` keeps the `json` tag because that tag is also
-  the `jobs.approvals` JSONB persistence format the broker re-reads to validate
-  authority; redact per publication with `Redacted()` instead of dropping the tag.
+  decision nonce. This includes running, failed, cancelled, orphan-reconciliation,
+  collision, and approval-resolution snapshots. `store.Approval` keeps the `json`
+  tag because that tag is also the `jobs.approvals` JSONB persistence format the
+  broker re-reads to validate authority; redact per publication with `Redacted()`
+  instead of dropping the tag.
 - Analysis reads are kind-scoped and per-job, which is what the `(kind, ts)` and
   partial `(job_id, ts)` indexes exist for.
 

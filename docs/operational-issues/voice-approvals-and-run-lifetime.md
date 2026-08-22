@@ -128,9 +128,12 @@ Thornhill retains the pending record and resource owner for retry/restart
 reconciliation rather than pretending reclamation or a decision succeeded.
 
 Process restart applies the same rule to a sole durable pending request: it parks
-the request, stops the known upstream run, and lets stale River redelivery finish
-without starting work. A request already in `sending` cannot be reconstructed as
-pending; it becomes failed with an indeterminate authority outcome instead.
+the request, reads the known upstream run status, avoids stopping an already
+terminal run, and sends one bounded stop plus a follow-up terminal-status check
+for a live run. It clears the run ID only after terminal proof; if cleanup cannot
+be confirmed, the ID remains a restart-recoverable obligation. A request already
+in `sending` cannot be reconstructed as pending; it becomes failed with an
+indeterminate authority outcome instead.
 
 Thornhill no longer wraps the whole Hermes run in a 4m30s timer, and its River
 worker reports no elapsed runtime timeout. Hermes CLI, gateway, API, ACP, MCP,
@@ -139,16 +142,22 @@ from elapsed time. Before the parking threshold, gateway heartbeats keep a
 healthy pending wait active.
 
 A decision does not make network operations unbounded. The post-decision
-approval control request has a short transport deadline. It carries the exact
-provider request ID and a durable decision-attempt key, so a transport or proxy
-replay of the same decision is idempotent on upgraded Hermes. Thornhill itself
-does not automatically retry an ambiguous authority call: a `409
-approval_not_pending` means that the provider wait is gone or no longer matches,
-not that the operator denied the action. Thornhill records `indeterminate`,
-never synthesizes allow/deny, stops the run unless Hermes already reports it
-terminal, and exposes resume guidance for a fresh request. MCP similarly
-excludes explicit elicitation-decision time from its tool transport deadline,
-then resumes ordinary deadline accounting after the decision.
+approval control request has a short transport deadline and carries the exact
+provider request ID plus a durable decision-attempt key. Upgraded Hermes
+replays an exact duplicate response without resolving another queue entry. A
+`409 approval_not_pending`, `approval_not_active`, or `approval_request_mismatch`
+means that the provider wait is gone or no longer matches; it is not evidence of
+deny and is not retried. Thornhill reads the provider run status first, sends no
+stop when the run is already terminal, sends one bounded stop for a live run, and
+records the operator's requested decision as `indeterminate` with explicit
+resume instructions. Automatic policy decisions use this same reconciliation
+path for generic timeouts, transport failures, and malformed acknowledgements;
+they are persisted as indeterminate attempted intent rather than being treated
+as confirmed allow or deny. If stop or status reconciliation cannot be confirmed, the
+Durable job retains the upstream run ID as a reconciliation obligation rather
+than claiming cleanup succeeded. MCP similarly excludes explicit
+elicitation-decision time from its tool transport deadline, then resumes
+ordinary deadline accounting after the decision.
 
 Exact one-use approval IDs/nonces, provider-request correlation, idempotency,
 collision fail-closed handling, and exact-pattern-set job/permanent policies
@@ -192,8 +201,16 @@ exact reusable approval scope are unchanged.
 Process restart still stops known in-flight Hermes runs fail-closed. Running work
 preserves the job's error and last progress evidence rather than erasing the
 uncertain outcome. A job already parked in `needs_input` retains its durable
-question and can consume a persisted answer after restart; a legacy stale run ID
-is stopped and conditionally cleared first. A sole pending approval is parked
+question and can consume a persisted answer after restart; a legacy stale
+`needs_input` run uses the same status-first cleanup proof: a terminal run is not
+stopped, a live run receives one bounded stop plus a follow-up status check, and
+Thornhill clears `HermesRunID` only after terminal proof. If status or stop
+confirmation is unavailable, the durable run ID remains for restart recovery
+instead of being discarded. Failed jobs that retain a Hermes run ID are loaded by
+startup reconciliation separately from the user-facing active-job list. Startup
+retries the cleanup and clears the handle only after terminal status is proven;
+an operator does not need to discover and resume the failed job merely to release
+an uncertain upstream resource. A sole pending approval is parked
 unresolved as described above; restart never converts it to allow or deny.
 
 `resume_job` atomically claims either a `failed` or `parked_approval` job into

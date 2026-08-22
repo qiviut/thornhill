@@ -1,13 +1,73 @@
 package dispatch
 
 import (
+	"context"
+	"encoding/json"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"thornhill/internal/events"
 	"thornhill/internal/store"
 )
+
+func TestCancelledJobEventRedactsApprovalNonce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bus := events.NewBus(nil, slog.Default())
+	eventCh := bus.Subscribe(ctx, false)
+	const nonce = "cancelled-approval-nonce"
+	j := store.Job{
+		ID: "cancelled-job", Status: store.StatusCancelled,
+		Approvals: []store.Approval{{ID: "approval", DecisionNonce: nonce, State: store.ApprovalStatePending}},
+	}
+
+	publishCancelledJob(bus, j)
+	e := <-eventCh
+	if e.Kind != events.KindJobCancelled || e.JobID != j.ID {
+		t.Fatalf("event = %+v", e)
+	}
+	var published store.Job
+	if err := json.Unmarshal(e.Payload, &published); err != nil {
+		t.Fatalf("decode event payload: %v", err)
+	}
+	if len(published.Approvals) != 1 || published.Approvals[0].DecisionNonce != "" {
+		t.Fatalf("cancelled event retained approval nonce: %+v", published.Approvals)
+	}
+	if j.Approvals[0].DecisionNonce != nonce {
+		t.Fatalf("redaction mutated durable snapshot: %+v", j.Approvals)
+	}
+}
+
+func TestQueuedJobEventRedactsApprovalNonce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bus := events.NewBus(nil, slog.Default())
+	eventCh := bus.Subscribe(ctx, false)
+	const nonce = "queued-approval-nonce"
+	j := store.Job{
+		ID: "queued-job", Status: store.StatusQueued,
+		Approvals: []store.Approval{{ID: "approval", DecisionNonce: nonce, State: store.ApprovalStatePending}},
+	}
+
+	publishQueuedJob(bus, j)
+	e := <-eventCh
+	if e.Kind != events.KindJobQueued || e.JobID != j.ID {
+		t.Fatalf("event = %+v", e)
+	}
+	var published store.Job
+	if err := json.Unmarshal(e.Payload, &published); err != nil {
+		t.Fatalf("decode event payload: %v", err)
+	}
+	if len(published.Approvals) != 1 || published.Approvals[0].DecisionNonce != "" {
+		t.Fatalf("queued event retained approval nonce: %+v", published.Approvals)
+	}
+	if j.Approvals[0].DecisionNonce != nonce {
+		t.Fatalf("redaction mutated durable snapshot: %+v", j.Approvals)
+	}
+}
 
 func TestPrepareForResumePreservesFailureEvidence(t *testing.T) {
 	finished := time.Unix(1_700_000_000, 0)

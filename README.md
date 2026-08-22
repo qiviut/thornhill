@@ -339,23 +339,30 @@ one-time grant for each concrete request. Permanent allow still requires
 explicit confirmation of its pattern-wide scope.
 
 The broker accepts a decision only for the sole active pending request and
-validates both the durable one-use approval ID/nonce and, when available, the
-Hermes provider request ID. A second concurrent request triggers deny-all and a
-fail-closed stop. Decision POSTs carry the provider request ID plus the durable
+validates the durable one-use approval ID/nonce plus the Hermes provider request
+ID when available. A second concurrent request triggers deny-all and a
+fail-closed stop. Decision POSTs carry the provider request ID and durable
 approval ID as an idempotency key; Hermes replays an exact duplicate response
-without resolving another queue entry. A `409 approval_not_pending` is a
-reconciliation signal, not a denial: Thornhill records an indeterminate outcome,
-never infers or retries allow/deny, stops the run when it is not already
-terminal, and tells the operator to resume for a fresh approval. Approval
-heartbeats keep a healthy Hermes wait active before its resource threshold
+without resolving another queue entry. A `409 approval_not_pending`,
+`approval_not_active`, or `approval_request_mismatch` is a reconciliation
+signal, not a denial:
+Thornhill reads the Hermes run status, avoids stopping an already-terminal run,
+stops a still-live run once, records an indeterminate outcome with the
+operator's requested decision, and requires resume with fresh authority. Automatic
+policy resolution failures use the same status-first reconciliation for generic
+transport/timeout or malformed-response errors and persist the attempted policy
+intent as indeterminate. It never infers allow/deny or retries the decision.
+Approval heartbeats keep a healthy Hermes wait active before its resource threshold
 without turning elapsed time into a decision. The River worker has no whole-run
-elapsed runtime deadline; explicit cancel, shutdown, execution failure, and
-durable approval parking still stop or reclaim work.
+elapsed runtime deadline; explicit cancel, shutdown, execution failure, and durable
+approval parking still stop or reclaim work.
 
 ## Job recovery and script lifecycle
 
 Browser parking never cancels durable Hermes jobs. After a Thornhill restart,
-known upstream runs are stopped fail-closed. Running/input work becomes failed
+known upstream runs are reconciled fail-closed: terminal runs are not stopped, live
+runs receive one bounded stop plus terminal-status proof, and a durable
+`HermesRunID` is cleared only after that proof. Running/input work becomes failed
 with its uncertainty recorded; a sole pending approval becomes
 `parked_approval` without any authority decision. Stale River delivery cannot
 restart parked work.
