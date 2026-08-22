@@ -1306,6 +1306,75 @@ func TestApprovalDecisionFailClosedOnIndeterminatePOST(t *testing.T) {
 	}
 }
 
+func TestApprovalNotPendingRecordsStaleIntentWithoutRetryOrRedundantStop(t *testing.T) {
+	t.Parallel()
+	var approvalBody map[string]any
+	var stopCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stale/approval" {
+			if err := json.NewDecoder(r.Body).Decode(&approvalBody); err != nil {
+				t.Errorf("decode approval body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"message":"Run has no pending approval","code":"approval_not_pending","details":{"run_status":"completed","last_event":"run.completed"}}}`)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run-stale/stop" {
+			stopCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	jobID := "job-stale-approval"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Stale approval", Status: store.StatusNeedsApproval,
+		HermesRunID: "run-stale", Approvals: []store.Approval{{
+			ID: "approval-stale", ProviderRequestID: "provider-request-7", DecisionNonce: "nonce-stale",
+			State: store.ApprovalStatePending,
+		}},
+	}}}
+	h := NewHermes(server.URL, "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	ownRun(h, jobID, "run-stale")
+
+	_, err := h.DecideApproval(context.Background(), jobID, "approval-stale", "nonce-stale", DecisionAllowOnce)
+	if err == nil || !strings.Contains(err.Error(), "no longer pending") || !strings.Contains(err.Error(), "fresh approval") {
+		t.Fatalf("stale approval error = %v", err)
+	}
+	if approvalBody["request_id"] != "provider-request-7" || approvalBody["idempotency_key"] != "approval-stale" {
+		t.Fatalf("approval correlation body = %#v", approvalBody)
+	}
+	if got := stopCalls.Load(); got != 0 {
+		t.Fatalf("terminal upstream run received %d redundant stop calls", got)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if got.Status != store.StatusFailed || got.HermesRunID != "" || len(got.Approvals) != 1 ||
+		got.Approvals[0].State != store.ApprovalStateIndeterminate || got.Progress == nil ||
+		got.Progress.State != store.ApprovalStateIndeterminate {
+		t.Fatalf("stale approval durable state = %+v", got)
+	}
+}
+
+func TestApprovalEventPersistsHermesProviderRequestID(t *testing.T) {
+	jobID := "job-provider-request"
+	fs := &fakeStore{jobs: map[string]store.Job{jobID: {
+		ID: jobID, DisplayName: "Provider correlation", Status: store.StatusRunning,
+		HermesRunID: "run-provider-request",
+	}}}
+	h := NewHermes("http://127.0.0.1:1", "", "hermes-agent", fs, events.NewBus(nil, testLog()), testLog())
+	if err := h.handleApprovalRequest(context.Background(), jobID, "run-provider-request", runEvent{
+		Event: "approval.request", RequestID: "provider-request-8", Description: "approval", PatternKeys: []string{"shell"},
+	}); err != nil {
+		t.Fatalf("handle approval request: %v", err)
+	}
+	got, _ := fs.ResolveJob(context.Background(), jobID)
+	if len(got.Approvals) != 1 || got.Approvals[0].ProviderRequestID != "provider-request-8" {
+		t.Fatalf("provider request ID was not persisted: %+v", got.Approvals)
+	}
+}
+
 func TestSecondPendingApprovalDeniesAllAndStops(t *testing.T) {
 	t.Parallel()
 	var approvalBody map[string]any
