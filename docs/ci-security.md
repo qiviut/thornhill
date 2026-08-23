@@ -73,7 +73,10 @@ classifier's own coverage for deployment installers, scanner configuration, and
 review-gate helpers. `scripts/high-risk-review.py` then binds its report to the
 actual contributor head (`pull_request.head.sha`) and base (`pull_request.base.sha`),
 not GitHub's synthetic merge ref; push and protected-main dispatch contexts use
-their event-specific revisions, including the all-zero initial-push case. Changes
+their event-specific revisions. A normal base/head pair uses the three-dot
+range; when GitHub supplies an all-zero initial-push base, the reviewer diffs the
+empty tree against the submitted head so root commits and every commit in a
+multi-commit initial push are covered. Changes
 classified as lifecycle, stateful-deployment, or pipeline-container run their
 corresponding evidence matrix. The resulting `automated-evidence-complete`
 disposition is deterministic CI evidence, not a human-review approval.
