@@ -106,6 +106,7 @@ jobs:
           RISK_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mkdir -p "${RUNNER_TEMP}/coverage"
+          python3 scripts/test-high-risk-review.py
           python3 scripts/high-risk-review.py \
             --base "${RISK_REVIEW_BASE_SHA}" \
             --head "${RISK_REVIEW_HEAD_SHA}" \
