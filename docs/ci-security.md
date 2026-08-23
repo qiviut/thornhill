@@ -68,6 +68,16 @@ The required check exercises:
 - migrations and concurrent approval claims against an ephemeral PostgreSQL container whose username, database, password, container name, host port, and test data are freshly generated from cryptographic randomness;
 - the Compose delivery model and this policy itself.
 
+Before source evidence runs, `scripts/test-high-risk-review.py` verifies the
+classifier's own coverage for deployment installers, scanner configuration, and
+review-gate helpers. `scripts/high-risk-review.py` then binds its report to the
+actual contributor head (`pull_request.head.sha`) and base (`pull_request.base.sha`),
+not GitHub's synthetic merge ref; push and protected-main dispatch contexts use
+their event-specific revisions, including the all-zero initial-push case. Changes
+classified as lifecycle, stateful-deployment, or pipeline-container run their
+corresponding evidence matrix. The resulting `automated-evidence-complete`
+disposition is deterministic CI evidence, not a human-review approval.
+
 ### 2. Promotion: branch protection decides trust
 
 Only the exact revision that passed the required check may merge to `main`. Dependabot pull requests use the same secretless qualification lane. After CI succeeds, the review `workflow_run` job may act on only an open same-repository PR whose actor and author are `dependabot[bot]`, base is `main`, branch is `dependabot/*`, and head SHA exactly matches the successful CI run. It never checks out or executes PR code and has only read access plus `pull-requests: write`. A separate merge lane re-derives the same guards and holds the branch-write grants described below. Repository-wide workflow permissions remain read-only; only those isolated jobs receive write access. This bot approval is an automation signal, not independent human review.
