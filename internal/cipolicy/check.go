@@ -4,6 +4,7 @@ package cipolicy
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,6 +31,7 @@ type workflowConcurrency struct {
 type workflowJob struct {
 	Name        string            `yaml:"name"`
 	If          string            `yaml:"if"`
+	Environment string            `yaml:"environment"`
 	Needs       any               `yaml:"needs"`
 	Permissions map[string]string `yaml:"permissions"`
 	Steps       []workflowStep    `yaml:"steps"`
@@ -39,6 +41,7 @@ type workflowStep struct {
 	Name string            `yaml:"name"`
 	If   string            `yaml:"if"`
 	Env  map[string]string `yaml:"env"`
+	With map[string]any    `yaml:"with"`
 	Uses string            `yaml:"uses"`
 	Run  string            `yaml:"run"`
 }
@@ -168,11 +171,175 @@ func Check(root string) error {
 	if err := checkScorecard(root); err != nil {
 		return err
 	}
+	if err := checkTrustedImagePublisher(root); err != nil {
+		return err
+	}
+	if err := checkProtectedCanary(root); err != nil {
+		return err
+	}
 	if err := checkPinnedImages(root); err != nil {
 		return err
 	}
 	if err := checkRollbackCompatibility(root); err != nil {
 		return err
+	}
+	return nil
+}
+
+// checkTrustedImagePublisher confines package-write authority to a protected
+// workflow_run lane. It re-derives the source run and main SHA before checkout,
+// and publishes only full-SHA image tags after final-image tests.
+func checkTrustedImagePublisher(root string) error {
+	relative := ".github/workflows/publish-images.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	text := string(data)
+	if strings.Contains(text, "secrets.") || strings.Contains(text, "pull_request_target") {
+		return fmt.Errorf("%s must not access repository secrets or use pull_request_target", relative)
+	}
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	if len(wf.On) != 1 || wf.On["workflow_run"] == nil {
+		return fmt.Errorf("%s must trigger only from workflow_run", relative)
+	}
+	wantDefaults := map[string]string{"actions": "read", "contents": "read"}
+	if len(wf.Permissions) != len(wantDefaults) {
+		return fmt.Errorf("%s must default to exactly read-only permissions", relative)
+	}
+	for name, access := range wantDefaults {
+		if wf.Permissions[name] != access {
+			return fmt.Errorf("%s default permission %s must be %s", relative, name, access)
+		}
+	}
+	publish, ok := wf.Jobs["publish"]
+	if len(wf.Jobs) != 1 || !ok || publish.If != "github.event.workflow_run.conclusion == 'success'" {
+		return fmt.Errorf("%s must contain only the success-gated publish job", relative)
+	}
+	wantJob := map[string]string{"actions": "read", "contents": "read", "packages": "write"}
+	if len(publish.Permissions) != len(wantJob) {
+		return fmt.Errorf("%s publish job must hold exactly the documented package-write permissions", relative)
+	}
+	for name, access := range wantJob {
+		if publish.Permissions[name] != access {
+			return fmt.Errorf("%s publish permission %s must be %s", relative, name, access)
+		}
+	}
+	var lane strings.Builder
+	for _, step := range publish.Steps {
+		lane.WriteString(step.Uses)
+		lane.WriteByte('\n')
+		lane.WriteString(step.Run)
+		lane.WriteByte('\n')
+		if len(step.With) != 0 {
+			with, err := yaml.Marshal(step.With)
+			if err != nil {
+				return fmt.Errorf("encode %s step inputs: %w", relative, err)
+			}
+			lane.Write(with)
+		}
+	}
+	laneText := lane.String()
+	for _, required := range []string{
+		".head_repository.full_name",
+		".head_branch",
+		".head_sha",
+		"git/ref/heads/main",
+		`[[ "${event}" == push || "${event}" == workflow_dispatch ]]`,
+		`[[ "${head_branch}" == main ]]`,
+		`[[ "${head_sha}" == "${main_sha}" ]]`,
+		"actions/checkout@",
+		"actions/download-artifact@",
+		"run-id:",
+		"github-token:",
+		"thornhill-images-",
+		"docker load",
+		"docker tag",
+		"docker login ghcr.io",
+		"docker push",
+		"org.opencontainers.image.revision",
+		"scripts/test-container-hardening.sh",
+		"@sha256:",
+		"actions/upload-artifact@",
+	} {
+		if !strings.Contains(laneText, required) {
+			return fmt.Errorf("%s must include %q", relative, required)
+		}
+	}
+	for _, forbidden := range []string{"docker buildx build", "docker build ", "docker compose build"} {
+		if strings.Contains(laneText, forbidden) {
+			return fmt.Errorf("%s must promote downloaded qualified images without rebuilding: %q", relative, forbidden)
+		}
+	}
+	return nil
+}
+
+func checkProtectedCanary(root string) error {
+	relative := ".github/workflows/canary.yml"
+	data, err := os.ReadFile(filepath.Join(root, relative))
+	if err != nil {
+		return err
+	}
+	var wf workflow
+	if err := yaml.Unmarshal(data, &wf); err != nil {
+		return fmt.Errorf("decode %s: %w", relative, err)
+	}
+	if len(wf.On) != 1 || wf.On["workflow_dispatch"] == nil {
+		return fmt.Errorf("%s must be opt-in workflow_dispatch only", relative)
+	}
+	wantPermissions := map[string]string{"actions": "read", "contents": "read"}
+	if len(wf.Permissions) != len(wantPermissions) {
+		return fmt.Errorf("%s must default to read-only permissions", relative)
+	}
+	for name, access := range wantPermissions {
+		if wf.Permissions[name] != access {
+			return fmt.Errorf("%s permission %s must be %s", relative, name, access)
+		}
+	}
+	job, ok := wf.Jobs["canary"]
+	if len(wf.Jobs) != 1 || !ok || job.If != "github.ref == 'refs/heads/main'" || job.Environment != "production-canary" {
+		return fmt.Errorf("%s must have one protected-main environment canary job", relative)
+	}
+	if len(job.Permissions) != len(wantPermissions) {
+		return fmt.Errorf("%s canary job must retain read-only permissions", relative)
+	}
+	for name, access := range wantPermissions {
+		if job.Permissions[name] != access {
+			return fmt.Errorf("%s canary job permission %s must be %s", relative, name, access)
+		}
+	}
+	var lane strings.Builder
+	for _, step := range job.Steps {
+		lane.WriteString(step.Uses)
+		lane.WriteByte('\n')
+		lane.WriteString(step.Run)
+		lane.WriteByte('\n')
+		for name, value := range step.Env {
+			lane.WriteString(name)
+			lane.WriteByte('=')
+			lane.WriteString(value)
+			lane.WriteByte('\n')
+		}
+	}
+	laneText := lane.String()
+	if strings.Contains(laneText, "inputs.base_url") || strings.Contains(laneText, "inputs.provider_url") {
+		return fmt.Errorf("%s must not route a protected provider token to dispatch-controlled URLs", relative)
+	}
+	for _, required := range []string{
+		"git/ref/heads/main",
+		"actions/checkout@",
+		"scripts/run-canary.sh",
+		"vars.THORNHILL_CANARY_BASE_URL",
+		"vars.THORNHILL_CANARY_PROVIDER_URL",
+		"THORNHILL_CANARY_PROVIDER_TOKEN",
+		"secrets.THORNHILL_CANARY_PROVIDER_TOKEN",
+	} {
+		if !strings.Contains(laneText, required) {
+			return fmt.Errorf("%s must include %q", relative, required)
+		}
 	}
 	return nil
 }
@@ -202,7 +369,7 @@ func checkRollbackCompatibility(root string) error {
 	if err := json.Unmarshal(policyData, &policy); err != nil {
 		return fmt.Errorf("decode rollback compatibility policy: %w", err)
 	}
-	if policy.SchemaSHA256 != digest {
+	if subtle.ConstantTimeCompare([]byte(policy.SchemaSHA256), []byte(digest)) != 1 {
 		return fmt.Errorf("rollback compatibility policy does not cover current schema: got %q want %q", policy.SchemaSHA256, digest)
 	}
 	if policy.Mode != "backward-compatible-additive" && policy.Mode != "manual-forward-only" {
@@ -249,7 +416,10 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 		"go tool actionlint",
 		"go tool staticcheck",
 		"go tool govulncheck",
-		"go test -race ./...",
+		"go test -race -covermode=atomic",
+		"scripts/check-coverage.py",
+		"scripts/high-risk-review.py",
+		"github.event.before",
 		"scripts/test-deployer-policy.sh",
 		"scripts/test-deployer-transition-recovery.sh",
 		"scripts/test-fuzz.sh",
@@ -269,7 +439,11 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 		"docker buildx build --check",
 		"scripts/test-container-hardening.sh",
 		"scripts/test-postgres-integration.sh",
+		"scripts/test-local-recovery.sh",
 		"scripts/run-security-scans.sh",
+		"docker save thornhill:ci",
+		"docker save thornhill-postgres:ci",
+		"thornhill-images-${{ github.sha }}",
 		"actions/upload-artifact@",
 	}); err != nil {
 		return err
@@ -332,19 +506,44 @@ func checkCIDispatchContract(wf workflow, preflight workflowJob) error {
 }
 
 func requireLaneSteps(name string, job workflowJob, required []string) error {
+	lane, err := workflowLaneText(job)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	for _, want := range required {
+		if !strings.Contains(lane, want) {
+			return fmt.Errorf("%s must include %q", name, want)
+		}
+	}
+	return nil
+}
+
+func workflowLaneText(job workflowJob) (string, error) {
 	var lane strings.Builder
 	for _, step := range job.Steps {
+		lane.WriteString(step.Name)
+		lane.WriteByte('\n')
+		lane.WriteString(step.If)
+		lane.WriteByte('\n')
+		for name, value := range step.Env {
+			lane.WriteString(name)
+			lane.WriteByte('=')
+			lane.WriteString(value)
+			lane.WriteByte('\n')
+		}
+		if len(step.With) != 0 {
+			with, err := yaml.Marshal(step.With)
+			if err != nil {
+				return "", err
+			}
+			lane.Write(with)
+		}
 		lane.WriteString(step.Uses)
 		lane.WriteByte('\n')
 		lane.WriteString(step.Run)
 		lane.WriteByte('\n')
 	}
-	for _, want := range required {
-		if !strings.Contains(lane.String(), want) {
-			return fmt.Errorf("%s must include %q", name, want)
-		}
-	}
-	return nil
+	return lane.String(), nil
 }
 
 func needs(job workflowJob, wanted string) bool {

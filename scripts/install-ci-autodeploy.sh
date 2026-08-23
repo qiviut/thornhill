@@ -6,13 +6,9 @@ if [[ "${ROOT}" == *[' ']* ]]; then
   echo "Repository path with spaces is not supported: ${ROOT@Q}" >&2
   exit 1
 fi
-for command in git gh jq docker curl flock timeout python3 systemctl stat id; do
+for command in git gh jq docker curl flock timeout python3 systemctl stat id openssl; do
   command -v "${command}" >/dev/null || { echo "Missing required command: ${command}" >&2; exit 1; }
 done
-docker buildx version >/dev/null || {
-  echo "Missing required Docker Buildx CLI plugin (install docker-buildx before enabling deployment)" >&2
-  exit 1
-}
 if [[ ! -f "${ROOT}/.env" ]]; then
   echo "Missing host-local ${ROOT}/.env" >&2
   exit 1

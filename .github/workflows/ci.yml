@@ -85,6 +85,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -98,12 +100,30 @@ jobs:
           test -z "$(gofmt -l .)"
           go tool actionlint .github/workflows/*.yml
 
+      - name: Run automated high-risk review matrix
+        env:
+          RISK_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          RISK_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/coverage"
+          python3 scripts/high-risk-review.py \
+            --base "${RISK_REVIEW_BASE_SHA}" \
+            --head "${RISK_REVIEW_HEAD_SHA}" \
+            --report "${RUNNER_TEMP}/coverage/high-risk-review.json"
+
       - name: Analyze and test Go
         run: |
           go vet ./...
           go tool staticcheck ./...
           go tool govulncheck ./...
-          go test -race ./...
+          mkdir -p "${RUNNER_TEMP}/coverage"
+          go test -race -covermode=atomic \
+            -coverprofile="${RUNNER_TEMP}/coverage/go.out" ./...
+          go tool cover -func="${RUNNER_TEMP}/coverage/go.out" \
+            >"${RUNNER_TEMP}/coverage/go.txt"
+          python3 scripts/check-coverage.py \
+            --profile "${RUNNER_TEMP}/coverage/go.out" \
+            --require thornhill/internal/bridge=75
 
       - name: Test fail-closed deployer policy
         run: scripts/test-deployer-policy.sh
@@ -135,6 +155,15 @@ jobs:
           npm run build
           npm audit --audit-level=high
 
+      - name: Preserve Go coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thornhill-coverage-${{ github.sha }}
+          path: ${{ runner.temp }}/coverage/
+          if-no-files-found: ignore
+          retention-days: 30
+
   image:
     name: Image build and security
     needs: preflight
@@ -154,6 +183,7 @@ jobs:
         run: |
           docker buildx build --pull --load \
             --build-arg "THORNHILL_REVISION=${GITHUB_SHA}" \
+            --build-arg "THORNHILL_SOURCE=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --tag thornhill:ci .
           revision_label=$(docker image inspect thornhill:ci --format='{{ index .Config.Labels "org.opencontainers.image.revision" }}')
@@ -164,13 +194,28 @@ jobs:
         # Dockerfile.postgres deliberately refreshes Alpine security packages;
         # bypass a stale cached `apk upgrade` layer so the scan covers today's
         # repository fixes rather than only the pinned upstream base.
-        run: docker buildx build --pull --no-cache --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
+        run: |
+          docker buildx build --pull --no-cache --load \
+            --build-arg "THORNHILL_REVISION=${GITHUB_SHA}" \
+            --build-arg "THORNHILL_SOURCE=https://github.com/${GITHUB_REPOSITORY}" \
+            --file Dockerfile.postgres --tag thornhill-postgres:ci .
 
       - name: Test container health and runtime hardening
         run: scripts/test-container-hardening.sh thornhill:ci thornhill-postgres:ci
 
       - name: Test randomized PostgreSQL migrations and approval claims
+        env:
+          THORNHILL_COVERAGE_DIR: ${{ runner.temp }}/coverage
         run: scripts/test-postgres-integration.sh
+
+      - name: Check integration coverage for River ownership
+        run: |
+          python3 scripts/check-coverage.py \
+            --profile "${RUNNER_TEMP}/coverage/dispatch.out" \
+            --require thornhill/internal/dispatch/queue_river.go=35
+
+      - name: Test bounded local database recovery
+        run: scripts/test-local-recovery.sh
 
       - name: Validate Compose model
         run: |
@@ -186,6 +231,42 @@ jobs:
           TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
         run: scripts/run-security-scans.sh thornhill:ci thornhill-postgres:ci
 
+      # Export the exact images that passed every image/runtime/security gate.
+      # The privileged workflow_run publisher loads these archives; it never
+      # rebuilds a supposedly qualified revision.
+      - name: Export qualified image artifacts
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/thornhill-images"
+          mkdir -p "${artifact_dir}"
+          docker save thornhill:ci | gzip -1 >"${artifact_dir}/app.tar.gz"
+          docker save thornhill-postgres:ci | gzip -1 >"${artifact_dir}/postgres.tar.gz"
+          app_revision=$(docker image inspect thornhill:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          db_revision=$(docker image inspect thornhill-postgres:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          app_id=$(docker image inspect thornhill:ci --format '{{.Id}}')
+          db_id=$(docker image inspect thornhill-postgres:ci --format '{{.Id}}')
+          jq -n \
+            --arg source_commit "${GITHUB_SHA}" \
+            --arg app_revision "${app_revision}" \
+            --arg db_revision "${db_revision}" \
+            --arg app_id "${app_id}" \
+            --arg db_id "${db_id}" \
+            '{version:1,source_commit:$source_commit,images:{app:{archive:"app.tar.gz",local_tag:"thornhill:ci",id:$app_id,revision:$app_revision},postgres:{archive:"postgres.tar.gz",local_tag:"thornhill-postgres:ci",id:$db_id,revision:$db_revision}}}' \
+            >"${artifact_dir}/manifest.json"
+          jq -e --arg expected "${GITHUB_SHA}" '
+            .version == 1 and .source_commit == $expected and
+            .images.app.revision == $expected and
+            .images.postgres.revision == $expected
+          ' "${artifact_dir}/manifest.json" >/dev/null
+
+      - name: Preserve qualified image artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thornhill-images-${{ github.sha }}
+          path: ${{ runner.temp }}/thornhill-images/
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Preserve CycloneDX SBOMs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -193,6 +274,15 @@ jobs:
           name: thornhill-sboms-${{ github.sha }}
           path: ${{ runner.temp }}/thornhill-scan/*.cdx.json
           if-no-files-found: warn
+          retention-days: 30
+
+      - name: Preserve integration coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thornhill-dispatch-coverage-${{ github.sha }}
+          path: ${{ runner.temp }}/coverage/
+          if-no-files-found: ignore
           retention-days: 30
 
   # Keep this exact check name: branch protection and the CI-gated deployer use

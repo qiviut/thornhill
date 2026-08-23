@@ -4,6 +4,18 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 controller=$(<"${root}/scripts/deploy-passed-main.sh")
 credential_helper=$(<"${root}/scripts/rotate-postgres-role-password.sh")
+recovery_helper=$(<"${root}/scripts/local-recovery.sh")
+[[ "${controller}" == *"resolve_published_images"* && "${controller}" == *"validate_digest_ref"* && \
+  "${controller}" == *"docker pull"* && "${controller}" == *"@sha256:"* && \
+  "${controller}" == *"--no-build"* && "${controller}" != *"docker buildx build"* ]] || {
+  printf 'Deployer must promote pulled CI images without rebuilding on the host\n' >&2
+  exit 1
+}
+[[ "${controller}" == *"local-recovery.sh"* && "${controller}" == *"THORNHILL_RECOVERY_SOURCE_COMMIT"* && \
+  "${recovery_helper}" == *"THORNHILL_RECOVERY_MAX_BYTES"* && "${recovery_helper}" == *"pg_restore --exit-on-error"* ]] || {
+  printf 'Deployer must create bounded local recovery and verify disposable restore\n' >&2
+  exit 1
+}
 [[ "${controller}" == *"trap on_exit EXIT"* && "${controller}" == *"trap 'exit 130' INT"* && \
   "${controller}" == *"trap 'exit 143' TERM"* && "${controller}" != *"trap on_exit EXIT INT TERM"* ]] || {
   printf 'Deployer signal traps must route INT/TERM through a nonzero EXIT rollback\n' >&2
