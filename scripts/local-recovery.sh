@@ -29,6 +29,7 @@ validate_decimal THORNHILL_RECOVERY_MIN_FREE_BYTES "${MIN_FREE_BYTES}" 268435456
 
 mkdir -p "${RECOVERY_DIR}"
 chmod 0700 "${RECOVERY_DIR}"
+RECOVERY_DIR=$(realpath -e -- "${RECOVERY_DIR}") || fail "recovery directory cannot be canonicalized"
 exec 9>"${RECOVERY_DIR}/recovery.lock"
 flock -n 9 || fail "another recovery operation is running"
 
@@ -120,9 +121,20 @@ latest_snapshot() {
 }
 
 verify_snapshot() {
-  local snapshot=$1 metadata expected_snapshot expected_sha expected_size actual_size actual_sha
+  local snapshot=$1 metadata canonical_snapshot canonical_metadata expected_snapshot expected_sha expected_size actual_size actual_sha
+  [[ -f "${snapshot}" ]] || fail "recovery snapshot is missing"
+  canonical_snapshot=$(realpath -e -- "${snapshot}") || fail "recovery snapshot cannot be canonicalized"
+  [[ "${canonical_snapshot}" == "${snapshot}" ]] ||
+    fail "recovery snapshot path must be canonical and cannot be a symlink"
+  [[ "$(dirname -- "${canonical_snapshot}")" == "${RECOVERY_DIR}" ]] ||
+    fail "recovery snapshot must be directly inside the configured recovery directory"
   metadata="${snapshot%.dump}.json"
   [[ -f "${metadata}" ]] || fail "snapshot metadata is missing"
+  canonical_metadata=$(realpath -e -- "${metadata}") || fail "snapshot metadata cannot be canonicalized"
+  [[ "${canonical_metadata}" == "${metadata}" ]] ||
+    fail "snapshot metadata path must be canonical and cannot be a symlink"
+  [[ "$(dirname -- "${canonical_metadata}")" == "${RECOVERY_DIR}" ]] ||
+    fail "snapshot metadata must be directly inside the configured recovery directory"
   jq -e --arg snapshot "${snapshot}" '
     .version == 1 and .snapshot == $snapshot and
     (.sha256 | test("^[0-9a-f]{64}$")) and
@@ -146,7 +158,6 @@ restore_check() {
     "${RECOVERY_DIR}"/snapshot-*.dump) ;;
     *) fail "snapshot must be inside the configured recovery directory" ;;
   esac
-  [[ -f "${snapshot}" ]] || fail "recovery snapshot is missing"
   verify_snapshot "${snapshot}"
   docker inspect "${DB_CONTAINER}" >/dev/null 2>&1 || fail "database container is missing"
   image=${THORNHILL_RECOVERY_POSTGRES_IMAGE:-$(docker inspect "${DB_CONTAINER}" --format '{{.Config.Image}}')}
@@ -154,8 +165,35 @@ restore_check() {
   user="r_${suffix}"
   password=$(openssl rand -hex 32)
   container="thornhill-recovery-${suffix}"
-  cleanup_restore() { docker rm --force "${container}" >/dev/null 2>&1 || true; }
-  trap cleanup_restore EXIT INT TERM
+  cleanup_restore() {
+    for _ in 1 2 3; do
+      docker info >/dev/null 2>&1 || return 1
+      if docker container inspect "${container}" >/dev/null 2>&1; then
+        docker container rm --force "${container}" >/dev/null 2>&1 || true
+      fi
+      if ! docker container inspect "${container}" >/dev/null 2>&1; then
+        docker info >/dev/null 2>&1 || return 1
+        if ! docker container inspect "${container}" >/dev/null 2>&1; then
+          return 0
+        fi
+      fi
+      sleep 1
+    done
+    return 1
+  }
+  on_restore_exit() {
+    local status=$?
+    trap '' INT TERM
+    if ! cleanup_restore; then
+      printf 'Local recovery: disposable restore cleanup could not be verified\n' >&2
+      status=1
+    fi
+    trap - EXIT INT TERM
+    exit "${status}"
+  }
+  trap on_restore_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   docker run --rm --detach --name "${container}" \
     --network none \
     --read-only \
@@ -189,8 +227,8 @@ restore_check() {
   docker exec --env "PGPASSWORD=${password}" "${container}" \
     psql --username "${user}" --dbname restored --tuples-only --no-align \
     --command 'SELECT 1' | grep -qx 1
+  cleanup_restore || fail "disposable restore cleanup could not be verified"
   trap - EXIT INT TERM
-  cleanup_restore
   printf 'Local recovery restore check passed: %s\n' "${snapshot}"
 }
 

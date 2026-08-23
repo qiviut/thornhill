@@ -37,9 +37,12 @@ entrypoint performs the same validation before the official PostgreSQL initializ
 so a malformed direct-Compose bootstrap cannot poison a fresh persistent volume.
 Recovery verification uses a disposable PostgreSQL container with no network,
 read-only root, bounded tmpfs mounts/PIDs, dropped capabilities, and
-`no-new-privileges`; `--rm` plus an explicit cleanup trap prevents normal test
-containers from becoming rollback state. Snapshot metadata is checked for path,
-integer byte count, checksum, and configured size budget before `pg_restore`.
+`no-new-privileges`; `--rm` plus an EXIT/signal cleanup trap keeps the trap active
+until Docker confirms the container is absent, and cleanup uncertainty returns
+non-zero. Snapshot and metadata paths are canonicalized with `realpath -e`, must
+be direct non-symlink children of the configured recovery directory, and are
+checked for integer byte count, checksum, and configured size budget before
+`pg_restore`.
 
 ## Build and dependency discipline
 
