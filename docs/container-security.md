@@ -40,7 +40,13 @@ so a malformed direct-Compose bootstrap cannot poison a fresh persistent volume.
 
 `Dockerfile` uses deterministic lockfile installs (`npm ci --ignore-scripts` and committed Go checksums) and an explicit multi-stage build. `.dockerignore` excludes Git metadata, local environment files, dependency trees, coverage, and developer artifacts from the build context. Build arguments are metadata only; credentials must never be passed through `ARG`, `ENV`, copied files, labels, or provenance-visible inputs.
 
-BuildKit is mandatory. CI runs Dockerfile build checks before building, and the host deployer uses `docker buildx build --pull --load`. The pinned digest fixes the starting filesystem while the readable tag keeps Dependabot updates reviewable. `--pull` ensures the pinned reference is resolved rather than accidentally using an unrelated local tag.
+BuildKit is mandatory. CI runs Dockerfile build checks before building and
+qualifies the final images; the trusted publisher transfers those exact image
+archives without rebuilding. The host deployer pulls registry tags, resolves
+their immutable digests, and uses `docker compose up --no-build`. The pinned
+digest fixes the starting filesystem while the readable tag keeps Dependabot
+updates reviewable. `--pull` ensures the pinned reference is resolved rather
+than accidentally using an unrelated local tag during CI.
 
 The PostgreSQL wrapper starts from a pinned official image and applies current Alpine repository security fixes. This is an explicit trade-off: the base is reproducible, while the final OS package set tracks security fixes available at build time. PostgreSQL builds use `--no-cache` so a previously cached `apk upgrade` layer cannot hide newly published fixes. The resulting image, rather than only its source manifest, is scanned and recorded in an SBOM.
 
@@ -88,7 +94,7 @@ No scanner is installed from an unversioned network command in CI.
 2. Rebuild and redeploy promptly after base, Go, Node, npm, PostgreSQL, scanner, or vulnerability-database changes. Do not assume a previously clean image remains clean.
 3. Retain source SHA, OCI revision label, linked binary version, status response, SBOM, CI run, and deployment receipt as the correspondence chain.
 4. Investigate scanner findings in reachability and runtime context; do not dismiss a raw package-name match, but do not present it as an exploitable incident without evidence.
-5. When images are eventually published to a registry, add registry-native SBOM and provenance attestations, bind promotion to the immutable image digest, verify signatures/attestations before deployment, and retain rollback artifacts under a documented cleanup policy.
+5. Add registry-native SBOM and provenance attestations, bind promotion to the immutable image digest, verify signatures/attestations before deployment, and retain rollback artifacts under a documented cleanup policy. The current publisher already transfers the tested CI image artifact and records its pushed digests; signing/attestation verification remains the next additive control.
 6. Periodically test clean builds, health transitions, stop behavior, rollback, and restoration from persistent data—not only warm-cache happy paths.
 
 ## Primary sources

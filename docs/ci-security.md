@@ -133,24 +133,34 @@ Read two sub-scores with context rather than at face value:
   settings; that needs an admin-scoped PAT this lane deliberately does not hold.
   The real contract is `.github/branch-protection.json`, applied and verified by
   `./scripts/apply-branch-protection.sh` and asserted by `cipolicy`.
-- **Signed-Releases** and provenance sub-scores reflect the documented absence of a
-  signed artifact lane. Promotion here is source-revision correspondence, not binary
-  artifact promotion, as described below.
+- Signed-Releases and provenance sub-scores reflect that artifact signing is not
+  part of the near-term trust model. The trusted publisher still binds the host to
+  CI-built immutable image digests; signing/attestation verification remains an
+  additive future control rather than a prerequisite for eliminating host rebuilds.
 
-### 4. Secret-bearing canaries or deployment: trusted revision only
+### 4. Trusted artifact publication and opt-in canary
 
-If a live OpenAI/Hermes canary or deployment workflow is added, trigger it from a completed successful `CI` run and fail closed unless all of these are true:
+`.github/workflows/publish-images.yml` is a privileged `workflow_run` lane. It
+runs only after successful `CI`, re-derives the source run's event, repository,
+branch, head SHA, and current protected-main SHA, then checks out that exact
+trusted revision. It downloads the image archives produced by that exact CI run,
+verifies their source/revision/image IDs, loads them without rebuilding, reruns
+the runtime qualification, pushes only full-SHA tags to GHCR, and records their
+immutable digest-qualified references as an artifact. Package-write permission
+exists only on this one job; the qualification workflow remains secretless and
+read-only. The host deployer pulls the full-SHA tags, resolves the registry
+digests, verifies OCI revision labels and the binary version, and uses those
+digest references with `docker compose up --no-build`.
 
-1. the source run event was `push` or the protected-main post-merge `workflow_dispatch`, never `pull_request`;
-2. the source repository is exactly this repository;
-3. the branch is exactly `main`;
-4. the source run SHA still equals the protected `main` SHA selected for promotion;
-5. the privileged workflow definition comes from the protected default branch;
-6. credentials come from a narrowly scoped GitHub environment, with the smallest token permissions and concurrency limits.
-
-Check out and rebuild the exact trusted SHA in the privileged lane. Do not execute mutable PR artifacts, restore contributor-controlled caches, or inherit a PR workspace. If an artifact crosses the boundary, first bind it to the source SHA and verified digest/provenance and treat it as data until revalidated.
-
-No secret-bearing GitHub lane exists today. Promotion remains host-local, so GitHub never receives Docker, host, Tailnet, or application credentials. This is preferable to adding a privileged deployment workflow before its credential and runner boundaries exist.
+`.github/workflows/canary.yml` is separately opt-in through `workflow_dispatch`.
+It runs only from `main` in the protected `production-canary` environment and
+rechecks that the supplied SHA is the current main SHA before checkout. The
+bounded harness checks the browser-facing HTML/status surface and can optionally
+call an HTTPS OpenAI-compatible `/v1/models` endpoint with a narrowly scoped
+environment token. A headless Chromium binary is used when present; it is
+required only when the environment sets `THORNHILL_CANARY_BROWSER_REQUIRED=1`.
+The canary is lower-priority evidence and never substitutes for protected-main
+CI, image qualification, or deployment read-back.
 
 ### Local trusted deployment correspondence
 
@@ -158,9 +168,11 @@ The host-side `thornhill-ci-deploy.timer` is the promotion boundary. It has no
 PR trigger and never executes a pull-request checkout. It selects the newest
 successful trusted-main CI run (`push`, or the explicit protected-main
 post-merge `workflow_dispatch`), verifies that SHA is an ancestor of current
-`origin/main`, builds from a detached worktree at that exact revision, and
-injects the full SHA into the binary and OCI image label. Once the build is
-ready, a PostgreSQL transaction atomically sets the dispatch pause. A database
+`origin/main`, and pulls the full-SHA-tagged application and PostgreSQL images
+published by `publish-images.yml`. It resolves and records their registry
+digests, verifies both OCI labels and the binary version, and starts them with
+`--no-build`; the deployment host has no build step for a promoted revision.
+Once ready, a PostgreSQL transaction atomically sets the dispatch pause. A database
 trigger then rejects inserts and transitions into `queued` or `running`, while
 already-running work may still complete or park safely. The deployer rechecks
 that no queued or active work exists before replacing the services.
@@ -175,8 +187,8 @@ an operator explicitly sets `RETRY_FAILED=1`.
 This preserves a directly inspectable chain:
 
 ```text
-GitHub trusted-main CI run → head SHA → detached source worktree → revision-tagged app
-  and PostgreSQL images → OCI app revision label → linked binary commit
+GitHub trusted-main CI run → head SHA → CI-qualified image archives →
+  revision-tagged app and PostgreSQL images → OCI app revision label → linked binary commit
   → live /api/status and PostgreSQL hardening checks → deployed.json receipt
 ```
 
@@ -205,12 +217,13 @@ migration but blocks automatic promotion and rollback. A breaking migration
 requires an operator-controlled backup/restore or forward-recovery runbook before
 deployment—not a best-effort image downgrade.
 
-This is **source-revision correspondence**, not binary artifact promotion: CI and
-the host independently rebuild the same commit. OCI labels, linker metadata,
-runtime checks, and digest-pinned bases eliminate source and base-image ambiguity,
-but the PostgreSQL wrapper deliberately applies the current Alpine security
-repository at build time. A signed CI artifact/provenance lane would still be
-required for byte-identical artifact assurance.
+This is binary artifact promotion: CI builds and qualifies the final images once,
+the trusted publisher transfers those exact archives, and the host deployer uses
+the registry digests recorded after the push. OCI labels, linker metadata, runtime
+checks, and digest-pinned bases preserve source and base-image correspondence,
+while the PostgreSQL wrapper deliberately applies the current Alpine security
+repository at build time. Signed artifact/provenance verification remains an
+additive future control for stronger registry-level assurance.
 
 The detailed container design, scanner policy, exceptions, maintenance cadence,
 and primary-source research are in [container-security.md](container-security.md).

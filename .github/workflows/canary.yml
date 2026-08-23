@@ -1,0 +1,54 @@
+name: Protected main canary
+
+# Opt-in only: the canary is deliberately lower priority than protected-main
+# qualification and artifact publication. It never runs on pull requests.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full SHA currently deployed by the protected-main controller
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  canary:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production-canary
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Verify exact protected-main SHA
+        id: main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${EXPECTED_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          main_sha=$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [[ "${EXPECTED_SHA}" == "${main_sha}" ]]
+          printf 'sha=%s\n' "${EXPECTED_SHA}" >>"${GITHUB_OUTPUT}"
+
+      - name: Check out the exact protected-main revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.main.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Run bounded browser/provider canary
+        env:
+          THORNHILL_CANARY_BASE_URL: ${{ vars.THORNHILL_CANARY_BASE_URL }}
+          THORNHILL_CANARY_EXPECTED_SHA: ${{ steps.main.outputs.sha }}
+          THORNHILL_CANARY_PROVIDER_URL: ${{ vars.THORNHILL_CANARY_PROVIDER_URL }}
+          THORNHILL_CANARY_PROVIDER_TOKEN: ${{ secrets.THORNHILL_CANARY_PROVIDER_TOKEN }}
+          THORNHILL_CANARY_BROWSER_REQUIRED: '0'
+        run: scripts/run-canary.sh

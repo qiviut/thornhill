@@ -43,8 +43,15 @@ docker exec --env "PGPASSWORD=${password}" "${container}" \
   --command "CREATE SCHEMA \"${schema}\" AUTHORIZATION \"${user}\"" >/dev/null
 
 port=$(docker inspect "${container}" --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}')
+database_url="postgres://${user}:${password}@127.0.0.1:${port}/${database}?sslmode=disable&search_path=${schema}"
 export THORNHILL_TEST_SCHEMA="${schema}"
-export THORNHILL_TEST_DATABASE_URL="postgres://${user}:${password}@127.0.0.1:${port}/${database}?sslmode=disable&search_path=${schema}"
+export THORNHILL_TEST_DATABASE_URL="${database_url}"
+
+coverage_args=()
+if [[ -n "${THORNHILL_COVERAGE_DIR:-}" ]]; then
+  mkdir -p "${THORNHILL_COVERAGE_DIR}"
+  coverage_args=(-race -covermode=atomic -coverprofile="${THORNHILL_COVERAGE_DIR}/dispatch.out")
+fi
 
 go test -tags=integration -count=1 -run '^TestPostgres(MigrationAndAtomicApprovalClaim|AttentionClaimAckAndPushOutbox|SpokenLookupPreservesAmbiguityWithManyMatches)$' ./internal/store
-go test -tags=integration -count=1 -run '^Test(DispatchAndResumeCommitWithQueueDelivery|CancelledDeliveryAndDurableAnswerCannotResurrectTerminalState)$' ./internal/dispatch
+go test -tags=integration "${coverage_args[@]}" -count=1 -run '^Test(DispatchAndResumeCommitWithQueueDelivery|CancelledDeliveryAndDurableAnswerCannotResurrectTerminalState|DuplicateDeliveryCannotStealCancellationOwner)$' ./internal/dispatch

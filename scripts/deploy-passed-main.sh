@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 REPOSITORY=${REPOSITORY:-qiviut/thornhill}
 PROJECT_NAME=${PROJECT_NAME:-thornhill}
+APP_IMAGE_REPOSITORY=${THORNHILL_APP_IMAGE_REPOSITORY:-ghcr.io/${REPOSITORY}-app}
+DB_IMAGE_REPOSITORY=${THORNHILL_DB_IMAGE_REPOSITORY:-ghcr.io/${REPOSITORY}-postgres}
 LOCAL_APP_URL=${LOCAL_APP_URL:-http://127.0.0.1:8787/}
 LOCAL_STATUS_URL=${LOCAL_STATUS_URL:-http://127.0.0.1:8787/api/status}
 PUBLIC_APP_URL=${PUBLIC_APP_URL:?set the externally reachable Thornhill URL}
@@ -281,6 +283,39 @@ verify_running_db() {
     "${pids_limit}" == 256 && "${runtime_uid}" == 70 ]]
 }
 
+validate_digest_ref() {
+  local repository=$1 reference=$2 digest
+  [[ "${reference}" == "${repository}@sha256:"* ]] || return 1
+  digest=${reference##*@sha256:}
+  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]
+}
+
+resolve_published_images() {
+  local expected=$1 app_tag db_tag app_ref db_ref app_label db_label
+  [[ "${expected}" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "${APP_IMAGE_REPOSITORY}" =~ ^[a-z0-9./_-]+$ ]] || return 1
+  [[ "${DB_IMAGE_REPOSITORY}" =~ ^[a-z0-9./_-]+$ ]] || return 1
+  app_tag="${APP_IMAGE_REPOSITORY}:${expected}"
+  db_tag="${DB_IMAGE_REPOSITORY}:${expected}"
+  echo "Pulling trusted images for ${expected}: ${app_tag}, ${db_tag}"
+  docker pull "${app_tag}" >/dev/null || return 1
+  docker pull "${db_tag}" >/dev/null || return 1
+  app_ref=$(docker image inspect "${app_tag}" --format '{{json .RepoDigests}}' |
+    jq -er --arg repo "${APP_IMAGE_REPOSITORY}" '[.[] | select(startswith($repo + "@"))][0]') || return 1
+  db_ref=$(docker image inspect "${db_tag}" --format '{{json .RepoDigests}}' |
+    jq -er --arg repo "${DB_IMAGE_REPOSITORY}" '[.[] | select(startswith($repo + "@"))][0]') || return 1
+  validate_digest_ref "${APP_IMAGE_REPOSITORY}" "${app_ref}" || return 1
+  validate_digest_ref "${DB_IMAGE_REPOSITORY}" "${db_ref}" || return 1
+  app_label=$(docker image inspect "${app_ref}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}') || return 1
+  db_label=$(docker image inspect "${db_ref}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}') || return 1
+  [[ "${app_label}" == "${expected}" && "${db_label}" == "${expected}" ]] || {
+    echo "Trusted image revision labels do not match ${expected}" >&2
+    return 1
+  }
+  image=${app_ref}
+  db_image=${db_ref}
+}
+
 verify_live_revision() {
   local expected=$1 local_revision public_revision
   curl --fail --silent --show-error --output /dev/null --max-time 15 "${LOCAL_APP_URL}" || return 1
@@ -482,7 +517,7 @@ recover_pending_transition() {
     return 1
   fi
   local controlled_path
-  for controlled_path in scripts/deploy-passed-main.sh scripts/rotate-postgres-role-password.sh; do
+  for controlled_path in scripts/deploy-passed-main.sh scripts/rotate-postgres-role-password.sh scripts/local-recovery.sh scripts/capped-copy.py; do
     if ! git diff --quiet -- "${controlled_path}" || ! git diff --cached --quiet -- "${controlled_path}" || \
       [[ $(git hash-object "${controlled_path}") != $(git rev-parse "HEAD:${controlled_path}") ]]; then
       echo "CRITICAL: modified deployment control ${controlled_path}; refusing journal recovery" >&2
@@ -718,7 +753,7 @@ if ! git merge-base --is-ancestor "${revision}" "${remote_main}"; then
   echo "Latest passing CI revision ${revision} is not an ancestor of origin/main ${remote_main}" >&2
   exit 1
 fi
-for controlled_path in scripts/deploy-passed-main.sh scripts/rotate-postgres-role-password.sh; do
+for controlled_path in scripts/deploy-passed-main.sh scripts/rotate-postgres-role-password.sh scripts/local-recovery.sh scripts/capped-copy.py; do
   if ! git diff --quiet -- "${controlled_path}" || ! git diff --cached --quiet -- "${controlled_path}"; then
     defer_or_fail_checkout "modified deployment control ${controlled_path}"
   fi
@@ -782,23 +817,10 @@ source_dir="${tmp}/source"
 previous_source_dir="${tmp}/previous"
 git worktree add --quiet --detach "${source_dir}" "${revision}"
 git worktree add --quiet --detach "${previous_source_dir}" "${previous_revision}"
-image="thornhill-app:${revision}"
-db_image="thornhill-postgres:${revision}"
-stage=build
-docker buildx version >/dev/null || {
-  echo "Docker Buildx is required for reproducible BuildKit builds; install the Docker buildx CLI plugin" >&2
-  exit 1
-}
-docker buildx build --pull --load \
-  --build-arg "THORNHILL_REVISION=${revision}" \
-  --label "org.opencontainers.image.source=https://github.com/${REPOSITORY}" \
-  --tag "${image}" "${source_dir}"
-docker buildx build --pull --no-cache --load \
-  --file "${source_dir}/Dockerfile.postgres" \
-  --tag "${db_image}" "${source_dir}"
-label=$(docker image inspect "${image}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-if [[ "${label}" != "${revision}" || $(docker run --rm "${image}" --version) != "thornhill ${revision}" ]]; then
-  echo "Built image or binary does not report ${revision}" >&2
+stage=pull
+resolve_published_images "${revision}"
+if [[ "$(docker run --rm "${image}" --version)" != "thornhill ${revision}" ]]; then
+  echo "Published application image does not report ${revision}" >&2
   exit 1
 fi
 
@@ -815,6 +837,9 @@ if [[ "${active}" != 0 ]]; then
   exit 0
 fi
 
+stage=recovery
+THORNHILL_RECOVERY_SOURCE_COMMIT="${revision}" STATE_DIR="${STATE_DIR}" \
+  PROJECT_NAME="${PROJECT_NAME}" "${source_dir}/scripts/local-recovery.sh" snapshot
 write_transition "prepared"
 deployed=true
 stage=stop

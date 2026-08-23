@@ -89,6 +89,8 @@ func policyFixture(t *testing.T) string {
 		".github/workflows/dependabot-auto-approve.yml",
 		".github/workflows/dependabot-auto-merge.yml",
 		".github/workflows/scorecard.yml",
+		".github/workflows/publish-images.yml",
+		".github/workflows/canary.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
 		"Dockerfile",
@@ -600,6 +602,26 @@ func TestCheckRejectsUnsafeScorecardLane(t *testing.T) {
 				t.Fatalf("Check() error = %v, want %q", err, tc.contain)
 			}
 		})
+	}
+}
+
+func TestCheckRejectsDispatchControlledCanaryProviderURL(t *testing.T) {
+	root := policyFixture(t)
+	path := filepath.Join(root, ".github/workflows/canary.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := strings.Replace(string(data), "vars.THORNHILL_CANARY_PROVIDER_URL", "inputs.provider_url", 1)
+	if changed == string(data) {
+		t.Fatal("fixture did not contain the protected provider URL variable")
+	}
+	if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Check(root)
+	if err == nil || !strings.Contains(err.Error(), "dispatch-controlled URLs") {
+		t.Fatalf("Check() error = %v, want dispatch-controlled URL error", err)
 	}
 }
 

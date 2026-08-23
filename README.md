@@ -155,8 +155,14 @@ The timer polls GitHub every 15 minutes for the newest successful trusted-main
 CI run (`push`, or an exact-main `workflow_dispatch`, normally emitted after a
 `GITHUB_TOKEN` Dependabot merge). An authorized manual dispatch is also valid
 promotion evidence, but it must supply the exact protected-main SHA and pass the
-same pre-checkout binding. The deployer builds that exact commit
-from a detached temporary worktree. Immediately before
+same pre-checkout binding. CI builds, scans, and runtime-qualifies the final
+images, then exports those exact image archives. The trusted `publish-images.yml`
+workflow loads the archives from that exact CI run, reruns the runtime check,
+publishes full-SHA tags to public GHCR, and records immutable `repo@sha256:...`
+references. The host deployer pulls those tags, resolves and verifies the
+registry digests plus image labels and application binary, and starts Compose
+with `--no-build`; neither the publisher nor host rebuilds a promoted revision.
+Immediately before
 replacement it atomically pauses new dispatches in PostgreSQL and rechecks that
 no work is active. It then recreates the revision-pinned app and PostgreSQL
 services. PostgreSQL receives its fast clean-shutdown signal (`SIGINT`) with a
@@ -180,6 +186,14 @@ controller defer safely, write `deferred.json` under the deployment state
 directory, and do not generate failed systemd units. Direct script execution
 continues to fail closed.
 
+Before stopping the old application, the controller creates a compressed,
+cryptographically hashed PostgreSQL snapshot in the host-local deployment state
+directory. Retention is bounded to at most two archives, each capped at 1 GiB by
+default, with a minimum free-space reserve; `scripts/local-recovery.sh
+restore-check` restores into a disposable tmpfs-backed PostgreSQL container.
+Tune the budget explicitly with `THORNHILL_RECOVERY_*` variables; there is no
+off-host backup requirement in this single-operator deployment.
+
 The current correspondence is independently checked with:
 
 ```sh
@@ -189,15 +203,16 @@ curl -fsS https://your-host.your-tailnet.ts.net:8787/api/status | jq .
 
 The durable receipt is stored at
 `~/.local/state/thornhill-ci-deploy/deployed.json`; it includes the source SHA,
-the revision-tagged application and PostgreSQL images, and the GitHub Actions
-run URL.
+the immutable digest-qualified application and PostgreSQL image references, and
+the GitHub Actions run URL.
 
 ## Verification and maintenance
 
 ```sh
 gofmt -w .
 go vet ./...
-go test -race ./...
+go test -race -covermode=atomic -coverprofile=/tmp/thornhill-coverage.out ./...
+python3 scripts/check-coverage.py --profile /tmp/thornhill-coverage.out --require thornhill/internal/bridge=75
 go tool staticcheck ./...
 go tool govulncheck ./...
 go tool actionlint .github/workflows/*.yml
@@ -206,9 +221,10 @@ go test -tags=integration -run '^TestProviderProcessConformance$' ./internal/dum
 (cd web && npm ci --ignore-scripts && npm run check && npm run lint && npm run build && npm audit --audit-level=high)
 docker buildx build --check .
 docker buildx build --pull --load --build-arg THORNHILL_REVISION=0123456789abcdef0123456789abcdef01234567 --tag thornhill:local .
-docker buildx build --pull --load --file Dockerfile.postgres --tag thornhill-postgres:ci .
+docker buildx build --pull --no-cache --load --build-arg THORNHILL_REVISION=0123456789abcdef0123456789abcdef01234567 --file Dockerfile.postgres --tag thornhill-postgres:ci .
 scripts/test-container-hardening.sh thornhill:local thornhill-postgres:ci
 scripts/test-postgres-integration.sh
+scripts/test-local-recovery.sh
 scripts/run-security-scans.sh thornhill:local thornhill-postgres:ci
 scripts/check-ci-policy.sh
 ```

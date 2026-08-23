@@ -2,6 +2,15 @@
 # human-readable tag and the immutable manifest digest.
 FROM postgres:18.6-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
 
+ARG THORNHILL_REVISION=unknown
+ARG THORNHILL_SOURCE=https://github.com/qiviut/thornhill
+
+LABEL org.opencontainers.image.title="Thornhill PostgreSQL" \
+      org.opencontainers.image.description="Pinned PostgreSQL runtime for Thornhill" \
+      org.opencontainers.image.source="${THORNHILL_SOURCE}" \
+      org.opencontainers.image.revision="${THORNHILL_REVISION}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+
 # The upstream point-release image is not rebuilt for every Alpine advisory.
 # Apply current repository security fixes, then gate the resulting image with
 # Trivy. The pinned base digest still makes the upstream starting point clear.
