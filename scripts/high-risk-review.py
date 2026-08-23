@@ -18,6 +18,7 @@ from pathlib import Path
 
 GIT_COMMAND_TIMEOUT_SECONDS = 30
 EVIDENCE_COMMAND_TIMEOUT_SECONDS = 300
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 RULES = {
     "lifecycle-ownership": (
@@ -58,11 +59,14 @@ RULES = {
 
 def changed_paths(base: str, head: str) -> list[str]:
     if base and set(base) != {"0"}:
-        revision_range = f"{base}...{head}"
+        git_args = ["git", "diff", "--name-only", f"{base}...{head}"]
     else:
-        revision_range = f"{head}^..{head}"
+        # GitHub sends an all-zero `before` for an initial push.  There may be
+        # no parent at all, and a multi-commit initial push must include every
+        # path present in the submitted head rather than only its tip commit.
+        git_args = ["git", "diff", "--name-only", EMPTY_TREE_SHA, head]
     result = subprocess.run(
-        ["git", "diff", "--name-only", revision_range],
+        git_args,
         check=True,
         capture_output=True,
         text=True,
