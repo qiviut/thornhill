@@ -35,6 +35,11 @@ must be owned by the deployment user with no group/other access, and both the
 deployer and application reject a malformed credential. The Compose database
 entrypoint performs the same validation before the official PostgreSQL initializer,
 so a malformed direct-Compose bootstrap cannot poison a fresh persistent volume.
+Recovery verification uses a disposable PostgreSQL container with no network,
+read-only root, bounded tmpfs mounts/PIDs, dropped capabilities, and
+`no-new-privileges`; `--rm` plus an explicit cleanup trap prevents normal test
+containers from becoming rollback state. Snapshot metadata is checked for path,
+integer byte count, checksum, and configured size budget before `pg_restore`.
 
 ## Build and dependency discipline
 
