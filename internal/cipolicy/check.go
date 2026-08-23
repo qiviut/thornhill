@@ -419,6 +419,7 @@ func checkQualificationLanes(wf workflow, requiredCheck string) error {
 		"go test -race -covermode=atomic",
 		"scripts/check-coverage.py",
 		"scripts/high-risk-review.py",
+		"scripts/test-high-risk-review.py",
 		"github.event.before",
 		"scripts/test-deployer-policy.sh",
 		"scripts/test-deployer-transition-recovery.sh",
