@@ -120,17 +120,21 @@ latest_snapshot() {
 }
 
 verify_snapshot() {
-  local snapshot=$1 metadata expected_snapshot expected_sha actual_sha
+  local snapshot=$1 metadata expected_snapshot expected_sha expected_size actual_size actual_sha
   metadata="${snapshot%.dump}.json"
   [[ -f "${metadata}" ]] || fail "snapshot metadata is missing"
   jq -e --arg snapshot "${snapshot}" '
     .version == 1 and .snapshot == $snapshot and
     (.sha256 | test("^[0-9a-f]{64}$")) and
-    (.size | type == "number" and . >= 1)
+    (.size | type == "number" and floor == . and . >= 1)
   ' "${metadata}" >/dev/null || fail "snapshot metadata is malformed"
   expected_snapshot=$(jq -r .snapshot "${metadata}")
   expected_sha=$(jq -r .sha256 "${metadata}")
+  expected_size=$(jq -r .size "${metadata}")
   [[ "${expected_snapshot}" == "${snapshot}" ]] || fail "snapshot metadata path does not match"
+  actual_size=$(stat -c %s "${snapshot}")
+  [[ "${actual_size}" == "${expected_size}" ]] || fail "snapshot size does not match metadata"
+  (( actual_size <= MAX_BYTES )) || fail "snapshot exceeds the configured recovery budget"
   actual_sha=$(sha256sum "${snapshot}" | awk '{print $1}')
   [[ "${actual_sha}" == "${expected_sha}" ]] || fail "snapshot checksum does not match metadata"
 }
@@ -152,7 +156,13 @@ restore_check() {
   container="thornhill-recovery-${suffix}"
   cleanup_restore() { docker rm --force "${container}" >/dev/null 2>&1 || true; }
   trap cleanup_restore EXIT INT TERM
-  docker run --detach --name "${container}" \
+  docker run --rm --detach --name "${container}" \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --cap-add SETGID --cap-add SETUID \
+    --security-opt no-new-privileges:true \
+    --pids-limit 256 \
     --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m \
     --tmpfs /run/postgresql:rw,noexec,nosuid,size=16m \
     --tmpfs /tmp:rw,noexec,nosuid,size=64m \
