@@ -49,6 +49,91 @@ func TestCheckRejectsPrivilegedPublisherCheckout(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsPublisherTriggerDrift(t *testing.T) {
+	tests := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{
+			name: "different workflow",
+			old:  "    workflows: [CI]\n",
+			new:  "    workflows: [Other]\n",
+		},
+		{
+			name: "different activity",
+			old:  "    types: [completed]\n",
+			new:  "    types: [requested]\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/publish-images.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("publisher fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), "must trigger only the completed CI workflow") {
+				t.Fatalf("Check() error = %v, want publisher trigger rejection", err)
+			}
+		})
+	}
+}
+
+func TestCheckRejectsPublisherManifestBindingDrift(t *testing.T) {
+	tests := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{
+			name: "source commit binding",
+			old:  ".version == 1 and .source_commit == $expected",
+			new:  ".version == 1 and true",
+		},
+		{
+			name: "application archive binding",
+			old:  `.images.app.archive == "app.tar.gz"`,
+			new:  "true",
+		},
+		{
+			name: "application image identity binding",
+			old:  `[[ "${app_id}" == "${expected_app_id}" ]]`,
+			new:  "true",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/publish-images.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatalf("publisher fixture did not contain %q", tc.old)
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err = Check(root)
+			if err == nil || !strings.Contains(err.Error(), "must include publisher artifact binding") {
+				t.Fatalf("Check() error = %v, want publisher manifest rejection", err)
+			}
+		})
+	}
+}
+
 func TestCheckRejectsCIQualificationLaneBypass(t *testing.T) {
 	tests := []struct {
 		name    string
