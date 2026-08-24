@@ -123,7 +123,9 @@ def main() -> int:
     if "stateful-deployment" in high_risk:
         evidence.append(run("deployer policy", ["scripts/test-deployer-policy.sh"]))
         evidence.append(run("deployer transition recovery", ["scripts/test-deployer-transition-recovery.sh"]))
-        evidence.append(run("bounded local recovery", ["scripts/test-local-recovery.sh"]))
+        # The full recovery harness needs the image built by the image lane.
+        # Keep this source-side matrix independent from another job's Docker
+        # daemon; CI runs the image-backed harness in that owning lane.
     if "pipeline-container" in high_risk:
         evidence.append(run("workflow lint", ["go", "tool", "actionlint", *(str(path) for path in sorted(Path(".github/workflows").glob("*.yml")))]))
         evidence.append(run("checked-in CI policy", ["scripts/check-ci-policy.sh"]))
