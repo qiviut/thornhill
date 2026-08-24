@@ -23,6 +23,32 @@ func TestCheckRepositoryPolicy(t *testing.T) {
 	}
 }
 
+func TestCheckRejectsPrivilegedPublisherCheckout(t *testing.T) {
+	root := policyFixture(t)
+	path := filepath.Join(root, ".github/workflows/publish-images.yml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := "      - name: Download exact qualified image artifacts\n"
+	changed := strings.Replace(
+		string(data),
+		marker,
+		"      - name: Reintroduced checkout\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"+marker,
+		1,
+	)
+	if changed == string(data) {
+		t.Fatal("publisher fixture did not contain the artifact download step")
+	}
+	if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Check(root)
+	if err == nil || !strings.Contains(err.Error(), "must not contain privileged checkout") {
+		t.Fatalf("Check() error = %v, want privileged checkout rejection", err)
+	}
+}
+
 func TestCheckRejectsCIQualificationLaneBypass(t *testing.T) {
 	tests := []struct {
 		name    string

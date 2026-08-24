@@ -155,15 +155,16 @@ Read two sub-scores with context rather than at face value:
 
 `.github/workflows/publish-images.yml` is a privileged `workflow_run` lane. It
 runs only after successful `CI`, re-derives the source run's event, repository,
-branch, head SHA, and current protected-main SHA, then checks out that exact
-trusted revision. It downloads the image archives produced by that exact CI run,
-verifies their source/revision/image IDs, loads them without rebuilding, reruns
-the runtime qualification, pushes only full-SHA tags to GHCR, and records their
-immutable digest-qualified references as an artifact. Package-write permission
-exists only on this one job; the qualification workflow remains secretless and
-read-only. The host deployer pulls the full-SHA tags, resolves the registry
-digests, verifies OCI revision labels and the binary version, and uses those
-digest references with `docker compose up --no-build`.
+branch, head SHA, and current protected-main SHA, and never checks out repository
+content in the package-write job. It downloads the image archives produced by
+that exact CI run, verifies their source/revision/image IDs, loads them without
+rebuilding, and reruns inline runtime checks against only those exact artifacts.
+It pushes only full-SHA tags to GHCR and records their immutable
+digest-qualified references as an artifact. Package-write permission exists only
+on this one job; the qualification workflow remains secretless and read-only.
+The host deployer pulls the full-SHA tags, resolves the registry digests, verifies
+OCI revision labels and the binary version, and uses those digest references with
+`docker compose up --no-build`.
 
 `.github/workflows/canary.yml` is separately opt-in through `workflow_dispatch`.
 It runs only from `main` in the protected `production-canary` environment and

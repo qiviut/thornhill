@@ -187,8 +187,9 @@ func Check(root string) error {
 }
 
 // checkTrustedImagePublisher confines package-write authority to a protected
-// workflow_run lane. It re-derives the source run and main SHA before checkout,
-// and publishes only full-SHA image tags after final-image tests.
+// workflow_run lane. It re-derives the source run and main SHA before loading
+// artifacts, never checks out repository content, and publishes only full-SHA
+// image tags after final-artifact tests.
 func checkTrustedImagePublisher(root string) error {
 	relative := ".github/workflows/publish-images.yml"
 	data, err := os.ReadFile(filepath.Join(root, relative))
@@ -251,17 +252,22 @@ func checkTrustedImagePublisher(root string) error {
 		`[[ "${event}" == push || "${event}" == workflow_dispatch ]]`,
 		`[[ "${head_branch}" == main ]]`,
 		`[[ "${head_sha}" == "${main_sha}" ]]`,
-		"actions/checkout@",
 		"actions/download-artifact@",
 		"run-id:",
 		"github-token:",
 		"thornhill-images-",
 		"docker load",
 		"docker tag",
+		"docker image inspect",
+		"docker run --rm",
+		"--read-only",
+		"--cap-drop ALL",
+		"--pids-limit 256",
+		"docker stop",
+		"docker wait",
 		"docker login ghcr.io",
 		"docker push",
 		"org.opencontainers.image.revision",
-		"scripts/test-container-hardening.sh",
 		"@sha256:",
 		"actions/upload-artifact@",
 	} {
@@ -269,9 +275,9 @@ func checkTrustedImagePublisher(root string) error {
 			return fmt.Errorf("%s must include %q", relative, required)
 		}
 	}
-	for _, forbidden := range []string{"docker buildx build", "docker build ", "docker compose build"} {
+	for _, forbidden := range []string{"actions/checkout@", "docker buildx build", "docker build ", "docker compose build"} {
 		if strings.Contains(laneText, forbidden) {
-			return fmt.Errorf("%s must promote downloaded qualified images without rebuilding: %q", relative, forbidden)
+			return fmt.Errorf("%s must not contain privileged checkout or rebuild path: %q", relative, forbidden)
 		}
 	}
 	return nil
