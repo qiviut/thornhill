@@ -46,6 +46,34 @@ type workflowStep struct {
 	Run  string            `yaml:"run"`
 }
 
+func yamlStringList(value any) ([]string, bool) {
+	values, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			return nil, false
+		}
+		result = append(result, text)
+	}
+	return result, true
+}
+
+func exactStringList(got []string, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
 type dependabotConfig struct {
 	Updates []dependabotUpdate `yaml:"updates"`
 }
@@ -207,6 +235,15 @@ func checkTrustedImagePublisher(root string) error {
 	if len(wf.On) != 1 || wf.On["workflow_run"] == nil {
 		return fmt.Errorf("%s must trigger only from workflow_run", relative)
 	}
+	workflowRun, ok := wf.On["workflow_run"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s workflow_run must select the completed CI workflow", relative)
+	}
+	workflows, workflowsOK := yamlStringList(workflowRun["workflows"])
+	types, typesOK := yamlStringList(workflowRun["types"])
+	if !workflowsOK || !exactStringList(workflows, "CI") || !typesOK || !exactStringList(types, "completed") {
+		return fmt.Errorf("%s must trigger only the completed CI workflow", relative)
+	}
 	wantDefaults := map[string]string{"actions": "read", "contents": "read"}
 	if len(wf.Permissions) != len(wantDefaults) {
 		return fmt.Errorf("%s must default to exactly read-only permissions", relative)
@@ -244,6 +281,21 @@ func checkTrustedImagePublisher(root string) error {
 		}
 	}
 	laneText := lane.String()
+	for _, required := range []string{
+		`.version == 1 and .source_commit == $expected`,
+		`.images.app.archive == "app.tar.gz"`,
+		`.images.app.local_tag == "thornhill:ci"`,
+		`.images.postgres.archive == "postgres.tar.gz"`,
+		`.images.postgres.local_tag == "thornhill-postgres:ci"`,
+		`(.images.app.id | test("^sha256:[0-9a-f]{64}$"))`,
+		`(.images.postgres.id | test("^sha256:[0-9a-f]{64}$"))`,
+		`[[ "${app_id}" == "${expected_app_id}" ]]`,
+		`[[ "${db_id}" == "${expected_db_id}" ]]`,
+	} {
+		if !strings.Contains(laneText, required) {
+			return fmt.Errorf("%s must include publisher artifact binding %q", relative, required)
+		}
+	}
 	for _, required := range []string{
 		".head_repository.full_name",
 		".head_branch",
