@@ -154,8 +154,9 @@ engine, its database, or its credentials.
 A successful protected-main CI run publishes an artifact named
 `thornhill-release-<full-SHA>`. It contains the exact app and PostgreSQL OCI
 archives, the source/image manifest, `SHA256SUMS`, CycloneDX SBOMs, the Compose
-models, and the local installer. The bundle is not rebuilt on the host. The
-installer uses `docker load` and `docker compose up --no-build`; it never uses
+models, a non-hidden `compose/env.example` template, and the local installer.
+The bundle is not rebuilt on the host. The installer uses `docker load` and
+a `docker compose up --no-build`; it never uses
 `gh`, GitHub API calls, registry pulls, SSH, or remote deployment credentials.
 
 On an operator workstation, download the artifact from the exact successful
