@@ -26,8 +26,21 @@ THORNHILL_RELEASE_CI_URL=https://github.example.invalid/actions/runs/123 \
   sha256sum -c SHA256SUMS >/dev/null
 )
 [[ -x "${bundle}/install-release.sh" ]]
+[[ -f "${bundle}/compose/env.example" ]]
+[[ ! -e "${bundle}/compose/.env.example" ]]
 [[ ! -e "${bundle}/compose/.env" ]]
 [[ ! -e "${bundle}/.env" ]]
+python3 - "${bundle}/SHA256SUMS" <<'PY'
+from pathlib import Path
+import sys
+
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    _, path = line.split(maxsplit=1)
+    if path.startswith("./"):
+        path = path[2:]
+    if any(part.startswith(".") for part in path.split("/")):
+        raise SystemExit(f"hidden bundle path cannot survive artifact upload: {path}")
+PY
 
 "${bundle}/install-release.sh" \
   --bundle "${bundle}" \

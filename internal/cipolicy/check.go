@@ -404,7 +404,7 @@ func checkLocalReleaseBundle(root string) error {
 	if err != nil {
 		return err
 	}
-	for _, required := range []string{"SHA256SUMS", "release.json", "install-release.sh"} {
+	for _, required := range []string{"SHA256SUMS", "release.json", "install-release.sh", "compose/env.example"} {
 		if !strings.Contains(string(packageData), required) {
 			return fmt.Errorf("scripts/package-local-release.sh must include %q", required)
 		}
