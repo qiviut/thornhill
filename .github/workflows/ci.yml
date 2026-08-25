@@ -129,6 +129,9 @@ jobs:
       - name: Test fail-closed deployer policy
         run: scripts/test-deployer-policy.sh
 
+      - name: Test local OCI release bundle contract
+        run: scripts/test-local-release.sh
+
       - name: Test restart-safe credential transition recovery
         run: scripts/test-deployer-transition-recovery.sh
 
@@ -233,8 +236,8 @@ jobs:
         run: scripts/run-security-scans.sh thornhill:ci thornhill-postgres:ci
 
       # Export the exact images that passed every image/runtime/security gate.
-      # The privileged workflow_run publisher loads these archives; it never
-      # rebuilds a supposedly qualified revision.
+      # The archives feed both the retained raw image artifact and the
+      # operator-installed local release bundle; neither path rebuilds them.
       - name: Export qualified image artifacts
         run: |
           set -euo pipefail
@@ -259,6 +262,24 @@ jobs:
             .images.app.revision == $expected and
             .images.postgres.revision == $expected
           ' "${artifact_dir}/manifest.json" >/dev/null
+
+      - name: Assemble operator-installed local release bundle
+        run: |
+          scripts/package-local-release.sh \
+            --artifact-dir "${RUNNER_TEMP}/thornhill-images" \
+            --output-dir "${RUNNER_TEMP}/thornhill-release" \
+            --revision "${GITHUB_SHA}" \
+            --ci-run-id "${GITHUB_RUN_ID}" \
+            --ci-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --scan-dir "${RUNNER_TEMP}/thornhill-scan"
+
+      - name: Preserve operator-installed local release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thornhill-release-${{ github.sha }}
+          path: ${{ runner.temp }}/thornhill-release/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Preserve qualified image artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

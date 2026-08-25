@@ -202,6 +202,9 @@ func Check(root string) error {
 	if err := checkTrustedImagePublisher(root); err != nil {
 		return err
 	}
+	if err := checkLocalReleaseBundle(root); err != nil {
+		return err
+	}
 	if err := checkProtectedCanary(root); err != nil {
 		return err
 	}
@@ -214,14 +217,21 @@ func Check(root string) error {
 	return nil
 }
 
-// checkTrustedImagePublisher confines package-write authority to a protected
-// workflow_run lane. It re-derives the source run and main SHA before loading
-// artifacts, never checks out repository content, and publishes only full-SHA
-// image tags after final-artifact tests.
+// checkTrustedImagePublisher keeps the retired registry publisher absent. The
+// local bundle workflow is the only supported publication path.
 func checkTrustedImagePublisher(root string) error {
 	relative := ".github/workflows/publish-images.yml"
-	data, err := os.ReadFile(filepath.Join(root, relative))
+	publisherPath := filepath.Join(root, relative)
+	if _, err := os.Stat(publisherPath); err == nil {
+		return fmt.Errorf("%s is retired; use the operator-installed local bundle", relative)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	data, err := os.ReadFile(publisherPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
 	text := string(data)
@@ -330,6 +340,73 @@ func checkTrustedImagePublisher(root string) error {
 	for _, forbidden := range []string{"actions/checkout@", "docker buildx build", "docker build ", "docker compose build"} {
 		if strings.Contains(laneText, forbidden) {
 			return fmt.Errorf("%s must not contain privileged checkout or rebuild path: %q", relative, forbidden)
+		}
+	}
+	return nil
+}
+
+func checkLocalReleaseBundle(root string) error {
+	workflowPath := filepath.Join(root, ".github/workflows/ci.yml")
+	workflowData, err := os.ReadFile(workflowPath)
+	if err != nil {
+		return err
+	}
+	workflowText := string(workflowData)
+	for _, required := range []string{
+		"scripts/test-local-release.sh",
+		"scripts/package-local-release.sh",
+		"--output-dir \"${RUNNER_TEMP}/thornhill-release\"",
+		"--scan-dir \"${RUNNER_TEMP}/thornhill-scan\"",
+		"name: thornhill-release-${{ github.sha }}",
+		"actions/upload-artifact@",
+	} {
+		if !strings.Contains(workflowText, required) {
+			return fmt.Errorf("%s must include local release bundle contract %q", workflowPath, required)
+		}
+	}
+	for _, forbidden := range []string{
+		"packages: write",
+		"docker login ghcr.io",
+		"docker push",
+		"docker pull",
+		"ssh ",
+	} {
+		if strings.Contains(workflowText, forbidden) {
+			return fmt.Errorf("%s must not grant or use remote publication authority %q", workflowPath, forbidden)
+		}
+	}
+
+	for _, relative := range []string{
+		"scripts/package-local-release.sh",
+		"scripts/install-local-release.sh",
+		"scripts/test-local-release.sh",
+	} {
+		path := filepath.Join(root, relative)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		text := string(data)
+		if strings.Contains(text, "docker pull") || strings.Contains(text, "docker push") || strings.Contains(text, "gh api") {
+			return fmt.Errorf("%s must remain local-only and must not pull, push, or call GitHub", relative)
+		}
+	}
+	installerData, err := os.ReadFile(filepath.Join(root, "scripts/install-local-release.sh"))
+	if err != nil {
+		return err
+	}
+	for _, required := range []string{"docker load", "config --quiet", "--no-build", "wait_for_runtime", "transition.json"} {
+		if !strings.Contains(string(installerData), required) {
+			return fmt.Errorf("scripts/install-local-release.sh must include %q", required)
+		}
+	}
+	packageData, err := os.ReadFile(filepath.Join(root, "scripts/package-local-release.sh"))
+	if err != nil {
+		return err
+	}
+	for _, required := range []string{"SHA256SUMS", "release.json", "install-release.sh"} {
+		if !strings.Contains(string(packageData), required) {
+			return fmt.Errorf("scripts/package-local-release.sh must include %q", required)
 		}
 	}
 	return nil

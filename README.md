@@ -143,68 +143,75 @@ Production images embed the full Git commit and expose it at `GET /api/status`.
 A normal local build deliberately reports `unversioned`; it must not be confused
 with a CI-corresponding deployment.
 
-On the Thornhill host, install the user deployment service and optional timer:
+### Operator-installed CI release bundles
+
+The deployment authority is the local operator, not GitHub Actions. Do not install
+or re-enable `scripts/install-ci-autodeploy.sh`; the old GitHub-polling timer is
+retired on the Thornhill host. CI still builds, scans, runtime-qualifies, and
+exports the exact image archives, but it does not access the server, its Docker
+engine, its database, or its credentials.
+
+A successful protected-main CI run publishes an artifact named
+`thornhill-release-<full-SHA>`. It contains the exact app and PostgreSQL OCI
+archives, the source/image manifest, `SHA256SUMS`, CycloneDX SBOMs, the Compose
+models, and the local installer. The bundle is not rebuilt on the host. The
+installer uses `docker load` and `docker compose up --no-build`; it never uses
+`gh`, GitHub API calls, registry pulls, SSH, or remote deployment credentials.
+
+On an operator workstation, download the artifact from the exact successful
+protected-main run and transfer the resulting directory to the host through an
+approved local path:
 
 ```sh
-PUBLIC_APP_URL=https://your-host.your-tailnet.ts.net:8787/ \
-PUBLIC_STATUS_URL=https://your-host.your-tailnet.ts.net:8787/api/status \
-  ./scripts/install-ci-autodeploy.sh
+gh run download RUN_ID \
+  --repo qiviut/thornhill \
+  --name thornhill-release-FULL_SHA \
+  --dir /tmp/thornhill-release-FULL_SHA
+# Transfer /tmp/thornhill-release-FULL_SHA to the host by the approved local method.
 ```
 
-The timer polls GitHub every 15 minutes for the newest successful trusted-main
-CI run (`push`, or an exact-main `workflow_dispatch`, normally emitted after a
-`GITHUB_TOKEN` Dependabot merge). An authorized manual dispatch is also valid
-promotion evidence, but it must supply the exact protected-main SHA and pass the
-same pre-checkout binding. CI builds, scans, and runtime-qualifies the final
-images, then exports those exact image archives. The trusted `publish-images.yml`
-workflow loads the archives from that exact CI run, reruns the runtime check,
-publishes full-SHA tags to public GHCR, and records immutable `repo@sha256:...`
-references. The host deployer pulls those tags, resolves and verifies the
-registry digests plus image labels and application binary, and starts Compose
-with `--no-build`; neither the publisher nor host rebuilds a promoted revision.
-Immediately before
-replacement it atomically pauses new dispatches in PostgreSQL and rechecks that
-no work is active. It then recreates the revision-pinned app and PostgreSQL
-services. PostgreSQL receives its fast clean-shutdown signal (`SIGINT`) with a
-30-second grace period after the old application is stopped, so lingering
-connections cannot turn a routine replacement into crash recovery. PostgreSQL
-runs directly as PID 1 so the signal reaches its UID-70 process without granting
-`CAP_KILL` to a root-owned init shim. On the one-time upgrade from the former
-shim model, the controller disables its persisted automatic-restart policy,
-asks PostgreSQL to checkpoint and stop through `pg_ctl` running as UID 70, and
-verifies that it remains cleanly stopped before recreation. The controller stops
-the already identified app and database containers directly, so shutdown cannot
-be blocked by Compose image-variable interpolation. Every deployment and rollback
-samples both app and database state after stop and requires a stable
-`Running=false`, `Restarting=false`, exit-zero result; missing, forced, or
-ambiguous stops fail closed before recreation. The controller then verifies the
-UI, status endpoint, OCI label, binary revision, and database runtime. Failed
-verification restores the prior revision's image **and Compose model**; the bad
-SHA is quarantined instead of being retried. During active development the timer
-may be stopped. Polls against a modified or revision-mismatched deployment
-controller defer safely, write `deferred.json` under the deployment state
-directory, and do not generate failed systemd units. Direct script execution
-continues to fail closed.
-
-Before stopping the old application, the controller creates a compressed,
-cryptographically hashed PostgreSQL snapshot in the host-local deployment state
-directory. Retention is bounded to at most two archives, each capped at 1 GiB by
-default, with a minimum free-space reserve; `scripts/local-recovery.sh
-restore-check` restores into a disposable tmpfs-backed PostgreSQL container.
-Tune the budget explicitly with `THORNHILL_RECOVERY_*` variables; there is no
-off-host backup requirement in this single-operator deployment.
-
-The current correspondence is independently checked with:
+On the host, first verify without changing containers or loading images:
 
 ```sh
-CHECK_ONLY=1 ./scripts/deploy-passed-main.sh
-curl -fsS https://your-host.your-tailnet.ts.net:8787/api/status | jq .
+./install-release.sh \
+  --bundle /path/to/thornhill-release-FULL_SHA \
+  --env-file /home/operator/projects/thornhill/.env \
+  --expected-sha FULL_SHA \
+  --check-only
 ```
 
-The durable receipt is stored at
-`~/.local/state/thornhill-ci-deploy/deployed.json`; it includes the source SHA,
-the immutable digest-qualified application and PostgreSQL image references, and
-the GitHub Actions run URL.
+Then install deliberately, preserving the existing `.env`, Compose project name,
+PostgreSQL volume, application volume, and runtime hardening:
+
+```sh
+./install-release.sh \
+  --bundle /path/to/thornhill-release-FULL_SHA \
+  --env-file /home/operator/projects/thornhill/.env \
+  --expected-sha FULL_SHA \
+  --local-app-url http://127.0.0.1:8787/ \
+  --local-status-url http://127.0.0.1:8787/api/status \
+  --public-app-url https://your-host.your-tailnet.ts.net:8787/ \
+  --public-status-url https://your-host.your-tailnet.ts.net:8787/api/status
+```
+
+The installer verifies the exact source SHA, image IDs, OCI revision labels, and
+bundle checksums before loading anything. It checks the current deployment and
+configured database credential, pauses new dispatches, refuses to proceed while
+work is active, creates a bounded local PostgreSQL recovery snapshot, stops the
+application before PostgreSQL, recreates both services without a build, and
+verifies both status paths, the application binary, database health, and database
+hardening. A failed replacement attempts to restore the previous local image
+references and leaves dispatch paused if rollback cannot be verified. A verified
+rollback records a non-secret `failed.json` quarantine marker; retrying that exact
+revision requires an explicit `RETRY_FAILED=1` after operator review. An unresolved
+`transition.json` blocks subsequent installs until recovery is addressed.
+
+Receipts and transition state are stored under
+`~/.local/state/thornhill-local-release/`; recovery snapshots remain in its
+`recovery/` directory. The host-local `.env` is never copied into the bundle or
+sent to GitHub. The older registry-based controller and its source files remain
+in the repository only as historical/rollback reference until their separate
+cleanup change is reviewed.
 
 ## Verification and maintenance
 
@@ -225,6 +232,7 @@ docker buildx build --pull --no-cache --load --build-arg THORNHILL_REVISION=0123
 scripts/test-container-hardening.sh thornhill:local thornhill-postgres:ci
 scripts/test-postgres-integration.sh
 scripts/test-local-recovery.sh
+scripts/test-local-release.sh
 scripts/run-security-scans.sh thornhill:local thornhill-postgres:ci
 scripts/check-ci-policy.sh
 ```

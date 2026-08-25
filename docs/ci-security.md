@@ -146,98 +146,73 @@ Read two sub-scores with context rather than at face value:
   settings; that needs an admin-scoped PAT this lane deliberately does not hold.
   The real contract is `.github/branch-protection.json`, applied and verified by
   `./scripts/apply-branch-protection.sh` and asserted by `cipolicy`.
-- Signed-Releases and provenance sub-scores reflect that artifact signing is not
-  part of the near-term trust model. The trusted publisher still binds the host to
-  CI-built immutable image digests; signing/attestation verification remains an
-  additive future control rather than a prerequisite for eliminating host rebuilds.
+- Signed-Releases and provenance sub-scores reflect that detached artifact signing
+  is not part of the near-term trust model. The local bundle still binds the host
+  to CI-built image IDs and the exact protected-main SHA; signing/attestation
+  verification remains an additive future control.
 
-### 4. Trusted artifact publication and opt-in canary
+### 4. Operator-installed release bundles
 
-`.github/workflows/publish-images.yml` is a privileged `workflow_run` lane. It
-runs only after successful `CI`, re-derives the source run's event, repository,
-branch, head SHA, and current protected-main SHA, and never checks out repository
-content in the package-write job. It downloads the image archives produced by
-that exact CI run, verifies their source/revision/image IDs, loads them without
-rebuilding, and reruns inline runtime checks against only those exact artifacts.
-It pushes only full-SHA tags to GHCR and records their immutable
-digest-qualified references as an artifact. Package-write permission exists only
-on this one job; the qualification workflow remains secretless and read-only.
-The host deployer pulls the full-SHA tags, resolves the registry digests, verifies
-OCI revision labels and the binary version, and uses those digest references with
-`docker compose up --no-build`.
+The qualification workflow remains secretless and read-only. After the image,
+runtime, security, and SBOM gates pass, the image lane assembles an artifact named
+`thornhill-release-<full-SHA>`. That bundle contains the exact OCI archives,
+source/image manifest, checksums, SBOMs, Compose models, and local installer. It
+is produced from the already-qualified images; it does not rebuild them.
 
-`.github/workflows/canary.yml` is separately opt-in through `workflow_dispatch`.
-It runs only from `main` in the protected `production-canary` environment and
-rechecks that the supplied SHA is the current main SHA before checkout. The
-bounded harness checks the browser-facing HTML/status surface and can optionally
-call an HTTPS OpenAI-compatible `/v1/models` endpoint with a narrowly scoped
-environment token. A headless Chromium binary is used when present; it is
-required only when the environment sets `THORNHILL_CANARY_BROWSER_REQUIRED=1`.
+A registry publisher is not the production promotion authority for this model. The
+host receives a bundle through an operator-approved transfer path. GitHub Actions
+has no SSH, Tailnet, Docker, database, server, or deployment credentials. The
+operator selects the exact successful protected-main run, downloads the matching
+bundle, verifies the full source SHA and artifact checksums, and invokes the
+installer locally. Detached signing/attestation can be added as a stronger
+artifact-authenticity control; the current required binding is the operator's
+exact protected-main CI evidence plus the bundle's source/image/checksum checks.
+
+`.github/workflows/canary.yml` remains separately opt-in through
+`workflow_dispatch`. It runs only from `main` in the protected
+`production-canary` environment and rechecks the supplied SHA before checkout.
 The canary is lower-priority evidence and never substitutes for protected-main
-CI, image qualification, or deployment read-back.
+CI, image qualification, or local package installation read-back.
 
-### Local trusted deployment correspondence
+### Local release installation correspondence
 
-The host-side `thornhill-ci-deploy.timer` is the promotion boundary. It has no
-PR trigger and never executes a pull-request checkout. It selects the newest
-successful trusted-main CI run (`push`, or the explicit protected-main
-post-merge `workflow_dispatch`), verifies that SHA is an ancestor of current
-`origin/main`, and pulls the full-SHA-tagged application and PostgreSQL images
-published by `publish-images.yml`. It resolves and records their registry
-digests, verifies both OCI labels and the binary version, and starts them with
-`--no-build`; the deployment host has no build step for a promoted revision.
-Once ready, a PostgreSQL transaction atomically sets the dispatch pause. A database
-trigger then rejects inserts and transitions into `queued` or `running`, while
-already-running work may still complete or park safely. The deployer rechecks
-that no queued or active work exists before replacing the services.
+The local `scripts/install-local-release.sh` is the promotion boundary. It accepts
+only an operator-supplied bundle and exact expected SHA. It does not invoke `gh`,
+GitHub APIs, registry pulls, SSH, or remote deployment. It uses `docker load` for
+the two bundle archives and `docker compose up --no-build` against the existing
+Compose project name and host `.env`.
 
-Both local and Tailnet UI/status probes, the running OCI label, and the in-container
-binary must agree. Failure restores the prior application **and PostgreSQL**
-images using the prior revision's Compose model, force-recreates both services,
-and verifies the rollback. A revision that fails host verification
-is recorded in `failed.json` and suppressed until a newer passing SHA arrives or
-an operator explicitly sets `RETRY_FAILED=1`.
+Before any container mutation it verifies:
 
-This preserves a directly inspectable chain:
+- release metadata and the exact expected full source SHA;
+- the app/PostgreSQL image IDs, image revision labels, and all `SHA256SUMS` entries;
+- host `.env` ownership and mode without printing its contents;
+- the currently running local/Tailnet revision, image labels, binary version,
+  database health, runtime UID, and database hardening;
+- the configured database password through the disposable client path.
+
+The installer then creates a bounded host-local PostgreSQL recovery snapshot,
+atomically pauses new dispatches, refuses to proceed while queued or active work
+exists, stops the application before PostgreSQL, and recreates both services
+without a build. It verifies both status paths, the in-container binary, database
+health, and hardening after startup. It records a local receipt and transition
+journal. A failed replacement attempts to restore locally tagged previous images;
+if rollback cannot be verified, dispatch remains paused for operator recovery.
+
+This preserves the inspectable chain:
 
 ```text
-GitHub trusted-main CI run → head SHA → CI-qualified image archives →
-  revision-tagged app and PostgreSQL images → OCI app revision label → linked binary commit
-  → live /api/status and PostgreSQL hardening checks → deployed.json receipt
+Protected-main CI run → exact head SHA → qualified image archives →
+  bundle manifest/checksums → docker load image IDs → OCI labels → binary commit
+  → live status endpoints and PostgreSQL hardening → local deployed receipt
 ```
 
-The timer deliberately polls from the host rather than giving GitHub a Tailnet
-or Docker credential. The externally reachable UI and status URLs are required
-host-local service environment values (`PUBLIC_APP_URL` and
-`PUBLIC_STATUS_URL`); they are never committed as deployment defaults.
-Polling is a convergence mechanism, not a release-time requirement: the timer
-runs every 15 minutes and may remain disabled during active development. If the
-shared checkout has a modified deployment controller, or that controller does
-not match the selected passing revision, poll mode records the reason in
-`~/.local/state/thornhill-ci-deploy/deferred.json`, exits successfully without
-deploying, and stays quiet. Direct script execution remains fail-closed for the
-same conditions. After a merge, update the checkout, run the service once, and
-enable the timer only after the deployed receipt and live revision agree.
-`CHECK_ONLY=1 scripts/deploy-passed-main.sh` fails whenever the live revision
-differs from the latest passing CI revision. It also fails if another deployment
-holds the lock; lock contention is never reported as successful correspondence.
-
-Automatic rollback reuses the persistent database after candidate startup has
-applied its schema. `docs/rollback-compatibility.json` therefore binds an
-explicit compatibility mode and rationale to the SHA-256 of the embedded schema
-SQL. CI rejects an uncovered schema edit. The host deployer accepts only
-`backward-compatible-additive`; `manual-forward-only` documents an incompatible
-migration but blocks automatic promotion and rollback. A breaking migration
-requires an operator-controlled backup/restore or forward-recovery runbook before
-deployment—not a best-effort image downgrade.
-
-This is binary artifact promotion: CI builds and qualifies the final images once,
-the trusted publisher transfers those exact archives, and the host deployer uses
-the registry digests recorded after the push. OCI labels, linker metadata, runtime
-checks, and digest-pinned bases preserve source and base-image correspondence,
-while the PostgreSQL wrapper deliberately applies the current Alpine security
-repository at build time. Signed artifact/provenance verification remains an
-additive future control for stronger registry-level assurance.
+The former `thornhill-ci-deploy.timer`/registry controller is not part of this
+promotion path and must remain disabled. Its source files are retained only until
+a separate cleanup/removal change is reviewed. `docs/rollback-compatibility.json`
+continues to document migration compatibility for any future package that changes
+schema; incompatible migrations require an explicit operator backup/restore path
+rather than an automatic downgrade.
 
 The detailed container design, scanner policy, exceptions, maintenance cadence,
 and primary-source research are in [container-security.md](container-security.md).

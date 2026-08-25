@@ -23,114 +23,14 @@ func TestCheckRepositoryPolicy(t *testing.T) {
 	}
 }
 
-func TestCheckRejectsPrivilegedPublisherCheckout(t *testing.T) {
+func TestCheckRejectsRetiredRegistryPublisher(t *testing.T) {
 	root := policyFixture(t)
 	path := filepath.Join(root, ".github/workflows/publish-images.yml")
-	data, err := os.ReadFile(path)
-	if err != nil {
+	if err := os.WriteFile(path, []byte("name: retired\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marker := "      - name: Download exact qualified image artifacts\n"
-	changed := strings.Replace(
-		string(data),
-		marker,
-		"      - name: Reintroduced checkout\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"+marker,
-		1,
-	)
-	if changed == string(data) {
-		t.Fatal("publisher fixture did not contain the artifact download step")
-	}
-	if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err = Check(root)
-	if err == nil || !strings.Contains(err.Error(), "must not contain privileged checkout") {
-		t.Fatalf("Check() error = %v, want privileged checkout rejection", err)
-	}
-}
-
-func TestCheckRejectsPublisherTriggerDrift(t *testing.T) {
-	tests := []struct {
-		name string
-		old  string
-		new  string
-	}{
-		{
-			name: "different workflow",
-			old:  "    workflows: [CI]\n",
-			new:  "    workflows: [Other]\n",
-		},
-		{
-			name: "different activity",
-			old:  "    types: [completed]\n",
-			new:  "    types: [requested]\n",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			root := policyFixture(t)
-			path := filepath.Join(root, ".github/workflows/publish-images.yml")
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed := strings.Replace(string(data), tc.old, tc.new, 1)
-			if changed == string(data) {
-				t.Fatalf("publisher fixture did not contain %q", tc.old)
-			}
-			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			err = Check(root)
-			if err == nil || !strings.Contains(err.Error(), "must trigger only the completed CI workflow") {
-				t.Fatalf("Check() error = %v, want publisher trigger rejection", err)
-			}
-		})
-	}
-}
-
-func TestCheckRejectsPublisherManifestBindingDrift(t *testing.T) {
-	tests := []struct {
-		name string
-		old  string
-		new  string
-	}{
-		{
-			name: "source commit binding",
-			old:  ".version == 1 and .source_commit == $expected",
-			new:  ".version == 1 and true",
-		},
-		{
-			name: "application archive binding",
-			old:  `.images.app.archive == "app.tar.gz"`,
-			new:  "true",
-		},
-		{
-			name: "application image identity binding",
-			old:  `[[ "${app_id}" == "${expected_app_id}" ]]`,
-			new:  "true",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			root := policyFixture(t)
-			path := filepath.Join(root, ".github/workflows/publish-images.yml")
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			changed := strings.Replace(string(data), tc.old, tc.new, 1)
-			if changed == string(data) {
-				t.Fatalf("publisher fixture did not contain %q", tc.old)
-			}
-			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			err = Check(root)
-			if err == nil || !strings.Contains(err.Error(), "must include publisher artifact binding") {
-				t.Fatalf("Check() error = %v, want publisher manifest rejection", err)
-			}
-		})
+	if err := Check(root); err == nil || !strings.Contains(err.Error(), "is retired") {
+		t.Fatalf("Check() error = %v, want retired publisher rejection", err)
 	}
 }
 
@@ -200,7 +100,6 @@ func policyFixture(t *testing.T) string {
 		".github/workflows/dependabot-auto-approve.yml",
 		".github/workflows/dependabot-auto-merge.yml",
 		".github/workflows/scorecard.yml",
-		".github/workflows/publish-images.yml",
 		".github/workflows/canary.yml",
 		".github/workflows/ci.yml",
 		".github/workflows/fuzz.yml",
@@ -209,6 +108,9 @@ func policyFixture(t *testing.T) string {
 		"docs/rollback-compatibility.json",
 		"internal/store/store.go",
 		"scripts/deploy-passed-main.sh",
+		"scripts/package-local-release.sh",
+		"scripts/install-local-release.sh",
+		"scripts/test-local-release.sh",
 	} {
 		data, err := os.ReadFile(filepath.Join(source, relative))
 		if err != nil {

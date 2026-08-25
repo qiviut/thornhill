@@ -75,6 +75,7 @@ def main() -> None:
     check_initial_push_ranges(review)
     paths = [
         "scripts/install-ci-autodeploy.sh",
+        "scripts/install-local-release.sh",
         ".github/scanners/compose.yml",
         "scripts/test-high-risk-review.py",
     ]
@@ -82,6 +83,10 @@ def main() -> None:
     require(
         "scripts/install-ci-autodeploy.sh" in categories["stateful-deployment"],
         "deployment installer is not stateful high-risk",
+    )
+    require(
+        "scripts/install-local-release.sh" in categories["stateful-deployment"],
+        "local release installer is not stateful high-risk",
     )
     require(
         ".github/scanners/compose.yml" in categories["pipeline-container"],
