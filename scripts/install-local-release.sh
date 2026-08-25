@@ -221,6 +221,8 @@ status_revision() {
 }
 
 db_sql() {
+  # The single-quoted command intentionally expands DB variables in the container.
+  # shellcheck disable=SC2016
   timeout 15s docker exec -i "${PROJECT_NAME}-db-1" \
     sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atq'
 }
