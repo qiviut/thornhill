@@ -301,14 +301,20 @@ Before shipping a revision:
 4. Build both container images; verify the app image label and binary version
    contain the candidate source revision.
 5. Push the complete code, test, documentation, and issue-ledger commit and wait
-   for the exact GitHub Actions push SHA to pass.
-6. Deploy only that passing SHA through `scripts/deploy-passed-main.sh`.
+   for the exact protected-main GitHub Actions SHA to pass.
+6. Download the matching `thornhill-release-<SHA>` artifact on the operator
+   workstation, transfer it to the host, run `install-release.sh --check-only`
+   with the exact expected SHA, then install it deliberately with the existing
+   host `.env` and Compose project.
 7. Verify local and Tailnet `/api/status`, running OCI revision label, in-container
-   binary version, deployment receipt, health/readiness, and a real Hermes job.
-8. Exercise a real Realtime call for serialized multi-tool continuation, audible
-   Park drain, reconnect, explicit approval resolution, and durable-job survival.
-9. Run the deployer in `CHECK_ONLY=1` mode and confirm the systemd timer records a
-   clean already-current no-op.
+   binary version, local deployment receipt, health/readiness, and database
+   hardening.
+8. Exercise a real Hermes job and a real Realtime call for serialized multi-tool
+   continuation, audible Park drain, reconnect, explicit approval resolution,
+   and durable-job survival.
+9. Confirm the GitHub-polling systemd timer remains disabled; the local package
+   installer, not GitHub polling, is the release authority.
 
-Do not claim shipment from local tests alone. The green Actions SHA, deployed SHA,
-status endpoint, image label, binary version, and receipt must all agree.
+Do not claim shipment from local tests alone. The green Actions SHA, downloaded
+bundle SHA, deployed SHA, status endpoint, image label, binary version, and local
+receipt must all agree.

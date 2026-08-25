@@ -49,12 +49,12 @@ checked for integer byte count, checksum, and configured size budget before
 `Dockerfile` uses deterministic lockfile installs (`npm ci --ignore-scripts` and committed Go checksums) and an explicit multi-stage build. `.dockerignore` excludes Git metadata, local environment files, dependency trees, coverage, and developer artifacts from the build context. Build arguments are metadata only; credentials must never be passed through `ARG`, `ENV`, copied files, labels, or provenance-visible inputs.
 
 BuildKit is mandatory. CI runs Dockerfile build checks before building and
-qualifies the final images; the trusted publisher transfers those exact image
-archives without rebuilding. The host deployer pulls registry tags, resolves
-their immutable digests, and uses `docker compose up --no-build`. The pinned
-digest fixes the starting filesystem while the readable tag keeps Dependabot
-updates reviewable. `--pull` ensures the pinned reference is resolved rather
-than accidentally using an unrelated local tag during CI.
+qualifies the final images, then packages those exact archives for operator
+installation without rebuilding. The host installer uses `docker load` and
+`docker compose up --no-build`; it never pulls a registry tag during promotion.
+The pinned digest fixes the starting filesystem while the readable build tag keeps
+Dependabot updates reviewable. `--pull` is used only inside CI to resolve the
+pinned base rather than accidentally using an unrelated local tag.
 
 The PostgreSQL wrapper starts from a pinned official image and applies current Alpine repository security fixes. This is an explicit trade-off: the base is reproducible, while the final OS package set tracks security fixes available at build time. PostgreSQL builds use `--no-cache` so a previously cached `apk upgrade` layer cannot hide newly published fixes. The resulting image, rather than only its source manifest, is scanned and recorded in an SBOM.
 
@@ -73,7 +73,7 @@ The PostgreSQL wrapper starts from a pinned official image and applies current A
 - Trivy scans of the built application and PostgreSQL images;
 - a runtime harness that first renders and asserts the checked-in Compose security model, then verifies application and PostgreSQL runtime identities, image health, exact source-revision reporting, read-only roots, least capabilities, `no-new-privileges`, both PID limits, and graceful application `SIGTERM` shutdown;
 - real PostgreSQL migration/concurrency integration tests and Compose-model validation;
-- CycloneDX SBOM generation and 30-day artifact retention for both images.
+- CycloneDX SBOM generation, local OCI bundle assembly, and 90-day artifact retention for both qualified images and the bundle; SBOMs retain for 30 days.
 
 The vulnerability gate rejects fixable `HIGH` or `CRITICAL` findings. Unfixed findings remain visible but do not block an otherwise unremediable build. New suppressions must be narrow, justified, and time-bounded; there is currently no vulnerability ignore file.
 
