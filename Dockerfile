@@ -1,5 +1,5 @@
 # --- web build ---
-FROM node:26.7.0-alpine@sha256:aadf416b2cdce311a8811ba3f0608a61b77dbf997500e2eafe781b51f6a0b019 AS web
+FROM node:26.10.0-alpine@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3fec8cbd2eee500cfd9e80 AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN set -eu; \
@@ -18,7 +18,7 @@ COPY web/ ./
 RUN npm run check && npm run lint && npm run build
 
 # --- Go build ---
-FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS build
+FROM golang:1.27.1-alpine@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414 AS build
 ARG THORNHILL_REVISION=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
