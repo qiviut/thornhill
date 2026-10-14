@@ -144,7 +144,7 @@ jobs:
         run: go test -tags=integration -count=1 -run '^TestProviderProcessConformance$' ./internal/dummyopenai
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # Deliberately omit `cache` in the public-PR qualification lane.
           node-version: ${{ needs.preflight.outputs.node }}
@@ -161,7 +161,7 @@ jobs:
 
       - name: Preserve Go coverage report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thornhill-coverage-${{ github.sha }}
           path: ${{ runner.temp }}/coverage/
@@ -274,7 +274,7 @@ jobs:
             --scan-dir "${RUNNER_TEMP}/thornhill-scan"
 
       - name: Preserve operator-installed local release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thornhill-release-${{ github.sha }}
           path: ${{ runner.temp }}/thornhill-release/
@@ -282,7 +282,7 @@ jobs:
           retention-days: 90
 
       - name: Preserve qualified image artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thornhill-images-${{ github.sha }}
           path: ${{ runner.temp }}/thornhill-images/
@@ -291,7 +291,7 @@ jobs:
 
       - name: Preserve CycloneDX SBOMs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thornhill-sboms-${{ github.sha }}
           path: ${{ runner.temp }}/thornhill-scan/*.cdx.json
@@ -300,7 +300,7 @@ jobs:
 
       - name: Preserve integration coverage report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thornhill-dispatch-coverage-${{ github.sha }}
           path: ${{ runner.temp }}/coverage/
