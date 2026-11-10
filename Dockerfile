@@ -18,7 +18,7 @@ COPY web/ ./
 RUN npm run check && npm run lint && npm run build
 
 # --- Go build ---
-FROM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS build
+FROM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS build
 ARG THORNHILL_REVISION=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -32,7 +32,7 @@ RUN mkdir -p /out/data \
 # --- runtime ---
 # Chainguard static supplies CA certificates and a non-root identity without a
 # shell or package manager, keeping the runtime surface deliberately small.
-FROM cgr.dev/chainguard/static:latest@sha256:f68e3a8244c7d0f4cd56635aaff8e6a533cf6cc3850d8fb339567a5782d6a0b0
+FROM cgr.dev/chainguard/static:latest@sha256:fc42af33e643f20d08baf03cddcc1c02ba57052dfb02edb0d79f3fc47bcea8d9
 ARG THORNHILL_REVISION=unknown
 ARG THORNHILL_SOURCE=https://github.com/qiviut/thornhill
 LABEL org.opencontainers.image.title="Thornhill" \

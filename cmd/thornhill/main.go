@@ -132,7 +132,7 @@ func main() {
 		log.Info("web push active")
 	}
 
-	tts := audio.New(cfg.OpenAIKey, cfg.OpenAIBaseURL, cfg.TTSModel, cfg.TTSVoice, cfg.PrebakeDir, log.With("comp", "tts"))
+	tts := audio.New(cfg.OpenAIKey, cfg.OpenAIRealtimeWSURL, cfg.TTSModel, cfg.TTSVoice, cfg.PrebakeDir, log.With("comp", "tts"))
 	go tts.Prebake(ctx)
 
 	go pruneEvents(ctx, st, cfg.EventRetention, log.With("comp", "retention"))

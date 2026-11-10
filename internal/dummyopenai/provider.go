@@ -91,6 +91,10 @@ func (p *Provider) createCall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Provider) sideband(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("model") != "" && r.URL.Query().Get("call_id") == "" {
+		p.realtimeSpeech(w, r)
+		return
+	}
 	callID := r.URL.Query().Get("call_id")
 	p.mu.Lock()
 	_, ok := p.calls[callID]
@@ -165,6 +169,69 @@ func (p *Provider) sideband(w http.ResponseWriter, r *http.Request) {
 			// Accepted deliberately. A response is emitted only after response.create.
 		default:
 			_ = writeJSON(ctx, conn, map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "code": "unsupported_event", "message": "unsupported event type"}})
+		}
+	}
+}
+
+func (p *Provider) realtimeSpeech(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	ctx := r.Context()
+	if writeJSON(ctx, conn, map[string]any{"type": "session.created"}) != nil {
+		return
+	}
+	read := func() map[string]any {
+		_, raw, readErr := conn.Read(ctx)
+		if readErr != nil {
+			return nil
+		}
+		var event map[string]any
+		if json.Unmarshal(raw, &event) != nil {
+			return nil
+		}
+		return event
+	}
+	update := read()
+	session, _ := update["session"].(map[string]any)
+	audio, _ := session["audio"].(map[string]any)
+	output, _ := audio["output"].(map[string]any)
+	format, _ := output["format"].(map[string]any)
+	modalities, _ := session["output_modalities"].([]any)
+	voice, _ := output["voice"].(string)
+	if update["type"] != "session.update" || session["type"] != "realtime" || len(modalities) != 1 || modalities[0] != "audio" || voice == "" || format["type"] != "audio/pcm" || format["rate"] != float64(24000) {
+		_ = writeJSON(ctx, conn, map[string]any{"type": "error"})
+		return
+	}
+	if writeJSON(ctx, conn, map[string]any{"type": "session.updated"}) != nil {
+		return
+	}
+	itemEvent := read()
+	item, _ := itemEvent["item"].(map[string]any)
+	content, _ := item["content"].([]any)
+	if itemEvent["type"] != "conversation.item.create" || item["role"] != "user" || len(content) != 1 {
+		return
+	}
+	part, _ := content[0].(map[string]any)
+	text, _ := part["text"].(string)
+	if part["type"] != "input_text" || text == "" {
+		return
+	}
+	if read()["type"] != "response.create" {
+		return
+	}
+	for _, event := range []map[string]any{
+		{"type": "response.created", "response": map[string]any{"id": "resp_dummy"}},
+		{"type": "response.output_audio.delta", "response_id": "resp_dummy", "delta": "AAA="},
+		{"type": "response.output_audio.delta", "response_id": "resp_dummy", "delta": "AAA="},
+		{"type": "response.output_audio.done", "response_id": "resp_dummy"},
+		{"type": "response.output_audio_transcript.done", "response_id": "resp_dummy", "transcript": text},
+		{"type": "response.done", "response": map[string]any{"id": "resp_dummy", "status": "completed"}},
+	} {
+		if writeJSON(ctx, conn, event) != nil {
+			return
 		}
 	}
 }

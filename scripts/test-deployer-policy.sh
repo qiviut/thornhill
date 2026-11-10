@@ -137,3 +137,65 @@ if [[ "${output}" != *"A Thornhill deployment is already running"* ]]; then
 fi
 
 printf 'Deployer policy passed: CHECK_ONLY fails closed on lock contention\n'
+
+# Exercise the actual drain block with fake database operations. No host service
+# is contacted; a count or persistence error must not reach the recovery stage.
+python3 - "${root}/scripts/deploy-passed-main.sh" "${state_dir}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+source = Path(sys.argv[1]).read_text()
+state = Path(sys.argv[2])
+def function(name):
+    start = source.index(name + '() {\n')
+    return source[start:source.index('\n}\n', start) + 3]
+
+block = source.split('\nstage=drain\n', 1)[1].split('\nstage=recovery\n', 1)[0]
+harness = '''set -euo pipefail
+revision=0123456789abcdef0123456789abcdef01234567
+draining=false
+ensure_deployment_control() { :; }
+set_dispatch_paused() {
+  printf '%s\\n' "$1" >>"$CASE_DIR/operations"
+  if [[ "$1" == TRUE ]]; then
+    draining=true
+    return 0
+  fi
+  [[ "$FAIL_UNPAUSE" != 1 ]] || return 1
+  draining=false
+}
+active_jobs() { printf '%s\\n' "$COUNT"; }
+deployed=false
+database_password_rotated=false
+transition_active=false
+previous_compose=()
+previous_compose_with_password=()
+cleanup_worktrees() { :; }
+''' + function('fsync_path') + function('write_deferral') + function('rollback') + function('on_exit') + '\ntrap on_exit EXIT\n' + block + '\nprintf "REACHED RECOVERY\\n"\n'
+
+for count, quiet, fail_unpause, bad_state in [('3', '1', '0', False), ('3', '0', '0', False), ('invalid', '1', '0', False), ('3', '1', '1', False), ('3', '1', '0', True)]:
+    case = state / ('case-' + str(len(list(state.glob('case-*')))))
+    case.mkdir()
+    target = case / 'missing' if bad_state else case
+    env = dict(os.environ, STATE_DIR=str(target), CASE_DIR=str(case), COUNT=count, QUIET_DEPLOY_DEFERRALS=quiet, FAIL_UNPAUSE=fail_unpause)
+    result = subprocess.run(['bash', '-c', harness], env=env, text=True, capture_output=True)
+    assert 'REACHED RECOVERY' not in result.stdout, result
+    operations = (case / 'operations').read_text().splitlines()
+    if bad_state:
+        assert result.returncode != 0 and operations == ['TRUE', 'FALSE'], (result, operations)
+        continue
+    if count == 'invalid':
+        assert result.returncode != 0 and operations == ['TRUE', 'FALSE'], (result, operations)
+    else:
+        record = json.loads((case / 'deferred.json').read_text())
+        assert record['source_commit'] == '0123456789abcdef0123456789abcdef01234567'
+        assert record['reason'] == '3 active job(s) after entering drain mode'
+        expected_operations = ['TRUE', 'FALSE'] if fail_unpause == '0' else ['TRUE', 'FALSE', 'FALSE']
+        assert operations == expected_operations, operations
+        assert (result.returncode != 0) == (fail_unpause == '1'), result
+        assert ('Deployment deferred:' in result.stdout) == (quiet == '0'), result
+print('Deployer drain deferral: quiet, visible, malformed count, rollback unpause and state-write failure passed')
+PY

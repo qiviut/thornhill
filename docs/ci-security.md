@@ -140,6 +140,16 @@ token is a materially larger grant than this measurement justifies. The cost is 
 the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
 both permission sets, the single job, and the absence of publication.
 
+Observed snapshot, not a claim about subsequent changes: scheduled run
+`41482464318` succeeded on 2026-11-02 at source commit
+`b2e7a5bc3c93d3522820537461b78ed687ddcf26`. Its uploaded SARIF reported a
+Vulnerabilities sub-score of 0 with 13 advisory IDs, Code-Review 0 (0 of 6
+changesets approved), Security-Policy 4, and Best-Practices 0. A successful
+workflow means measurement ran, not that these findings passed. The uploaded
+analyses are a subset rather than a documented aggregate score; publication is
+disabled. Recheck the next default-branch run and its SARIF after remediation.
+This project does not claim a verified SLSA level or signed build provenance.
+
 Read two sub-scores with context rather than at face value:
 
 - **Branch-Protection** scores low because `GITHUB_TOKEN` cannot read protection
