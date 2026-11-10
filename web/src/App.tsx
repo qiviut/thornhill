@@ -404,6 +404,7 @@ export default function App() {
       </header>
 
       <main>
+      <p>Thornhill's voice is AI-generated, not a human voice.</p>
       <button
         type="button"
         className={`ring ${session.toLowerCase()} ${muted ? "muted" : ""} ${connecting ? "connecting" : ""}`}

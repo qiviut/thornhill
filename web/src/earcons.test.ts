@@ -40,6 +40,7 @@ describe("prebaked audio ownership", () => {
     await Promise.all([playPrebaked("voice_down"), playPrebaked("voice_down")]);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/audio/prebaked/voice_down.wav", expect.anything());
     expect(createObjectURL).toHaveBeenCalledTimes(1);
     expect(audioElements).toHaveLength(1);
     expect(audioElements[0].play).toHaveBeenCalledTimes(2);

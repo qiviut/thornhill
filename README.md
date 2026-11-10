@@ -417,8 +417,10 @@ before completion. Unexplained ad-hoc scripts are not an acceptable residue.
 
 - **L0** session alive: errors injected as conversation items; the model
   voices them.
-- **L1** realtime dead, backend alive: prebaked OpenAI TTS phrases
-  (generated at startup into `PREBAKE_DIR`) played via the control WS.
+- **L1** realtime dead, backend alive: prebaked OpenAI-generated phrases
+  (generated at startup as WAV in `PREBAKE_DIR`) are fetched over HTTP and
+  played by the browser when instructed through the control WS. Failures fall
+  back to earcons. Voices are AI-generated, not human.
 - **L2** backend dead: browser-local earcons (descending = link lost,
   ascending = restored, triple blip = job done, low buzz = failed) driven
   by a heartbeat watchdog.
@@ -443,13 +445,30 @@ docs/vendor/         the exact API docs this code was written against
 
 ## Verify on first contact (marked TODO(verify) in code)
 
-Confirmed against primary sources on 2026-07-26:
+Model identifiers and endpoint support checked against OpenAI's [model
+catalog](https://developers.openai.com/api/docs/models), [latest-model
+guide](https://developers.openai.com/api/docs/guides/latest-model), [Realtime
+conversations guide](https://developers.openai.com/api/docs/guides/realtime-conversations), [speech
+guide](https://developers.openai.com/api/docs/guides/text-to-speech), and
+[deprecation notices](https://developers.openai.com/api/docs/deprecations) on
+2026-11-06. Support does not by itself establish product suitability:
 
 - `TRANSCRIBE_MODEL` — `gpt-realtime-whisper` is named throughout the vendored
   Realtime docs and the current model catalog.
-- `TTS_MODEL` — `gpt-4o-mini-tts` is the documented current model ID and the
-  configured default; no successor is recommended. The vendored set is
-  Realtime-only, so this one is checked against the live docs.
+- `TTS_MODEL` — `gpt-realtime-2.1-mini` replaces the deprecated
+  `gpt-4o-mini-tts`, which OpenAI plans to shut down on 2027-01-06. The new
+  model uses the Realtime WebSocket, not `/v1/audio/speech`; the configured
+  `OPENAI_REALTIME_WS_URL` is shared with the other Realtime integration.
+  Existing MP3 cache files are not reused. WAV files are created from 24 kHz
+  PCM only after a completed response and a matching generated transcript.
+  Transcript matching is not proof of acoustic fidelity; dummy tests do not
+  evaluate voice quality or real-provider behavior.
+- `REALTIME_MODEL=gpt-realtime-2.1` and `SUMMARY_MODEL=gpt-5.5` remain supported.
+  The current model guide recommends `gpt-6-luna`, whose model page also lists
+  Chat Completions support. This integration sends one user message and no
+  tools. No representative quality, latency, cost, request-compatibility, or
+  usage-accounting evaluation has established `gpt-6-luna` as a better summary
+  default here, so keep `gpt-5.5` until that evidence exists.
 - Truncation field path — `session.truncation.{type, retention_ratio}` matches
   [`realtime-costs.md`](docs/vendor/openai/realtime-costs.md) exactly. Thornhill
   omits the optional `token_limits.post_instructions`, which that doc also

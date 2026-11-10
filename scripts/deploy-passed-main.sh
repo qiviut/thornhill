@@ -50,22 +50,28 @@ compose=()
 previous_compose=()
 previous_compose_with_password=()
 
-defer_or_fail_checkout() {
+write_deferral() {
   local reason=$1 temporary current_head
+  current_head=$(git rev-parse HEAD 2>/dev/null || true)
+  temporary=$(mktemp "${STATE_DIR}/deferred.json.XXXXXX") || return 1
+  jq -n --arg reason "${reason}" --arg source_commit "${revision}" \
+    --arg checkout_commit "${current_head}" \
+    '{reason:$reason,source_commit:$source_commit,checkout_commit:$checkout_commit,deferred_at:(now|todate)}' >"${temporary}" || return 1
+  fsync_path "${temporary}" || return 1
+  mv "${temporary}" "${STATE_DIR}/deferred.json" || return 1
+  fsync_path "${STATE_DIR}" || return 1
+  if [[ "${QUIET_DEPLOY_DEFERRALS:-0}" != 1 ]]; then
+    printf 'Deployment deferred: %s\n' "${reason}"
+  fi
+}
+
+defer_or_fail_checkout() {
+  local reason=$1
   if [[ "${DEPLOY_POLL_MODE:-0}" != 1 ]]; then
     printf 'Refusing deployment: %s\n' "${reason}" >&2
     exit 1
   fi
-
-  current_head=$(git rev-parse HEAD 2>/dev/null || true)
-  temporary=$(mktemp "${STATE_DIR}/deferred.json.XXXXXX")
-  jq -n --arg reason "${reason}" --arg source_commit "${revision}" \
-    --arg checkout_commit "${current_head}" \
-    '{reason:$reason,source_commit:$source_commit,checkout_commit:$checkout_commit,deferred_at:(now|todate)}' >"${temporary}"
-  mv "${temporary}" "${STATE_DIR}/deferred.json"
-  if [[ "${QUIET_DEPLOY_DEFERRALS:-0}" != 1 ]]; then
-    printf 'Deployment deferred: %s\n' "${reason}"
-  fi
+  write_deferral "${reason}"
   exit 0
 }
 
@@ -831,8 +837,12 @@ stage=drain
 ensure_deployment_control
 set_dispatch_paused TRUE
 active=$(active_jobs)
+if [[ ! "${active}" =~ ^[0-9]+$ ]]; then
+  echo "Refusing deployment: invalid active job count" >&2
+  exit 1
+fi
 if [[ "${active}" != 0 ]]; then
-  echo "Deferring ${revision}: ${active} active job(s) after entering drain mode"
+  write_deferral "${active} active job(s) after entering drain mode"
   set_dispatch_paused FALSE
   exit 0
 fi

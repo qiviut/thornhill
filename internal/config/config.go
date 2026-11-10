@@ -27,7 +27,7 @@ type Config struct {
 	OpenAIRealtimeWSURL string // OPENAI_REALTIME_WS_URL, default wss://api.openai.com/v1/realtime
 	RealtimeModel       string // REALTIME_MODEL, default gpt-realtime-2.1
 	Voice               string // REALTIME_VOICE, default marin
-	TTSModel            string // TTS_MODEL, default gpt-4o-mini-tts (current upstream, verified 2026-07-26)
+	TTSModel            string // TTS_MODEL, default gpt-realtime-2.1-mini
 	TTSVoice            string // TTS_VOICE, default alloy
 	SummaryModel        string // SUMMARY_MODEL, default gpt-5.5 (swap for a cheaper variant if available)
 	TranscribeModel     string // TRANSCRIBE_MODEL, default gpt-realtime-whisper (named throughout docs/vendor)
@@ -245,7 +245,7 @@ func Load() (*Config, error) {
 		OpenAIRealtimeWSURL: strings.TrimSpace(os.Getenv("OPENAI_REALTIME_WS_URL")),
 		RealtimeModel:       getenv("REALTIME_MODEL", "gpt-realtime-2.1"),
 		Voice:               getenv("REALTIME_VOICE", "marin"),
-		TTSModel:            getenv("TTS_MODEL", "gpt-4o-mini-tts"),
+		TTSModel:            getenv("TTS_MODEL", "gpt-realtime-2.1-mini"),
 		TTSVoice:            getenv("TTS_VOICE", "alloy"),
 		SummaryModel:        getenv("SUMMARY_MODEL", "gpt-5.5"),
 		TranscribeModel:     getenv("TRANSCRIBE_MODEL", "gpt-realtime-whisper"),

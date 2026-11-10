@@ -88,7 +88,7 @@ async function loadPrebaked(key: string): Promise<PrebakedAudio> {
   const controller = new AbortController();
   const generation = prebakedGeneration;
   const promise = (async () => {
-    const resp = await fetch(`/audio/prebaked/${key}.mp3`, {
+    const resp = await fetch(`/audio/prebaked/${key}.wav`, {
       signal: AbortSignal.any([controller.signal, AbortSignal.timeout(prebakedFetchTimeoutMs)]),
     });
     if (!resp.ok) throw new Error(`http ${resp.status}`);
