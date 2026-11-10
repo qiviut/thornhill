@@ -356,6 +356,69 @@ func TestCheckRejectsSchemaWithoutUpdatedRollbackDeclaration(t *testing.T) {
 // its containment must stay asserted: a read-only workflow default, one job, no
 // third-party action executing with that token, its own independently derived
 // guards, and a merge bound to the qualified SHA under squash.
+func TestCheckRejectsAdditionalPrivilegedNetworkCommands(t *testing.T) {
+	for _, command := range []string{
+		`gh api --method GET "repos/${REPOSITORY}/actions/runs/123/cancel"`,
+		`gh api --method GET repos/${REPOSITORY}/actions/runs/123/cancel`,
+		`cancel_method=POST; gh api --method "${cancel_method}" repos/${REPOSITORY}/actions/runs/123/cancel`,
+		`method=POST; endpoint=other; gh api --method "${method}" "${endpoint}"`,
+		`gh api -X POST "${endpoint}"`,
+		`gh api --method=POST "${endpoint}"`,
+		`g=gh; "$g" api -X POST "${endpoint}"`,
+		`gh ap"i" --method P"OST" "${endpoint}"`,
+		`gh api --method "${method}" repos/${REPOSITORY}/actions/runs/123/ca""ncel`,
+		`gh api --method GET "${endpoint}" -f mutate=true`,
+		`python3 -c 'print("unexpected network client")'`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/dependabot-auto-merge.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := "          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n"
+			changed := strings.Replace(string(data), marker, "          "+command+"\n"+marker, 1)
+			if changed == string(data) {
+				t.Fatal("fixture marker missing")
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := Check(root); err == nil {
+				t.Fatalf("Check accepted added command %q", command)
+			}
+		})
+	}
+}
+
+func TestDependabotWorkflowContentPinRejectsYAMLChanges(t *testing.T) {
+	for _, tc := range []struct{ old, new string }{
+		{"        env:\n          GH_TOKEN:", "        shell: sh\n        env:\n          GH_TOKEN:"},
+		{"          GH_TOKEN: ${{ github.token }}", "          GH_TOKEN: ${{ github.token }}\n          BASH_ENV: /tmp/attacker"},
+		{"    steps:\n", "    steps:\n      - name: Extra step\n        run: 'true'\n"},
+	} {
+		t.Run(tc.new, func(t *testing.T) {
+			root := policyFixture(t)
+			path := filepath.Join(root, ".github/workflows/dependabot-auto-merge.yml")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := strings.Replace(string(data), tc.old, tc.new, 1)
+			if changed == string(data) {
+				t.Fatal("fixture marker missing")
+			}
+			if err := os.WriteFile(path, []byte(changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := Check(root); err == nil || !strings.Contains(err.Error(), "reviewed privileged workflow content pin") {
+				t.Fatalf("Check() error = %v, want content pin error", err)
+			}
+		})
+	}
+}
+
 func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -389,7 +452,7 @@ func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
 			new: "            unbound_merge_endpoint=\"repos/${REPOSITORY}/pulls/${pull_request}/\"\"merge\"\n" +
 				"            gh api --method PUT \"${unbound_merge_endpoint}\" -f merge_method=squash\n" +
 				"            # Bind the merge to the tested commit. If Dependabot force-pushes a\n",
-			contain: "one merge mutation and three documented Actions mutations",
+			contain: "one merge mutation and one dispatch mutation",
 		},
 		{
 			name: "attached short-method extra merge call",
@@ -437,7 +500,7 @@ func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
 			new: "          unbound_dispatch_endpoint=\"repos/${REPOSITORY}/actions/workflows/ci.yml/\"\"dispatches\"\n" +
 				"          gh api --method POST \"${unbound_dispatch_endpoint}\" -f ref=${head_branch}\n" +
 				"          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
-			contain: "one merge mutation and three documented Actions mutations",
+			contain: "one merge mutation and one dispatch mutation",
 		},
 		{
 			name: "high-level extra CI dispatch",
@@ -466,9 +529,28 @@ func TestCheckRejectsUnsafeDependabotMerge(t *testing.T) {
 		},
 		{
 			name:    "dispatched revision is not rechecked",
-			old:     `"${dispatch_sha}" != "${landed_sha}"`,
-			new:     `"${dispatch_sha}" == "${landed_sha}"`,
+			old:     `.event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha and`,
+			new:     `.event == "workflow_dispatch" and .head_branch == "main" and .head_sha != $sha and`,
 			contain: "merge lane must include",
+		},
+		{
+			name:    "incomplete reconciliation listing accepted",
+			old:     `.total_count != (.workflow_runs | length) or .total_count > 100`,
+			new:     `.total_count < 0`,
+			contain: "merge lane must include",
+		},
+		{
+			name:    "ambiguous reconciliation accepted",
+			old:     `if [[ "${candidate_count}" == '1' ]]`,
+			new:     `if [[ "${candidate_count}" != '0' ]]`,
+			contain: "merge lane must include",
+		},
+		{
+			name: "cancellation of unverified run",
+			old:  "          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			new: "          gh api --method POST \"repos/${REPOSITORY}/actions/runs/123/cancel\"\n" +
+				"          # GITHUB_TOKEN-created commits do not emit another push workflow run.\n",
+			contain: "one merge mutation and one dispatch mutation",
 		},
 		{
 			name:    "actor guard removed",
