@@ -825,11 +825,11 @@ func checkDependabotMerge(root string) error {
 	if strings.Count(laneText, mergeEndpoint) != 1 || strings.Count(laneText, dispatchEndpoint) != 1 {
 		return fmt.Errorf("%s must contain exactly one SHA-bound merge and one exact-main CI dispatch", relative)
 	}
-	if strings.Count(laneText, "gh api --method PUT") != 1 || strings.Count(laneText, "gh api --method POST") != 3 {
-		return fmt.Errorf("%s must contain only the one merge mutation and three documented Actions mutations", relative)
+	if strings.Count(laneText, "gh api --method PUT") != 1 || strings.Count(laneText, "gh api --method POST") != 1 {
+		return fmt.Errorf("%s must contain only the one merge mutation and one dispatch mutation", relative)
 	}
 	for _, forbidden := range []string{
-		"gh api -X", "gh api --method=", "gh pr merge", "gh workflow run", "curl ", "wget ",
+		"gh api -X", "gh api --method=", "gh pr merge", "gh workflow run", "curl ", "wget ", "/cancel",
 	} {
 		if strings.Contains(laneText, forbidden) {
 			return fmt.Errorf("%s must not use an alternate network mutation form %q", relative, forbidden)
@@ -881,15 +881,34 @@ func checkDependabotMerge(root string) error {
 		`X-GitHub-Api-Version: 2026-03-10`,
 		`repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches`,
 		`.workflow_run_id`,
+		`repos/${REPOSITORY}/actions/workflows/ci.yml/runs`,
+		`-f branch=main -f event=workflow_dispatch -f per_page=100`,
+		`.total_count != (.workflow_runs | length) or .total_count > 100`,
+		`if [[ "${candidate_count}" == '1' ]]`,
+		`elif [[ "${candidate_count}" != '0' ]]`,
+		`window_start=$((dispatch_started - 5))`,
+		`window_end=$((dispatch_finished + 30))`,
+		`for attempt in 1 2 3 4 5 6; do`,
+		`.workflow_id == $workflow`,
+		`.repository.full_name == $repo and .head_repository.full_name == $repo`,
+		`.event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha)`,
+		`.event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha and`,
+		`(.path == ".github/workflows/ci.yml" or .path == ".github/workflows/ci.yml@main")`,
+		`(.id | tostring) == $id`,
+		`(.created_at | fromdateiso8601) >= $start`,
+		`(.created_at | fromdateiso8601) <= $end`,
 		`repos/${REPOSITORY}/actions/runs/${dispatch_run_id}`,
-		`"${dispatch_event}" != 'workflow_dispatch'`,
-		`"${dispatch_branch}" != 'main'`,
-		`"${dispatch_sha}" != "${landed_sha}"`,
-		`repos/${REPOSITORY}/actions/runs/${dispatch_run_id}/cancel`,
 	} {
 		if !strings.Contains(laneText, required) {
 			return fmt.Errorf("%s merge lane must include %q", relative, required)
 		}
+	}
+	// This is an exact content allowlist, not an attempt to parse arbitrary shell.
+	// Pin the entire workflow so added steps, environment, shell settings, and
+	// indirect commands require explicit review and a corresponding pin update.
+	const approvedWorkflowSHA256 = "28d06f1cf8277d3de7833df76aed0e213fa4d44d4506ab178479686b8d0bfe67"
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != approvedWorkflowSHA256 {
+		return fmt.Errorf("%s differs from the reviewed privileged workflow content pin", relative)
 	}
 	return nil
 }

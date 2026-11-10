@@ -147,20 +147,38 @@ jobs:
 
           # A rerun after a transient post-merge failure must be idempotent. A
           # queued/running exact-main proof, or an already successful one, owns
-          # qualification; failed/cancelled attempts may be retried.
-          qualification_run=$(gh run list --repo "${REPOSITORY}" --workflow CI --branch main --limit 50 \
-            --json databaseId,headSha,status,conclusion,event,url,createdAt \
-            | jq -c --arg sha "${landed_sha}" '
-                [ .[]
-                  | select(.headSha == $sha)
-                  | select(.event == "push" or .event == "workflow_dispatch")
-                  | select(
-                      .status == "queued" or
-                      .status == "in_progress" or
-                      (.status == "completed" and .conclusion == "success")
-                    )
-                ][0] // empty
-              ')
+          # qualification; failed or cancelled attempts may be retried.
+          qualification_list_ok=false
+          for attempt in 1 2 3 4 5 6; do
+            if qualification_list=$(timeout 10s gh run list --repo "${REPOSITORY}" --workflow CI --branch main --limit 50 \
+              --json databaseId,headSha,status,conclusion,event,url,createdAt 2>/dev/null) &&
+              qualification_run=$(jq -sc --arg sha "${landed_sha}" '
+                  if length != 1 or (.[0] | type) != "array" then error("invalid run listing") else .[0] end
+                  | map(if type == "object" and (.databaseId | type == "number" and . > 0 and floor == .) and
+                      (.headSha | type == "string" and test("^[0-9a-f]{40}$")) and
+                      (.status | type == "string") and (.event | type == "string") and
+                      (.conclusion | type == "string" or type == "null") and
+                      (.url | type == "string") and (.createdAt | type == "string")
+                    then . else error("malformed run") end)
+                  | [ .[]
+                    | select(.headSha == $sha)
+                    | select(.event == "push" or .event == "workflow_dispatch")
+                    | select(
+                        .status == "queued" or
+                        .status == "in_progress" or
+                        (.status == "completed" and .conclusion == "success")
+                      )
+                  ][0] // empty
+                ' <<<"${qualification_list}" 2>/dev/null); then
+              qualification_list_ok=true
+              break
+            fi
+            if [[ "${attempt}" != '6' ]]; then sleep 2; fi
+          done
+          if [[ "${qualification_list_ok}" != 'true' ]]; then
+            echo 'Cannot read existing CI qualification runs; no dispatch attempted.' >&2
+            exit 1
+          fi
           if [[ -n "${qualification_run}" ]]; then
             qualification_run_id=$(jq -r '.databaseId' <<<"${qualification_run}")
             qualification_url=$(jq -r '.url' <<<"${qualification_run}")
@@ -174,31 +192,116 @@ jobs:
           # the landed SHA as a required input and fails before checkout unless
           # GitHub resolved `main` to that exact revision.
           if [[ "${main_sha}" == "${landed_sha}" ]]; then
+            # Resolve the CI workflow identity independently of the POST result.
+            workflow_id=$(gh api "repos/${REPOSITORY}/actions/workflows/ci.yml" \
+              | jq -er '.id | select(type == "number" and . > 0 and floor == .) | tostring')
+            [[ "${workflow_id}" =~ ^[1-9][0-9]*$ ]]
             dispatch_payload=$(jq -cn --arg expected_sha "${landed_sha}" \
               '{ref:"main", inputs:{expected_sha:$expected_sha}}')
-            dispatch_response=$(gh api --method POST \
+            dispatch_started=$(date -u +%s)
+            # One POST only: a nonzero exit can still mean GitHub created a run.
+            dispatch_response=$(timeout 30s gh api --method POST \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "repos/${REPOSITORY}/actions/workflows/ci.yml/dispatches" \
-              --input - <<<"${dispatch_payload}")
-            dispatch_run_id=$(jq -er '.workflow_run_id | select(type == "number")' \
-              <<<"${dispatch_response}")
-            dispatch_run=$(gh api "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}")
-            dispatch_event=$(jq -r '.event' <<<"${dispatch_run}")
-            dispatch_branch=$(jq -r '.head_branch' <<<"${dispatch_run}")
-            dispatch_sha=$(jq -r '.head_sha' <<<"${dispatch_run}")
+              --input - <<<"${dispatch_payload}" 2>/dev/null) || :
+            dispatch_finished=$(date -u +%s)
+            window_start=$((dispatch_started - 5))
+            window_end=$((dispatch_finished + 30))
+            created_since=$(date -u -d "@${window_start}" '+%Y-%m-%dT%H:%M:%SZ')
+            dispatch_run_id=$(jq -ser '
+              if length == 1 then .[0].workflow_run_id else null end
+              | select(type == "number" and . > 0 and floor == .) | tostring
+            ' <<<"${dispatch_response}" 2>/dev/null) || dispatch_run_id=''
+            if [[ ! "${dispatch_run_id}" =~ ^[1-9][0-9]*$ ]]; then
+              dispatch_run_id=''
+            fi
 
-            if [[ "${dispatch_event}" != 'workflow_dispatch' ||
-                  "${dispatch_branch}" != 'main' ]]; then
-              gh api --method POST "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}/cancel"
-              echo "Dispatch ${dispatch_run_id} resolved outside protected main; cancelled."
+            if [[ -z "${dispatch_run_id}" ]]; then
+              # The workflow-scoped list is capped at 100; an incomplete result
+              # is uncertainty, not evidence of uniqueness. Retry only reads.
+              for attempt in 1 2 3 4 5 6; do
+                if runs=$(timeout 10s gh api --method GET \
+                  "repos/${REPOSITORY}/actions/workflows/ci.yml/runs" \
+                  -f branch=main -f event=workflow_dispatch -f per_page=100 \
+                  -f "created=>=${created_since}" 2>/dev/null) &&
+                  candidates=$(jq -sc --arg sha "${landed_sha}" --arg repo "${REPOSITORY}" \
+                    --argjson workflow "${workflow_id}" --argjson start "${window_start}" \
+                    --argjson end "${window_end}" '
+                      if length != 1 then error("invalid run listing") else .[0] end
+                      |
+                      if (.workflow_runs | type) != "array" or
+                         (.total_count | type) != "number" or
+                         .total_count != (.workflow_runs | length) or .total_count > 100
+                      then error("incomplete run listing") else .workflow_runs end
+                      | map(if type == "object" and
+                          (.id | type == "number" and . > 0 and floor == .) and
+                          (.workflow_id | type == "number") and
+                          (.repository.full_name | type == "string") and
+                          (.head_repository.full_name | type == "string") and
+                          (.event | type == "string") and (.head_branch | type == "string") and
+                          (.head_sha | type == "string") and (.created_at | type == "string")
+                        then . else error("malformed run") end)
+                      | [ .[] | select(.workflow_id == $workflow and
+                          .repository.full_name == $repo and .head_repository.full_name == $repo and
+                          .event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha)
+                        | select((.created_at | fromdateiso8601) >= $start and
+                                 (.created_at | fromdateiso8601) <= $end)
+                        | .id ]
+                    ' <<<"${runs}" 2>/dev/null); then
+                  candidate_count=$(jq -r 'length' <<<"${candidates}")
+                  if [[ "${candidate_count}" == '1' ]]; then
+                    dispatch_run_id=$(jq -r '.[0] | tostring' <<<"${candidates}")
+                    [[ "${dispatch_run_id}" =~ ^[1-9][0-9]*$ ]] || exit 1
+                    break
+                  elif [[ "${candidate_count}" != '0' ]]; then
+                    echo 'Cannot reconcile dispatch: multiple matching CI runs.' >&2
+                    exit 1
+                  fi
+                fi
+                if [[ "${attempt}" != '6' ]]; then sleep 2; fi
+              done
+              if [[ -z "${dispatch_run_id}" ]]; then
+                echo 'Cannot reconcile dispatch: no unique visible CI run.' >&2
+                exit 1
+              fi
+            fi
+
+            # An ID is only a hint until a separate GET proves its full identity.
+            dispatch_run=''
+            for attempt in 1 2 3 4 5 6; do
+              if dispatch_run=$(timeout 10s gh api "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}" 2>/dev/null) &&
+                jq -se 'length == 1 and (.[0] |
+                  type == "object" and (.id | type == "number") and
+                  (.workflow_id | type == "number") and (.path | type == "string") and
+                  (.repository.full_name | type == "string") and
+                  (.head_repository.full_name | type == "string") and
+                  (.event | type == "string") and (.head_branch | type == "string") and
+                  (.head_sha | type == "string") and (.created_at | type == "string"))
+                ' <<<"${dispatch_run}" >/dev/null 2>&1; then
+                break
+              fi
+              dispatch_run=''
+              if [[ "${attempt}" != '6' ]]; then sleep 2; fi
+            done
+            if [[ -z "${dispatch_run}" ]]; then
+              echo 'Cannot read back the dispatched CI run.' >&2
               exit 1
             fi
-            if [[ "${dispatch_sha}" != "${landed_sha}" ]]; then
-              gh api --method POST "repos/${REPOSITORY}/actions/runs/${dispatch_run_id}/cancel"
-              echo "Main advanced from ${landed_sha} to ${dispatch_sha} during dispatch; the newer revision owns qualification."
-              exit 0
+            if ! jq -se --arg id "${dispatch_run_id}" --arg sha "${landed_sha}" \
+              --arg repo "${REPOSITORY}" --argjson workflow "${workflow_id}" \
+              --argjson start "${window_start}" --argjson end "${window_end}" '
+                length == 1 and (.[0] |
+                (.id | tostring) == $id and .workflow_id == $workflow and
+                (.path == ".github/workflows/ci.yml" or .path == ".github/workflows/ci.yml@main") and
+                .repository.full_name == $repo and .head_repository.full_name == $repo and
+                .event == "workflow_dispatch" and .head_branch == "main" and .head_sha == $sha and
+                ((.created_at | fromdateiso8601) >= $start) and
+                ((.created_at | fromdateiso8601) <= $end))
+              ' <<<"${dispatch_run}" >/dev/null 2>&1; then
+              echo 'Dispatched CI run does not match the expected identity; no run was cancelled.' >&2
+              exit 1
             fi
             echo "Dispatched full CI run ${dispatch_run_id} for landed main revision ${landed_sha}."
           else
-            echo "Main advanced from ${landed_sha} to ${main_sha}; the newer revision owns qualification."
+            echo "Main advanced from ${landed_sha} to ${main_sha}; the newer revision needs separate CI evidence."
           fi

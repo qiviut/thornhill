@@ -96,8 +96,52 @@ Delegating the merge to Dependabot's own credentials was tried first, because it
 - It re-derives every guard — event, actor, source repository, branch prefix, base branch, and head SHA — from the `workflow_run` metadata rather than trusting the review lane, so neither lane can widen the other.
 - The merge request names the CI-tested SHA. A rebase landing between qualification and the request changes the SHA, and GitHub refuses rather than merging untested code.
 - A refusal exits zero. Under a strict required check every merge leaves the other open branches out of date, so Dependabot rebases them and the replacement revision earns its own run and its own attempt; treating that convergence as failure would manufacture noise.
-- A successful squash reads the landed `main` SHA back from GitHub and dispatches full `CI` using the required `expected_sha` input. GitHub's API accepts a branch or tag ref rather than a raw commit, so CI preflight rejects the run before checkout unless `main`, the resolved run SHA, and `expected_sha` all match. The merge lane also reads back the created run ID and cancels a race that resolved to a newer revision. CI concurrency separates push runs from SHA-keyed dispatch runs, so cancelling that stale dispatch cannot cancel qualification already running for newer `main`. This explicit dispatch is required because GitHub suppresses recursive `push` workflows for commits created with `GITHUB_TOKEN`.
-- The merge/dispatch transition is restart-safe. A rerun revalidates the original pull-request number and exact tested head, recognizes an already merged squash through its immutable `merge_commit_sha`, and reuses queued, running, or successful qualification for that landed SHA. Only a missing, failed, or cancelled qualification is dispatched again.
+- A successful squash dispatches full `CI` using the required `expected_sha` input if protected `main` still equals the landed SHA. GitHub's API accepts a branch or tag ref rather than a raw commit, so CI preflight rejects the run before checkout unless the resolved ref and SHA match that input. This explicit dispatch is required because GitHub suppresses recursive `push` workflows for commits created with `GITHUB_TOKEN`. CI concurrency separates push runs from SHA-keyed dispatch runs.
+- A rerun revalidates the original pull-request number and exact tested head, recognizes an already merged squash through its immutable `merge_commit_sha`, and searches the latest 50 main CI runs for queued, running, or successful qualification of that SHA. A malformed or unavailable listing is retried and then fails closed before dispatch. This lookup is best-effort duplicate avoidance, not an atomic lock or an exhaustive history scan.
+
+The post-merge dispatcher sends at most one POST per attempt, even if its response
+is empty, malformed, lost, or reports failure after GitHub created a run. It first
+resolves the CI workflow's numeric identity and then, for a usable returned run
+ID, retries a separate run GET. Without a usable ID it retries a workflow-scoped
+list and requires exactly one visible match on workflow identity, repository,
+`workflow_dispatch`, `main`, landed SHA, and creation time. The local window
+starts five seconds before the request and ends 30 seconds after the response or
+30-second POST timeout. A listing with more than 100 results, inconsistent count,
+malformed data, no match, or multiple matches does not authorize success. The
+chosen ID must independently pass a bounded GET and the same identity, workflow
+path, and time checks. Only `.github/workflows/ci.yml` and the exact
+`.github/workflows/ci.yml@main` representation are accepted. Read retries are
+bounded to six attempts; none repeats the POST. An unexpected returned ID, wrong
+resolved branch/SHA, or unavailable read
+fails the job without cancelling any run. If main advanced before dispatch, the
+lane skips the old dispatch; if it advances during dispatch, the mismatch fails
+closed and CI's own preflight protects checkout. Neither case proves the newer
+revision has passed CI.
+
+Reconciliation proves only a unique *visible* matching run at that observation,
+not that it originated from this POST: GitHub's list does not expose the dispatch
+input or an idempotency key, and another matching run can appear later. A later
+rerun or concurrent workflow can race visibility and dispatch a duplicate; no
+cross-attempt exactly-once guarantee is claimed. The clock window depends on
+runner/GitHub clock agreement, and a slow or truncated API view can fail the job
+despite an existing run. Operators should inspect exact-SHA CI evidence before
+rerunning or promoting; a successful dispatch/readback is not a successful CI
+qualification. Local mocked tests do not establish live GitHub API behavior.
+
+GitHub's versioned REST documentation specifies a run-ID response for the
+selected `2026-03-10` API, while the `2022-11-28` contract documents an optional
+`return_run_details` flag and a 204 empty response when false. Empty or ambiguous
+responses remain supported defensively without a second POST. See GitHub's
+[workflow dispatch API](https://docs.github.com/en/rest/actions/workflows?apiVersion=2026-03-10#create-a-workflow-dispatch-event)
+and its [2022-11-28 version](https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#create-a-workflow-dispatch-event).
+
+The policy pins the entire privileged workflow's SHA-256 as an exact reviewed
+content allowlist, in addition to explicit invariants and the literal `/cancel`
+ban. Any workflow edit, including YAML metadata, requires a security review and
+an intentional update to `approvedWorkflowSHA256`; the pin is not a shell
+parser or protection against an actor who can also change the policy. The
+legitimate GET reads, SHA-bound PUT merge, and single POST dispatch are exercised
+with a local fixture rather than by contacting GitHub.
 
 The host deployer treats only normal `push` CI and exact-SHA protected-main
 `workflow_dispatch` CI as promotion evidence. The merge lane normally emits the
