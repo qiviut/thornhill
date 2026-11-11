@@ -184,15 +184,16 @@ token is a materially larger grant than this measurement justifies. The cost is 
 the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
 both permission sets, the single job, and the absence of publication.
 
-Observed snapshot, not a claim about subsequent changes: scheduled run
-`41482464318` succeeded on 2026-11-02 at source commit
-`b2e7a5bc3c93d3522820537461b78ed687ddcf26`. Its uploaded SARIF reported a
-Vulnerabilities sub-score of 0 with 13 advisory IDs, Code-Review 0 (0 of 6
-changesets approved), Security-Policy 4, and Best-Practices 0. A successful
+Observed snapshot, not a claim about subsequent changes: manually dispatched run
+`42958347295` succeeded on 2026-11-11 at source commit
+`3329fb1e3edcb20cb4dc7d2db8d98eb62875bfd2`. Its uploaded SARIF reported a
+Vulnerabilities sub-score of 9 with one advisory, `GO-2026-5932`, Code-Review 0
+(0 of 8 changesets approved), Security-Policy 4, and Best-Practices 0. A successful
 workflow means measurement ran, not that these findings passed. The uploaded
 analyses are a subset rather than a documented aggregate score; publication is
-disabled. Recheck the next default-branch run and its SARIF after remediation.
-This project does not claim a verified SLSA level or signed build provenance.
+disabled. The advisory remains open; a prior `govulncheck` found no affected called
+symbols, which is not a claim that the dependency advisory is fixed. This project
+does not claim a verified SLSA level or signed build provenance.
 
 Read two sub-scores with context rather than at face value:
 
