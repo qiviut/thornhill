@@ -184,11 +184,11 @@ token is a materially larger grant than this measurement justifies. The cost is 
 the public badge and the OpenSSF dataset entry. `checkScorecard` pins the triggers,
 both permission sets, the single job, and the absence of publication.
 
-Observed snapshot, not a claim about subsequent changes: manually dispatched run
-`42958347295` succeeded on 2026-11-11 at source commit
-`3329fb1e3edcb20cb4dc7d2db8d98eb62875bfd2`. Its uploaded SARIF reported a
+Observed snapshot, not a claim about subsequent changes: push run
+`42960963245` succeeded on 2026-11-11 at source commit
+`4203b543e6dee9a11ddc801b57fbbc7becf212e9`. Its uploaded SARIF reported a
 Vulnerabilities sub-score of 9 with one advisory, `GO-2026-5932`, Code-Review 0
-(0 of 8 changesets approved), Security-Policy 4, and Best-Practices 0. A successful
+(0 of 9 changesets approved), Security-Policy 4, and Best-Practices 0. A successful
 workflow means measurement ran, not that these findings passed. The uploaded
 analyses are a subset rather than a documented aggregate score; publication is
 disabled. The advisory remains open; a prior `govulncheck` found no affected called
