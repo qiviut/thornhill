@@ -191,10 +191,16 @@ Vulnerabilities sub-score of 9 with one advisory, `GO-2026-5932`, Code-Review 0
 (0 of 9 changesets approved), Security-Policy 4, and Best-Practices 0. A successful
 workflow means measurement ran, not that these findings passed. The uploaded
 analyses are a subset rather than a documented aggregate score; publication is
-disabled. The advisory remains open; `govulncheck` found no affected called
-symbols, which is not a claim that the dependency advisory is fixed. The advisory's
-pseudo-version marks an upstream module split, not a repair of OpenPGP itself;
-product and test dependency closure currently contains no OpenPGP packages.
+disabled. At that snapshot, `govulncheck` found no affected called symbols, which
+was not a claim that the dependency advisory was fixed. The advisory's fixed
+pseudo-version marks an upstream module split, not a repair of OpenPGP itself.
+
+The project now requires `golang.org/x/crypto` v0.59.0. The product and test
+dependency closure contains no OpenPGP packages, and `govulncheck` reports no
+vulnerabilities for that module graph. This is not a claim that OpenPGP itself was
+repaired: upstream removed it from the parent module, and its separate module is
+still described as unmaintained and unsafe. The historical Scorecard result above
+is unchanged; a fresh Scorecard run is needed to establish its current result.
 This project does not claim a verified SLSA level or signed build provenance.
 
 Read two sub-scores with context rather than at face value:
