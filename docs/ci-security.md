@@ -199,9 +199,12 @@ The project now requires `golang.org/x/crypto` v0.59.0. The product and test
 dependency closure contains no OpenPGP packages, and `govulncheck` reports no
 vulnerabilities for that module graph. This is not a claim that OpenPGP itself was
 repaired: upstream removed it from the parent module, and its separate module is
-still described as unmaintained and unsafe. The historical Scorecard result above
-is unchanged; a fresh Scorecard run is needed to establish its current result.
-This project does not claim a verified SLSA level or signed build provenance.
+still described as unmaintained and unsafe. A later Scorecard run, `43282558941`,
+succeeded on 2026-11-12 at commit `ad4b30863c2872ae8440314f0e95b0f0bcb000d3`;
+its three uploaded SARIF analyses contained no Vulnerabilities finding. That
+absence is not evidence of a particular aggregate score. The historical result
+above is unchanged. This project does not claim a verified SLSA level or signed
+build provenance.
 
 Read two sub-scores with context rather than at face value:
 
