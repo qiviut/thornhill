@@ -207,7 +207,11 @@ dispatches, refuses to proceed while
 work is active, creates a bounded local PostgreSQL recovery snapshot, stops the
 application before PostgreSQL, recreates both services without a build, and
 verifies both status paths, the application binary, database health, and database
-hardening. A failed replacement attempts to restore the previous local image
+hardening. Verification fails closed on each required check; replacement and
+rollback use only the locally loaded images. If a target start fails, rollback
+re-checks and stops the target application before PostgreSQL before recreating
+the previous images; a failed clean stop leaves dispatch paused for operator
+recovery. A failed replacement attempts to restore the previous local image
 references and leaves dispatch paused if rollback cannot be verified. A verified
 rollback records a non-secret `failed.json` quarantine marker; retrying that exact
 revision requires an explicit `RETRY_FAILED=1` after operator review. An unresolved

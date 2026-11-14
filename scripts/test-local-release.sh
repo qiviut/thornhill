@@ -11,6 +11,7 @@ artifact="${tmp}/artifact"
 bundle="${tmp}/bundle"
 mkdir -p "${artifact}"
 PYTHONDONTWRITEBYTECODE=1 python3 "${root}/scripts/test-image-config-id.py"
+"${root}/scripts/test-install-runtime-safety.sh"
 python3 - "${artifact}" "${revision}" <<'PY'
 import hashlib
 import io
