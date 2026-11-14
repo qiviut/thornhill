@@ -63,7 +63,7 @@ for path in "${manifest}" "${app_archive}" "${db_archive}"; do
 done
 
 jq -e --arg expected "${REVISION}" '
-  .version == 1 and
+  .version == 2 and
   .source_commit == $expected and
   .images.app.archive == "app.tar.gz" and
   .images.app.local_tag == "thornhill:ci" and
@@ -74,6 +74,16 @@ jq -e --arg expected "${REVISION}" '
   .images.app.revision == $expected and
   .images.postgres.revision == $expected
 ' "${manifest}" >/dev/null
+
+# Verify the stable config identity against the actual saved archives, not the
+# daemon-specific interpretation of `docker image inspect .Id`.
+app_config=$(python3 "${ROOT}/scripts/image-config-id.py" "${app_archive}" --tag thornhill:ci --revision "${REVISION}")
+db_config=$(python3 "${ROOT}/scripts/image-config-id.py" "${db_archive}" --tag thornhill-postgres:ci --revision "${REVISION}")
+[[ "${app_config}" == "$(jq -r .images.app.id "${manifest}")" &&
+   "${db_config}" == "$(jq -r .images.postgres.id "${manifest}")" ]] || {
+  printf '%s\n' 'Image config IDs do not match the supplied archives' >&2
+  exit 1
+}
 
 staging=$(mktemp -d "${TMPDIR:-/tmp}/thornhill-release.XXXXXX")
 cleanup() { rm -rf -- "${staging}"; }
@@ -90,6 +100,7 @@ install -m 0644 "${ROOT}/.env.example" "${staging}/compose/env.example"
 install -m 0755 "${ROOT}/scripts/install-local-release.sh" "${staging}/install-release.sh"
 install -m 0755 "${ROOT}/scripts/local-recovery.sh" "${staging}/scripts/local-recovery.sh"
 install -m 0755 "${ROOT}/scripts/capped-copy.py" "${staging}/scripts/capped-copy.py"
+install -m 0644 "${ROOT}/scripts/image-config-id.py" "${staging}/scripts/image-config-id.py"
 install -m 0755 "${ROOT}/scripts/rotate-postgres-role-password.sh" "${staging}/scripts/rotate-postgres-role-password.sh"
 install -m 0644 "${ROOT}/docs/rollback-compatibility.json" "${staging}/compose/rollback-compatibility.json"
 

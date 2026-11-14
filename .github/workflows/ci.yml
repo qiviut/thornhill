@@ -235,6 +235,13 @@ jobs:
           TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
         run: scripts/run-security-scans.sh thornhill:ci thornhill-postgres:ci
 
+      # Exercise real save/load on the runner's store before exporting. The
+      # portable config ID is also checked on the target after its own load.
+      - name: Verify portable image identity
+        run: |
+          scripts/test-image-config-roundtrip.sh thornhill:ci "${GITHUB_SHA}"
+          scripts/test-image-config-roundtrip.sh thornhill-postgres:ci "${GITHUB_SHA}"
+
       # Export the exact images that passed every image/runtime/security gate.
       # The archives feed both the retained raw image artifact and the
       # operator-installed local release bundle; neither path rebuilds them.
@@ -247,18 +254,20 @@ jobs:
           docker save thornhill-postgres:ci | gzip -1 >"${artifact_dir}/postgres.tar.gz"
           app_revision=$(docker image inspect thornhill:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
           db_revision=$(docker image inspect thornhill-postgres:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-          app_id=$(docker image inspect thornhill:ci --format '{{.Id}}')
-          db_id=$(docker image inspect thornhill-postgres:ci --format '{{.Id}}')
+          # Docker's .Id may be an OCI index digest or a config digest depending
+          # on its image store. Bind the archive to the portable config digest.
+          app_id=$(python3 scripts/image-config-id.py "${artifact_dir}/app.tar.gz" --tag thornhill:ci --revision "${GITHUB_SHA}")
+          db_id=$(python3 scripts/image-config-id.py "${artifact_dir}/postgres.tar.gz" --tag thornhill-postgres:ci --revision "${GITHUB_SHA}")
           jq -n \
             --arg source_commit "${GITHUB_SHA}" \
             --arg app_revision "${app_revision}" \
             --arg db_revision "${db_revision}" \
             --arg app_id "${app_id}" \
             --arg db_id "${db_id}" \
-            '{version:1,source_commit:$source_commit,images:{app:{archive:"app.tar.gz",local_tag:"thornhill:ci",id:$app_id,revision:$app_revision},postgres:{archive:"postgres.tar.gz",local_tag:"thornhill-postgres:ci",id:$db_id,revision:$db_revision}}}' \
+            '{version:2,source_commit:$source_commit,images:{app:{archive:"app.tar.gz",local_tag:"thornhill:ci",id:$app_id,revision:$app_revision},postgres:{archive:"postgres.tar.gz",local_tag:"thornhill-postgres:ci",id:$db_id,revision:$db_revision}}}' \
             >"${artifact_dir}/manifest.json"
           jq -e --arg expected "${GITHUB_SHA}" '
-            .version == 1 and .source_commit == $expected and
+            .version == 2 and .source_commit == $expected and
             .images.app.revision == $expected and
             .images.postgres.revision == $expected
           ' "${artifact_dir}/manifest.json" >/dev/null

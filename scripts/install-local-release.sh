@@ -94,7 +94,8 @@ release="${BUNDLE}/release.json"
 checksums="${BUNDLE}/SHA256SUMS"
 for path in "${manifest}" "${release}" "${checksums}" "${BUNDLE}/images/app.tar.gz" \
   "${BUNDLE}/images/postgres.tar.gz" "${BUNDLE}/compose/docker-compose.yml" \
-  "${BUNDLE}/install-release.sh" "${BUNDLE}/scripts/local-recovery.sh"; do
+  "${BUNDLE}/install-release.sh" "${BUNDLE}/scripts/local-recovery.sh" \
+  "${BUNDLE}/scripts/image-config-id.py"; do
   [[ -e "${path}" ]] || { printf 'Bundle member is missing: %s\n' "${path}" >&2; exit 1; }
 done
 [[ -f "${COMPOSE_OVERRIDE}" ]] || { printf 'Compose override is missing: %s\n' "${COMPOSE_OVERRIDE}" >&2; exit 1; }
@@ -106,7 +107,7 @@ jq -e --arg expected "${EXPECTED_SHA}" '
   .install_entrypoint == "install-release.sh"
 ' "${release}" >/dev/null
 jq -e --arg expected "${EXPECTED_SHA}" '
-  .version == 1 and .source_commit == $expected and
+  .version == 2 and .source_commit == $expected and
   .images.app.archive == "app.tar.gz" and
   .images.app.local_tag == "thornhill:ci" and
   .images.postgres.archive == "postgres.tar.gz" and
@@ -126,6 +127,10 @@ grep -Fq -- "  ./${override_rel}" "${checksums}" || {
   exit 1
 }
 
+grep -Fq -- "  ./scripts/image-config-id.py" "${checksums}" || {
+  printf '%s\n' 'Image config verifier is not covered by SHA256SUMS' >&2
+  exit 1
+}
 app_tag=$(jq -r .images.app.local_tag "${manifest}")
 db_tag=$(jq -r .images.postgres.local_tag "${manifest}")
 expected_app_id=$(jq -r .images.app.id "${manifest}")
@@ -135,8 +140,14 @@ expected_db_id=$(jq -r .images.postgres.id "${manifest}")
   exit 1
 }
 
+archive_app_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${BUNDLE}/images/app.tar.gz" --tag "${app_tag}" --revision "${EXPECTED_SHA}")
+archive_db_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${BUNDLE}/images/postgres.tar.gz" --tag "${db_tag}" --revision "${EXPECTED_SHA}")
+[[ "${archive_app_id}" == "${expected_app_id}" && "${archive_db_id}" == "${expected_db_id}" ]] || {
+  printf '%s\n' 'Image config IDs do not match the bundle archives' >&2
+  exit 1
+}
 printf 'Bundle verified: source_commit=%s\n' "${EXPECTED_SHA}"
-printf 'Bundle image IDs: app=%s db=%s\n' "${expected_app_id}" "${expected_db_id}"
+printf 'Bundle image config IDs: app=%s db=%s\n' "${expected_app_id}" "${expected_db_id}"
 if (( CHECK_ONLY )); then
   printf '%s\n' 'Check-only completed; no images, containers, volumes, or services were changed.'
   exit 0
@@ -173,12 +184,20 @@ if [[ -f "${STATE_DIR}/failed.json" ]]; then
   fi
 fi
 
+tmp=$(mktemp -d "${STATE_DIR}/.install.XXXXXX")
+cleanup_tmp() { rm -rf -- "${tmp}"; }
+trap cleanup_tmp EXIT
+
 printf 'Loading qualified application image locally\n'
 docker load --input "${BUNDLE}/images/app.tar.gz" >/dev/null
 printf 'Loading qualified PostgreSQL image locally\n'
 docker load --input "${BUNDLE}/images/postgres.tar.gz" >/dev/null
-loaded_app_id=$(docker image inspect "${app_tag}" --format '{{.Id}}')
-loaded_db_id=$(docker image inspect "${db_tag}" --format '{{.Id}}')
+# Re-export the loaded images and compare their config identities, rather than
+# Docker's backend-dependent .Id (which can be an index or config digest).
+docker image save --output "${tmp}/loaded-app.tar" "${app_tag}"
+docker image save --output "${tmp}/loaded-postgres.tar" "${db_tag}"
+loaded_app_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${tmp}/loaded-app.tar" --tag "${app_tag}" --revision "${EXPECTED_SHA}")
+loaded_db_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${tmp}/loaded-postgres.tar" --tag "${db_tag}" --revision "${EXPECTED_SHA}")
 [[ "${loaded_app_id}" == "${expected_app_id}" && "${loaded_db_id}" == "${expected_db_id}" ]] || {
   printf 'Loaded image IDs do not match the bundle manifest\n' >&2
   exit 1
@@ -195,10 +214,6 @@ db_label=$(docker image inspect "${db_tag}" --format '{{ index .Config.Labels "o
 }
 docker tag "${app_tag}" "thornhill-app:${EXPECTED_SHA}"
 docker tag "${db_tag}" "thornhill-postgres:${EXPECTED_SHA}"
-
-tmp=$(mktemp -d "${STATE_DIR}/.install.XXXXXX")
-cleanup_tmp() { rm -rf -- "${tmp}"; }
-trap cleanup_tmp EXIT
 
 db_override="${tmp}/db-image.override.yml"
 write_db_override() {
@@ -264,8 +279,8 @@ SQL
 set_dispatch_paused() {
   local value=$1 result
   printf 'BEGIN; SELECT pg_advisory_xact_lock(72623859790382856); UPDATE deployment_control SET dispatch_paused=%s, updated_at=now() WHERE singleton=TRUE; COMMIT;\n' "${value}" |
-    db_sql >/dev/null
-  result=$(printf 'SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE;\n' | db_sql)
+    db_sql >/dev/null || return 1
+  result=$(printf 'SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE;\n' | db_sql) || return 1
   if [[ "${value}" == TRUE ]]; then
     [[ "${result}" == t ]]
   else
@@ -279,34 +294,38 @@ active_jobs() {
 
 verify_running_revision() {
   local expected=$1 image_id label binary
-  image_id=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Image}}')
-  label=$(docker image inspect "${image_id}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-  binary=$(timeout 10s docker exec "${PROJECT_NAME}-app-1" /app/thornhill --version)
+  image_id=$(docker inspect "${PROJECT_NAME}-app-1" --format '{{.Image}}') || return 1
+  label=$(docker image inspect "${image_id}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}') || return 1
+  binary=$(timeout 10s docker exec "${PROJECT_NAME}-app-1" /app/thornhill --version) || return 1
   [[ "${label}" == "${expected}" && "${binary}" == "thornhill ${expected}" ]]
 }
 
 verify_running_db() {
   local expected_image=$1 actual health read_only cap_drop security pids uid
-  actual=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.Config.Image}}')
-  health=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.State.Health.Status}}')
-  read_only=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.ReadonlyRootfs}}')
-  cap_drop=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.CapDrop}}')
-  security=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.SecurityOpt}}')
-  pids=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.PidsLimit}}')
-  uid=$(docker exec "${PROJECT_NAME}-db-1" stat -c %u /proc/1)
+  actual=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.Config.Image}}') || return 1
+  health=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.State.Health.Status}}') || return 1
+  read_only=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.ReadonlyRootfs}}') || return 1
+  cap_drop=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.CapDrop}}') || return 1
+  security=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{json .HostConfig.SecurityOpt}}') || return 1
+  pids=$(docker inspect "${PROJECT_NAME}-db-1" --format '{{.HostConfig.PidsLimit}}') || return 1
+  uid=$(docker exec "${PROJECT_NAME}-db-1" stat -c %u /proc/1) || return 1
   [[ "${actual}" == "${expected_image}" && "${health}" == healthy && "${read_only}" == true &&
     "${cap_drop}" == *ALL* && "${security}" == *no-new-privileges* && "${pids}" == 256 && "${uid}" == 70 ]]
 }
 
 verify_runtime() {
-  local expected=$1 db_image=$2
-  curl --fail --silent --show-error --max-time 15 "${LOCAL_APP_URL}" >/dev/null
+  local expected=$1 db_image=$2 local_revision public_revision
+  curl --fail --silent --show-error --max-time 15 "${LOCAL_APP_URL}" >/dev/null || return 1
   if [[ -n "${PUBLIC_APP_URL}" ]]; then
-    curl --fail --silent --show-error --max-time 15 "${PUBLIC_APP_URL}" >/dev/null
+    curl --fail --silent --show-error --max-time 15 "${PUBLIC_APP_URL}" >/dev/null || return 1
   fi
-  [[ "$(status_revision "${LOCAL_STATUS_URL}")" == "${expected}" ]]
-  [[ -z "${PUBLIC_STATUS_URL}" || "$(status_revision "${PUBLIC_STATUS_URL}")" == "${expected}" ]]
-  verify_running_revision "${expected}"
+  local_revision=$(status_revision "${LOCAL_STATUS_URL}") || return 1
+  [[ "${local_revision}" == "${expected}" ]] || return 1
+  if [[ -n "${PUBLIC_STATUS_URL}" ]]; then
+    public_revision=$(status_revision "${PUBLIC_STATUS_URL}") || return 1
+    [[ "${public_revision}" == "${expected}" ]] || return 1
+  fi
+  verify_running_revision "${expected}" || return 1
   verify_running_db "${db_image}"
 }
 
@@ -323,41 +342,48 @@ wait_for_runtime() {
 }
 
 stop_application_cleanly() {
-  local container="${PROJECT_NAME}-app-1" running state
+  local container="${PROJECT_NAME}-app-1" running state names
   if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
+    # Only rollback may accept absence, and only after a successful daemon list.
+    if [[ "${1:-}" == allow-missing ]]; then
+      names=$(docker container ls --all --format '{{.Names}}') || return 1
+      if ! printf '%s\n' "${names}" | grep -Fxq -- "${container}"; then
+        return 0
+      fi
+    fi
     return 1
   fi
   if [[ "${running}" == true ]]; then
-    docker stop --timeout 30 "${container}" >/dev/null
+    docker stop --timeout 30 "${container}" >/dev/null || return 1
   fi
   for _ in 1 2; do
-    state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}}')
-    [[ "${state}" == 'false false' ]]
+    state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}}') || return 1
+    [[ "${state}" == 'false false' ]] || return 1
     sleep 0.2
   done
 }
 
 stop_database_cleanly() {
   local container="${PROJECT_NAME}-db-1" running uid exit_code state
-  running=$(docker inspect "${container}" --format '{{.State.Running}}')
+  running=$(docker inspect "${container}" --format '{{.State.Running}}') || return 1
   if [[ "${running}" != true ]]; then
-    state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}')
+    state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}') || return 1
     [[ "${state}" == 'false false 0' ]]
     return
   fi
-  uid=$(docker exec "${container}" stat -c %u /proc/1)
+  uid=$(docker exec "${container}" stat -c %u /proc/1) || return 1
   if [[ "${uid}" == 70 ]]; then
-    docker stop --timeout 30 "${container}" >/dev/null
+    docker stop --timeout 30 "${container}" >/dev/null || return 1
   else
-    docker update --restart=no "${container}" >/dev/null
+    docker update --restart=no "${container}" >/dev/null || return 1
     docker exec --detach --user 70:70 "${container}" \
-      sh -ec 'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop'
-    exit_code=$(timeout 35s docker wait "${container}")
-    [[ "${exit_code}" == 0 ]]
+      sh -ec 'exec pg_ctl -D "$PGDATA" -m fast -w -t 30 stop' || return 1
+    exit_code=$(timeout 35s docker wait "${container}") || return 1
+    [[ "${exit_code}" == 0 ]] || return 1
   fi
   for _ in 1 2; do
-    state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}')
-    [[ "${state}" == 'false false 0' ]]
+    state=$(docker inspect "${container}" --format '{{.State.Running}} {{.State.Restarting}} {{.State.ExitCode}}') || return 1
+    [[ "${state}" == 'false false 0' ]] || return 1
     sleep 0.2
   done
 }
@@ -382,12 +408,12 @@ write_receipt() {
 
 write_failed() {
   local temporary
-  temporary=$(mktemp "${STATE_DIR}/failed.json.XXXXXX")
+  temporary=$(mktemp "${STATE_DIR}/failed.json.XXXXXX") || return 1
   jq -n --arg target "${EXPECTED_SHA}" --arg previous "${previous_revision}" \
     '{version:1,target_revision:$target,previous_revision:$previous,
-      outcome:"verified-rollback",install_mode:"local-bundle"}' >"${temporary}"
-  chmod 0600 "${temporary}"
-  mv -- "${temporary}" "${STATE_DIR}/failed.json"
+      outcome:"verified-rollback",install_mode:"local-bundle"}' >"${temporary}" || return 1
+  chmod 0600 "${temporary}" || return 1
+  mv -- "${temporary}" "${STATE_DIR}/failed.json" || return 1
 }
 
 write_journal() {
@@ -410,6 +436,8 @@ db_stopped=false
 draining=false
 changed=false
 rollback_ok=false
+target_start_attempted=false
+had_previous_receipt=false
 previous_revision=""
 previous_app_local=""
 previous_db_local=""
@@ -418,17 +446,30 @@ rollback() {
   if [[ "${app_stopped}" != true || "${db_stopped}" != true ]]; then
     return 1
   fi
+  # Old stop flags cannot prove that a partially started target is stopped.
+  if [[ "${target_start_attempted}" == true ]]; then
+    # A failed unpause readback can hide a committed unpause. Re-establish
+    # admission control and check active work before stopping the target.
+    set_dispatch_paused TRUE || return 1
+    local active
+    active=$(active_jobs) || return 1
+    [[ "${active}" == 0 ]] || return 1
+    stop_application_cleanly allow-missing || return 1
+    stop_database_cleanly || return 1
+  fi
   export THORNHILL_APP_IMAGE="${previous_app_local}"
   export THORNHILL_POSTGRES_IMAGE="${previous_db_local}"
-  write_db_override "${THORNHILL_POSTGRES_IMAGE}"
-  if "${compose[@]}" up -d --no-build --force-recreate db app >/dev/null 2>&1; then
-    if wait_for_runtime "${previous_revision}" "${previous_db_local}"; then
-      rollback_ok=true
-    fi
+  write_db_override "${THORNHILL_POSTGRES_IMAGE}" || return 1
+  "${compose[@]}" up -d --no-build --pull never --force-recreate db app >/dev/null 2>&1 || return 1
+  wait_for_runtime "${previous_revision}" "${previous_db_local}" || return 1
+  if [[ "${had_previous_receipt}" == true ]]; then
+    cp -- "${tmp}/previous-receipt.json" "${tmp}/restore-receipt.json" || return 1
+    mv -- "${tmp}/restore-receipt.json" "${STATE_DIR}/deployed.json" || return 1
+  else
+    rm -f -- "${STATE_DIR}/deployed.json" || return 1
   fi
-  if [[ "${rollback_ok}" == true ]]; then
-    set_dispatch_paused FALSE
-  fi
+  set_dispatch_paused FALSE || return 1
+  rollback_ok=true
 }
 
 on_exit() {
@@ -438,21 +479,31 @@ on_exit() {
     if [[ "${changed}" == true ]]; then
       rollback || true
     elif [[ "${draining}" == true ]]; then
-      set_dispatch_paused FALSE || true
+      if set_dispatch_paused FALSE; then
+        clear_journal || printf '%s\n' 'CRITICAL: could not clear transition journal' >&2
+      else
+        set_dispatch_paused TRUE || true
+        printf '%s\n' 'CRITICAL: dispatch state is unknown; transition journal retained' >&2
+      fi
     fi
     if [[ "${rollback_ok}" != true && "${changed}" == true ]]; then
-      printf '%s\n' 'CRITICAL: local rollback was not verified; dispatch remains paused' >&2
+      set_dispatch_paused TRUE || true
+      printf '%s\n' 'CRITICAL: rollback not verified; dispatch state may be unknown; transition journal retained' >&2
     fi
     if [[ "${rollback_ok}" == true && "${changed}" == true ]]; then
-      write_failed || true
-      clear_journal || true
+      if write_failed; then
+        clear_journal || printf '%s\n' 'CRITICAL: could not clear transition journal' >&2
+      else
+        printf '%s\n' 'CRITICAL: quarantine not recorded; transition journal retained' >&2
+      fi
     fi
   elif [[ "${draining}" == true ]]; then
     set_dispatch_paused FALSE || rc=1
   fi
   if (( rc == 0 )); then
-    clear_journal
+    clear_journal || rc=1
   fi
+  cleanup_tmp || printf '%s\n' 'Warning: failed to remove temporary install files' >&2
   exit "${rc}"
 }
 trap on_exit EXIT
@@ -469,16 +520,23 @@ docker tag "${previous_app_image}" "thornhill-rollback-app:${previous_revision}"
 docker tag "${previous_db_image}" "thornhill-rollback-db:${previous_revision}"
 previous_app_local="thornhill-rollback-app:${previous_revision}"
 previous_db_local="thornhill-rollback-db:${previous_revision}"
+if [[ -f "${STATE_DIR}/deployed.json" ]]; then
+  cp -- "${STATE_DIR}/deployed.json" "${tmp}/previous-receipt.json"
+  had_previous_receipt=true
+fi
 
 # The password remains host-owned and stable. Refuse rather than silently rotate it.
 database_password=$(awk -F= '$1 == "THORNHILL_DB_PASSWORD" {print substr($0, index($0, "=") + 1)}' "${ENV_FILE}")
 [[ "${database_password}" =~ ^[0-9a-f]{64}$ ]]
 printf '%s\n' "${database_password}" |
-  "${BUNDLE}/scripts/rotate-postgres-role-password.sh" --verify-only "${PROJECT_NAME}-db-1" >/dev/null
+  bash "${BUNDLE}/scripts/rotate-postgres-role-password.sh" --verify-only "${PROJECT_NAME}-db-1" >/dev/null
 
 ensure_deployment_control
-set_dispatch_paused TRUE
+dispatch_before=$(printf 'SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE;\n' | db_sql)
+[[ "${dispatch_before}" == f ]] || { printf '%s\n' 'Refusing install: dispatch already paused or state unknown' >&2; exit 1; }
+write_journal pause_intent
 draining=true
+set_dispatch_paused TRUE
 active=$(active_jobs)
 if [[ "${active}" != 0 ]]; then
   printf 'Refusing local install: %s active job(s)\n' "${active}" >&2
@@ -488,7 +546,7 @@ fi
 THORNHILL_RECOVERY_SOURCE_COMMIT="${EXPECTED_SHA}" \
 STATE_DIR="${STATE_DIR}" PROJECT_NAME="${PROJECT_NAME}" \
 THORNHILL_RECOVERY_POSTGRES_IMAGE="${previous_db_image}" \
-"${BUNDLE}/scripts/local-recovery.sh" snapshot >/dev/null
+bash "${BUNDLE}/scripts/local-recovery.sh" snapshot >/dev/null
 write_journal prepared
 changed=true
 stop_application_cleanly
@@ -500,10 +558,11 @@ write_journal database_stopped
 export THORNHILL_APP_IMAGE="thornhill-app:${EXPECTED_SHA}"
 export THORNHILL_POSTGRES_IMAGE="thornhill-postgres:${EXPECTED_SHA}"
 write_db_override "${THORNHILL_POSTGRES_IMAGE}"
-"${compose[@]}" up -d --no-build --force-recreate db app >/dev/null
+target_start_attempted=true
+"${compose[@]}" up -d --no-build --pull never --force-recreate db app >/dev/null
 write_journal target_started
 wait_for_runtime "${EXPECTED_SHA}" "${THORNHILL_POSTGRES_IMAGE}"
 write_receipt "${previous_revision}" "${previous_app_local}" "${previous_db_local}"
-draining=false
 set_dispatch_paused FALSE
+draining=false
 printf 'Installed local release %s without remote access\n' "${EXPECTED_SHA}"
