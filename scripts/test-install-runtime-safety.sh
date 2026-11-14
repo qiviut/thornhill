@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Variables are consumed by actual installer functions extracted at runtime.
+# shellcheck disable=SC2034
 # Exercise installer runtime verification and rollback with a deterministic Docker stub.
 set -euo pipefail
 
