@@ -195,9 +195,15 @@ PostgreSQL volume, application volume, and runtime hardening:
   --public-status-url https://your-host.your-tailnet.ts.net:8787/api/status
 ```
 
-The installer verifies the exact source SHA, image IDs, OCI revision labels, and
-bundle checksums before loading anything. It checks the current deployment and
-configured database credential, pauses new dispatches, refuses to proceed while
+The version-2 image manifest records portable SHA-256 image configuration IDs,
+not Docker's backend-dependent `.Id` value. Before loading, the installer checks
+each archive's config digest, expected tag, and revision. After loading, it
+re-exports the images and checks the same config identities again; the config
+binds the root filesystem diff IDs. Version-1 manifests are rejected rather
+than reinterpreting an index digest as a config digest. The installer also checks
+image revision labels and bundle checksums before replacing services. It checks
+the current deployment and configured database credential, pauses new
+dispatches, refuses to proceed while
 work is active, creates a bounded local PostgreSQL recovery snapshot, stops the
 application before PostgreSQL, recreates both services without a build, and
 verifies both status paths, the application binary, database health, and database

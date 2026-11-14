@@ -94,7 +94,8 @@ release="${BUNDLE}/release.json"
 checksums="${BUNDLE}/SHA256SUMS"
 for path in "${manifest}" "${release}" "${checksums}" "${BUNDLE}/images/app.tar.gz" \
   "${BUNDLE}/images/postgres.tar.gz" "${BUNDLE}/compose/docker-compose.yml" \
-  "${BUNDLE}/install-release.sh" "${BUNDLE}/scripts/local-recovery.sh"; do
+  "${BUNDLE}/install-release.sh" "${BUNDLE}/scripts/local-recovery.sh" \
+  "${BUNDLE}/scripts/image-config-id.py"; do
   [[ -e "${path}" ]] || { printf 'Bundle member is missing: %s\n' "${path}" >&2; exit 1; }
 done
 [[ -f "${COMPOSE_OVERRIDE}" ]] || { printf 'Compose override is missing: %s\n' "${COMPOSE_OVERRIDE}" >&2; exit 1; }
@@ -106,7 +107,7 @@ jq -e --arg expected "${EXPECTED_SHA}" '
   .install_entrypoint == "install-release.sh"
 ' "${release}" >/dev/null
 jq -e --arg expected "${EXPECTED_SHA}" '
-  .version == 1 and .source_commit == $expected and
+  .version == 2 and .source_commit == $expected and
   .images.app.archive == "app.tar.gz" and
   .images.app.local_tag == "thornhill:ci" and
   .images.postgres.archive == "postgres.tar.gz" and
@@ -126,6 +127,10 @@ grep -Fq -- "  ./${override_rel}" "${checksums}" || {
   exit 1
 }
 
+grep -Fq -- "  ./scripts/image-config-id.py" "${checksums}" || {
+  printf '%s\n' 'Image config verifier is not covered by SHA256SUMS' >&2
+  exit 1
+}
 app_tag=$(jq -r .images.app.local_tag "${manifest}")
 db_tag=$(jq -r .images.postgres.local_tag "${manifest}")
 expected_app_id=$(jq -r .images.app.id "${manifest}")
@@ -135,8 +140,14 @@ expected_db_id=$(jq -r .images.postgres.id "${manifest}")
   exit 1
 }
 
+archive_app_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${BUNDLE}/images/app.tar.gz" --tag "${app_tag}" --revision "${EXPECTED_SHA}")
+archive_db_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${BUNDLE}/images/postgres.tar.gz" --tag "${db_tag}" --revision "${EXPECTED_SHA}")
+[[ "${archive_app_id}" == "${expected_app_id}" && "${archive_db_id}" == "${expected_db_id}" ]] || {
+  printf '%s\n' 'Image config IDs do not match the bundle archives' >&2
+  exit 1
+}
 printf 'Bundle verified: source_commit=%s\n' "${EXPECTED_SHA}"
-printf 'Bundle image IDs: app=%s db=%s\n' "${expected_app_id}" "${expected_db_id}"
+printf 'Bundle image config IDs: app=%s db=%s\n' "${expected_app_id}" "${expected_db_id}"
 if (( CHECK_ONLY )); then
   printf '%s\n' 'Check-only completed; no images, containers, volumes, or services were changed.'
   exit 0
@@ -173,12 +184,20 @@ if [[ -f "${STATE_DIR}/failed.json" ]]; then
   fi
 fi
 
+tmp=$(mktemp -d "${STATE_DIR}/.install.XXXXXX")
+cleanup_tmp() { rm -rf -- "${tmp}"; }
+trap cleanup_tmp EXIT
+
 printf 'Loading qualified application image locally\n'
 docker load --input "${BUNDLE}/images/app.tar.gz" >/dev/null
 printf 'Loading qualified PostgreSQL image locally\n'
 docker load --input "${BUNDLE}/images/postgres.tar.gz" >/dev/null
-loaded_app_id=$(docker image inspect "${app_tag}" --format '{{.Id}}')
-loaded_db_id=$(docker image inspect "${db_tag}" --format '{{.Id}}')
+# Re-export the loaded images and compare their config identities, rather than
+# Docker's backend-dependent .Id (which can be an index or config digest).
+docker image save --output "${tmp}/loaded-app.tar" "${app_tag}"
+docker image save --output "${tmp}/loaded-postgres.tar" "${db_tag}"
+loaded_app_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${tmp}/loaded-app.tar" --tag "${app_tag}" --revision "${EXPECTED_SHA}")
+loaded_db_id=$(python3 "${BUNDLE}/scripts/image-config-id.py" "${tmp}/loaded-postgres.tar" --tag "${db_tag}" --revision "${EXPECTED_SHA}")
 [[ "${loaded_app_id}" == "${expected_app_id}" && "${loaded_db_id}" == "${expected_db_id}" ]] || {
   printf 'Loaded image IDs do not match the bundle manifest\n' >&2
   exit 1
@@ -195,10 +214,6 @@ db_label=$(docker image inspect "${db_tag}" --format '{{ index .Config.Labels "o
 }
 docker tag "${app_tag}" "thornhill-app:${EXPECTED_SHA}"
 docker tag "${db_tag}" "thornhill-postgres:${EXPECTED_SHA}"
-
-tmp=$(mktemp -d "${STATE_DIR}/.install.XXXXXX")
-cleanup_tmp() { rm -rf -- "${tmp}"; }
-trap cleanup_tmp EXIT
 
 db_override="${tmp}/db-image.override.yml"
 write_db_override() {
@@ -453,6 +468,7 @@ on_exit() {
   if (( rc == 0 )); then
     clear_journal
   fi
+  cleanup_tmp || printf '%s\n' 'Warning: failed to remove temporary install files' >&2
   exit "${rc}"
 }
 trap on_exit EXIT

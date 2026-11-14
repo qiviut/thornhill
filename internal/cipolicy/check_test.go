@@ -60,6 +60,24 @@ func TestCheckRejectsCIQualificationLaneBypass(t *testing.T) {
 			contain: "image qualification lane must include",
 		},
 		{
+			name:    "image omits application identity roundtrip",
+			old:     "          scripts/test-image-config-roundtrip.sh thornhill:ci \"${GITHUB_SHA}\"\n",
+			new:     "",
+			contain: "image qualification lane must include",
+		},
+		{
+			name:    "image omits postgres identity roundtrip",
+			old:     "          scripts/test-image-config-roundtrip.sh thornhill-postgres:ci \"${GITHUB_SHA}\"\n",
+			new:     "",
+			contain: "image qualification lane must include",
+		},
+		{
+			name:    "image exports backend-dependent application identity",
+			old:     `app_id=$(python3 scripts/image-config-id.py "${artifact_dir}/app.tar.gz" --tag thornhill:ci --revision "${GITHUB_SHA}")`,
+			new:     `app_id=$(docker image inspect thornhill:ci --format '{{.Id}}')`,
+			contain: "image qualification lane must include",
+		},
+		{
 			name:    "verify does not aggregate failures",
 			old:     "    if: ${{ always() }}\n",
 			new:     "    if: ${{ success() }}\n",
