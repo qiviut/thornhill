@@ -75,7 +75,7 @@ export FAKE_DOCKER_LOG="${tmp}/docker.log"
 
 # .Id is deliberately the wrong OCI-index-style digest. The config-ID path
 # must still reach the safe stopping point after both image tags are prepared.
-if "${bundle}/install-release.sh" --bundle "${bundle}" --env-file "${tmp}/env" \
+if bash "${bundle}/install-release.sh" --bundle "${bundle}" --env-file "${tmp}/env" \
   --expected-sha "${revision}" --state-dir "${tmp}/state-good" \
   >"${tmp}/good.out" 2>&1; then
   printf '%s\n' 'fake installer unexpectedly succeeded' >&2
@@ -94,7 +94,7 @@ fi
 # A different loaded archive must fail before tags or runtime work.
 : >"${FAKE_DOCKER_LOG}"
 export FAKE_DOCKER_BAD=1
-if "${bundle}/install-release.sh" --bundle "${bundle}" --env-file "${tmp}/env" \
+if bash "${bundle}/install-release.sh" --bundle "${bundle}" --env-file "${tmp}/env" \
   --expected-sha "${revision}" --state-dir "${tmp}/state-bad" \
   >"${tmp}/bad.out" 2>&1; then
   printf '%s\n' 'installer accepted a mismatched loaded image' >&2

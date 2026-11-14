@@ -12,6 +12,7 @@ bundle="${tmp}/bundle"
 mkdir -p "${artifact}"
 PYTHONDONTWRITEBYTECODE=1 python3 "${root}/scripts/test-image-config-id.py"
 "${root}/scripts/test-install-runtime-safety.sh"
+"${root}/scripts/test-install-exit-safety.sh"
 python3 - "${artifact}" "${revision}" <<'PY'
 import hashlib
 import io
@@ -60,7 +61,9 @@ THORNHILL_RELEASE_CI_URL=https://github.example.invalid/actions/runs/123 \
   cd "${bundle}"
   sha256sum -c SHA256SUMS >/dev/null
 )
-[[ -x "${bundle}/install-release.sh" ]]
+[[ -f "${bundle}/install-release.sh" ]]
+# Model artifact extraction that removes executable bits; Bash must suffice.
+chmod 0644 "${bundle}/install-release.sh" "${bundle}/scripts/local-recovery.sh" "${bundle}/scripts/rotate-postgres-role-password.sh"
 [[ -f "${bundle}/compose/env.example" ]]
 [[ ! -e "${bundle}/compose/.env.example" ]]
 [[ ! -e "${bundle}/compose/.env" ]]
@@ -77,7 +80,7 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
         raise SystemExit(f"hidden bundle path cannot survive artifact upload: {path}")
 PY
 
-"${bundle}/install-release.sh" \
+bash "${bundle}/install-release.sh" \
   --bundle "${bundle}" \
   --env-file "${root}/.env.example" \
   --expected-sha "${revision}" \
@@ -86,7 +89,7 @@ PY
 "${root}/scripts/test-local-release-runtime.sh" "${bundle}" "${artifact}" "${revision}"
 
 printf '%s\n' 'unhashed override must be rejected' >"${tmp}/outside-override.yml"
-if "${bundle}/install-release.sh" \
+if bash "${bundle}/install-release.sh" \
   --bundle "${bundle}" \
   --env-file "${root}/.env.example" \
   --expected-sha "${revision}" \
@@ -97,7 +100,7 @@ if "${bundle}/install-release.sh" \
 fi
 
 printf 'tampered bundle must be rejected\n' >>"${bundle}/images/app.tar.gz"
-if "${bundle}/install-release.sh" \
+if bash "${bundle}/install-release.sh" \
   --bundle "${bundle}" \
   --env-file "${root}/.env.example" \
   --expected-sha "${revision}" \

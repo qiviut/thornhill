@@ -99,8 +99,14 @@ wait_for_runtime() {
 }
 
 set_dispatch_paused() {
-  EVENTS+=(unpause-dispatch)
+  EVENTS+=("dispatch-$1")
+  [[ "${TEST_CASE}" != rollback-pause-error || "${1}" != TRUE ]] || return 1
   return 0
+}
+
+active_jobs() {
+  [[ "${TEST_CASE}" != rollback-active-jobs ]] || { printf '1\n'; return; }
+  printf '0\n'
 }
 
 docker() {
@@ -187,10 +193,16 @@ docker() {
   fi
 
   case "${1:-}" in
+    container)
+      [[ "${TEST_CASE}" != rollback-list-error ]] || return 1
+      if [[ "${TEST_CASE}" != rollback-app-missing ]]; then printf '%s\n' "${PROJECT_NAME}-app-1"; fi
+      printf '%s\n' "${PROJECT_NAME}-db-1"
+      return 0 ;;
     inspect)
       container=${2:-}
       format=${4:-}
       if [[ "${container}" == "${PROJECT_NAME}-app-1" ]]; then
+        [[ "${TEST_CASE}" != rollback-app-missing && "${TEST_CASE}" != rollback-list-error ]] || return 1
         case "${format}" in
           '{{.State.Running}}') printf '%s\n' "${APP_RUNNING}"; return 0 ;;
           '{{.State.Running}} {{.State.Restarting}}') printf '%s false\n' "${APP_RUNNING}"; return 0 ;;
@@ -307,6 +319,7 @@ if rollback >/dev/null 2>&1; then
   rollback_order_ok=true
   if ! assert_event_order stop-app stop-db; then rollback_order_ok=false; fi
   if ! assert_event_order stop-db compose-up; then rollback_order_ok=false; fi
+  if ! assert_event_order dispatch-TRUE stop-app; then rollback_order_ok=false; fi
   if [[ "${rollback_order_ok}" == true ]]; then
     printf '%s\n' 'Rollback stopped app, then database, before Compose recreation'
   else
@@ -317,7 +330,7 @@ else
   failures=$((failures + 1))
 fi
 
-for failure in rollback-app-stop-error rollback-db-stop-error; do
+for failure in rollback-app-stop-error rollback-db-stop-error rollback-pause-error rollback-active-jobs rollback-list-error; do
   reset_rollback_case "${failure}"
   rollback_failed=false
   if rollback >/dev/null 2>&1; then
@@ -334,6 +347,12 @@ for failure in rollback-app-stop-error rollback-db-stop-error; do
     failures=$((failures + 1))
   fi
 done
+
+reset_rollback_case rollback-app-missing
+if ! rollback >/dev/null 2>&1 || ! assert_event_order stop-db compose-up; then
+  printf '%s\n' 'Rollback failed for daemon-confirmed missing app' >&2
+  failures=$((failures + 1))
+fi
 
 if (( failures != 0 )); then
   printf 'Installer runtime safety regression checks failed (%d issue(s))\n' "${failures}" >&2

@@ -342,8 +342,15 @@ wait_for_runtime() {
 }
 
 stop_application_cleanly() {
-  local container="${PROJECT_NAME}-app-1" running state
+  local container="${PROJECT_NAME}-app-1" running state names
   if ! running=$(docker inspect "${container}" --format '{{.State.Running}}'); then
+    # Only rollback may accept absence, and only after a successful daemon list.
+    if [[ "${1:-}" == allow-missing ]]; then
+      names=$(docker container ls --all --format '{{.Names}}') || return 1
+      if ! printf '%s\n' "${names}" | grep -Fxq -- "${container}"; then
+        return 0
+      fi
+    fi
     return 1
   fi
   if [[ "${running}" == true ]]; then
@@ -441,7 +448,13 @@ rollback() {
   fi
   # Old stop flags cannot prove that a partially started target is stopped.
   if [[ "${target_start_attempted}" == true ]]; then
-    stop_application_cleanly || return 1
+    # A failed unpause readback can hide a committed unpause. Re-establish
+    # admission control and check active work before stopping the target.
+    set_dispatch_paused TRUE || return 1
+    local active
+    active=$(active_jobs) || return 1
+    [[ "${active}" == 0 ]] || return 1
+    stop_application_cleanly allow-missing || return 1
     stop_database_cleanly || return 1
   fi
   export THORNHILL_APP_IMAGE="${previous_app_local}"
@@ -516,7 +529,7 @@ fi
 database_password=$(awk -F= '$1 == "THORNHILL_DB_PASSWORD" {print substr($0, index($0, "=") + 1)}' "${ENV_FILE}")
 [[ "${database_password}" =~ ^[0-9a-f]{64}$ ]]
 printf '%s\n' "${database_password}" |
-  "${BUNDLE}/scripts/rotate-postgres-role-password.sh" --verify-only "${PROJECT_NAME}-db-1" >/dev/null
+  bash "${BUNDLE}/scripts/rotate-postgres-role-password.sh" --verify-only "${PROJECT_NAME}-db-1" >/dev/null
 
 ensure_deployment_control
 dispatch_before=$(printf 'SELECT dispatch_paused FROM deployment_control WHERE singleton=TRUE;\n' | db_sql)
@@ -533,7 +546,7 @@ fi
 THORNHILL_RECOVERY_SOURCE_COMMIT="${EXPECTED_SHA}" \
 STATE_DIR="${STATE_DIR}" PROJECT_NAME="${PROJECT_NAME}" \
 THORNHILL_RECOVERY_POSTGRES_IMAGE="${previous_db_image}" \
-"${BUNDLE}/scripts/local-recovery.sh" snapshot >/dev/null
+bash "${BUNDLE}/scripts/local-recovery.sh" snapshot >/dev/null
 write_journal prepared
 changed=true
 stop_application_cleanly

@@ -174,7 +174,7 @@ gh run download RUN_ID \
 On the host, first verify without changing containers or loading images:
 
 ```sh
-./install-release.sh \
+bash ./install-release.sh \
   --bundle /path/to/thornhill-release-FULL_SHA \
   --env-file /home/operator/projects/thornhill/.env \
   --expected-sha FULL_SHA \
@@ -185,7 +185,7 @@ Then install deliberately, preserving the existing `.env`, Compose project name,
 PostgreSQL volume, application volume, and runtime hardening:
 
 ```sh
-./install-release.sh \
+bash ./install-release.sh \
   --bundle /path/to/thornhill-release-FULL_SHA \
   --env-file /home/operator/projects/thornhill/.env \
   --expected-sha FULL_SHA \
