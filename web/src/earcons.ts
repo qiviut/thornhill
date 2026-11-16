@@ -11,6 +11,14 @@ export function unlockAudio(): void {
   if (ctx.state === "suspended") void ctx.resume();
 }
 
+/** Start from a click: a successful schedule does not prove the tone was heard. */
+export async function testSound(): Promise<void> {
+  if (!ctx || ctx.state === "closed") ctx = new AudioContext();
+  if (ctx.state === "suspended") await ctx.resume();
+  if (ctx.state !== "running") throw new Error("Audio output is not running");
+  earcons.linkOk();
+}
+
 function tone(freq: number, at: number, dur: number, type: OscillatorType = "sine", gain = 0.12): void {
   if (!ctx) return;
   const t0 = ctx.currentTime + at;
