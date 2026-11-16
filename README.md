@@ -435,6 +435,17 @@ before completion. Unexplained ad-hoc scripts are not an acceptable residue.
   ascending = restored, triple blip = job done, low buzz = failed) driven
   by a heartbeat watchdog.
 
+### Browser diagnostics
+
+Open **Diagnostics** in the desk to test a browser-generated two-note tone or a
+prebaked voice phrase, without starting a live voice session. Both tests must be
+started by tapping or clicking their buttons. The result reports whether the
+browser started playback, not whether the sound reached your ears. If playback
+starts silently, check the tab's mute setting, volume, and selected output device.
+The browser network and control-link indicators are informational; they do not
+validate the WebRTC connection or the live voice provider. Test live voice
+separately after confirming browser audio.
+
 ## Layout
 
 ```

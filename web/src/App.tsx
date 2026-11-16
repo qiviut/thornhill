@@ -15,6 +15,7 @@ import {
   unsubscribePush,
 } from "./push";
 import { waitForIce, waitForRemoteAudioDrain } from "./voice-call";
+import { Diagnostics } from "./Diagnostics";
 
 interface TranscriptLine {
   id: string;
@@ -490,6 +491,8 @@ export default function App() {
       </section>
 
       {notice && <div className="notice" role="alert">{notice}</div>}
+
+      <Diagnostics linkUp={linkUp} />
 
       <div className="textbar">
         <input
